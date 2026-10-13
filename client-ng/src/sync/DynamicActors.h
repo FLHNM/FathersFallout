@@ -29,6 +29,8 @@ namespace F4MP::DynamicActors
 
     // Whether this local runtime actor is our copy of another player's.
     bool IsMirrorCopy(uint32_t localFormId);
+    // Our copy of another player's runtime actor -> (that player, their FormID for it).
+    bool OwnerOf(uint32_t localFormId, uint32_t& ownerId, uint32_t& ownerRefId);
 
     // Spawn queue, cleanup and duplicate suppression. ~10/s, every game.
     void ClientTick();

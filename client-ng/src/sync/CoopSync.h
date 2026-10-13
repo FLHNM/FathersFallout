@@ -35,6 +35,7 @@ namespace F4MP::Coop
         bool worldTime = true;   // follow the host's clock and weather
         bool combatAnims = true; // show other players' shots, swings, aiming and reloads
         bool building = true;    // settlement building, doors and switches
+        bool hitTrace = false;   // [Debug] BodyTrace: log every hit by/on a player, dump the appearance we send
     };
 
     struct Stats

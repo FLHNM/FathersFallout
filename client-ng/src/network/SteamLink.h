@@ -37,7 +37,7 @@ namespace Network::SteamLink
     // code (Steam > Add a Friend), a SteamID64 or (part of) a friend's Steam name.
     uint64_t FindHost(const std::string& a_target, std::string& a_outName, std::string& a_outError);
     HSteamNetConnection Connect(uint64_t a_hostSteamId);
-    bool Send(HSteamNetConnection a_conn, const void* a_data, uint32_t a_size);
+    bool Send(HSteamNetConnection a_conn, const void* a_data, uint32_t a_size, int a_flags = 8);   // 8 = reliable
     int  Receive(HSteamNetConnection a_conn, SteamNetworkingMessage_t** a_out, int a_max);
     // 0 none, 1 connecting, 2 finding route, 3 connected, 4 closed by peer, 5 problem (k_ESteamNetworkingConnectionState_*)
     int  State(HSteamNetConnection a_conn, std::string& a_endDebug);

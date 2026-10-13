@@ -77,7 +77,11 @@ namespace F4MP::DynamicActors
             if (GetPlayerIdForBody(fid) != 0 || g_mappedLocal.contains(fid)) return true;
             auto* base = ref->GetObjectReference();
             const uint32_t b = base ? base->GetFormID() : 0;
-            return b == 0x00000007 || b == 0x0003C62E || b == 0x0018E8F2 || b >= 0xFFF00000;
+            if (b == 0x00000007 || b == 0x0003C62E || b == 0x0018E8F2 || b >= 0xFFF00000) return true;
+            // Built settlement objects that are actors (turrets): the workshop sync shares them already. As
+            // "spawns" they got a second, unlinked copy on the other screen, or the copy was disabled.
+            static auto* s_workshopItem = Lookup<RE::BGSKeyword>(0x00054BA6);
+            return s_workshopItem && ref->GetLinkedRef(s_workshopItem) != nullptr;
         }
 
         template <class F>
@@ -167,6 +171,18 @@ namespace F4MP::DynamicActors
     }
 
     bool IsMirrorCopy(uint32_t localFormId) { return g_mappedLocal.contains(localFormId); }
+
+    bool OwnerOf(uint32_t localFormId, uint32_t& ownerId, uint32_t& ownerRefId)
+    {
+        if (!g_mappedLocal.contains(localFormId)) return false;
+        for (auto& [key, local] : g_map)
+            if (local == localFormId) {
+                ownerId = static_cast<uint32_t>(key >> 32);
+                ownerRefId = static_cast<uint32_t>(key);
+                return true;
+            }
+        return false;
+    }
 
     void ClientTick()
     {
@@ -262,6 +278,9 @@ namespace F4MP::DynamicActors
         g_mappedLocal.clear();
         g_announced.clear();
         g_lastAnnounced.clear();
+        // Our own spawns we hid while another player ran the area: back in our world.
+        for (uint32_t fid : g_suppressed)
+            if (auto* a = Lookup<RE::Actor>(fid); a && a->IsDisabled() && !a->IsDeleted()) a->Enable(false);
         g_suppressed.clear();
         g_inFlight = false;
     }

@@ -43,8 +43,8 @@ body:
     id: version
     attributes:
       label: Update
-      description: Shown on the left of the launcher (e.g. UPDATE 16 (ALPHA))
-      placeholder: Update 16
+      description: Shown on the left of the launcher (e.g. UPDATE 17 (ALPHA))
+      placeholder: Update 17
     validations:
       required: true
   - type: dropdown

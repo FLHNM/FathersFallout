@@ -66,6 +66,7 @@ enum class MessageType : uint16_t {
     CoopRefsHidden = 106,           // host -> joiner: plugin references the host scrapped (targetId 0: scrapped live, to all)
     CoopFurniture = 107,            // player -> all: the furniture they sit/lie on (CoopRefActivatedMsg; ref 0 = got up)
     CoopNpcAnim = 108,              // NPC owner -> all: combat animation event of an NPC it runs (attacks, reloads)
+    CoopLockChanged = 109,          // player -> all: a door/container they unlocked (lockpick, key) or locked
 };
 
 #pragma pack(push, 1)
@@ -131,6 +132,7 @@ struct ChatMessageMsg {
 // Estado de un NPC que difunde el HOST. El FormID identifica al mismo NPC en las dos
 // maquinas (para NPCs "fijos" del mundo, el FormID coincide). El cliente busca su NPC
 // local por ese FormID y lo conduce a este estado.
+constexpr uint8_t kNpcWeaponDrawn = 1, kNpcRunning = 2;
 struct NpcStateMsg {
     uint32_t formId;     // FormID del NPC (identidad comun entre maquinas)
     float x, y, z;
@@ -139,11 +141,19 @@ struct NpcStateMsg {
     bool isMoving;
     bool isSneaking;
     bool isDead;         // para muerte (mas adelante)
+    uint8_t flags;       // kNpcWeaponDrawn | kNpcRunning (was padding: same size as before)
     float health;        // current Health actor value on the owner
     uint32_t ownerId;    // player whose game runs this NPC (sync/Authority)
 };
 
 // ---- Co-op messages: every struct starts with senderId (stamped by the server) ----
+
+struct CoopLockChangedMsg {
+    uint32_t senderId;
+    uint32_t refFormId;      // plugin reference (same everywhere)
+    uint8_t  locked;
+    uint8_t  pad[3];
+};
 
 struct CoopPlayerDamageMsg {
     uint32_t senderId;
@@ -163,6 +173,7 @@ struct CoopContainerChangeMsg {
     uint32_t containerFormId;
     uint32_t itemFormId;
     int32_t  count;          // > 0 added to the container, < 0 taken from it
+    uint32_t ownerId;        // 0: plugin reference; else the game whose runtime actor (a spawned enemy's corpse) it is
 };
 
 struct CoopWorldRefTakenMsg {
@@ -292,6 +303,7 @@ struct CoopPropMovedMsg {
 struct CoopContainerSnapshotReqMsg {
     uint32_t senderId;
     uint32_t containerFormId;
+    uint32_t ownerId;        // as in CoopContainerChangeMsg
 };
 
 struct CoopContainerSnapshotMsg {
@@ -300,6 +312,7 @@ struct CoopContainerSnapshotMsg {
     uint16_t count;
     uint16_t _pad;
     struct Entry { uint32_t itemFormId; int32_t count; } entries[96];
+    uint32_t ownerId;        // as in CoopContainerChangeMsg
 };
 
 struct CoopQuestStageMsg {
@@ -363,7 +376,14 @@ struct CoopInboxItem {
     std::vector<uint8_t> payload;
 };
 
-constexpr uint32_t PROTOCOL_VERSION = 11;   // 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
+// Positions and NPC states are sent many times a second and only the newest one matters: unreliable, so a
+// lost packet doesn't hold up everything behind it (over the internet / Steam relays). Everything else
+// (hits, items, builds, quests) stays reliable and in order.
+inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosition || t == MessageType::NpcState; }
+constexpr int kSendStream = 1;     // k_nSteamNetworkingSend_UnreliableNoNagle
+constexpr int kSendEvent = 8;      // k_nSteamNetworkingSend_Reliable
+
+constexpr uint32_t PROTOCOL_VERSION = 12;   // 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 
 class NetworkClient {
@@ -444,6 +464,8 @@ private:
     // NPCs difundidos por el host (formId -> estado) + cuando se vio cada uno.
     std::unordered_map<uint64_t, NpcStateMsg> m_remoteNpcs;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_npcLastSeen;
+    std::unordered_map<uint32_t, uint64_t> m_remoteStamp;   // newest position stamp per player (unreliable: drop older)
+    std::unordered_map<uint64_t, uint64_t> m_npcStamp;      // the same per NPC
 
     std::mutex m_coopMutex;
     std::vector<CoopInboxItem> m_coopInbox;

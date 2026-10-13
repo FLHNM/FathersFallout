@@ -3,6 +3,7 @@
 // and NOTICE ("FathersFallout" and "FatherLamb" are reserved names; modified versions must be renamed).
 
 #include "pch.h"
+#include <chrono>
 #include "sync/GraphOverride.h"
 
 #include <Windows.h>
@@ -33,8 +34,16 @@ namespace F4MP::GraphOverride
             std::atomic<float> direction{ 0.0f };
             std::atomic<float> pitch{ 0.0f };      // radians, + = down
             std::atomic<bool> resync{ false };   // engine changed the graph's state: resend ours
+            std::atomic<int> wantDrawn{ -1 };      // its player's weapon: 1 out, 0 away, -1 unknown
+            std::atomic<long long> swapUntil{ 0 }; // ms clock: our own equip change may holster/draw
         };
+
+        long long NowMs()
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
         std::array<Slot, 32> g_slots;
+        std::atomic<unsigned long long> g_weaponBlocked{ 0 };
 
         PreUpdate_t g_original = nullptr;
         // Graph Pitch per radian of look pitch ([Bridge] f4mp:pitchscale).
@@ -142,6 +151,18 @@ namespace F4MP::GraphOverride
                     if (_strnicmp(ev, "sneak", 5) == 0) slot->resync.store(true, std::memory_order_release);
                     return true;
                 }
+                // The body's own AI drawing or holstering against its player (in and after fights: the
+                // weapon tug-of-war of shots refused while it played). Our own requests
+                // match the player's state, so they pass; an equipment swap gets a moment to holster.
+                if (ev && NowMs() > slot->swapUntil.load(std::memory_order_relaxed)) {
+                    const int want = slot->wantDrawn.load(std::memory_order_relaxed);
+                    if ((want == 1 && _stricmp(ev, "Unequip") == 0) || (want == 0 && _stricmp(ev, "WeapEquip") == 0)) {
+                        const auto n = g_weaponBlocked.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (n <= 20 || n % 200 == 0) REX::INFO("[GraphOverride] body: its AI's {} dropped (player has the weapon {}) (#{})", ev,
+                            want ? "out" : "away", n);
+                        return true;
+                    }
+                }
                 // Anything else (RelaxedStateStart, WeapEquip, Unequip, archetype changes...) can
                 // drop the graph out of its locomotion state: have the sync resend move/sprint.
                 const bool ok = g_originalNotify(a_self, a_event);
@@ -242,6 +263,16 @@ namespace F4MP::GraphOverride
     }
 
     unsigned long long BlockedCount() { return g_blocked.load(); }
+
+    void SetWantDrawn(RE::Actor* a_body, bool a_drawn)
+    {
+        if (Slot* s = SlotOf(HolderOf(a_body))) s->wantDrawn.store(a_drawn ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    void AllowWeaponSwap(RE::Actor* a_body)
+    {
+        if (Slot* s = SlotOf(HolderOf(a_body))) s->swapUntil.store(NowMs() + 1500, std::memory_order_relaxed);
+    }
 
     bool TakeResync(RE::Actor* a_body)
     {

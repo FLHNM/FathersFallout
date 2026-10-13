@@ -26,6 +26,7 @@
 #include <chrono>
 #include <deque>
 #include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -59,6 +60,36 @@ namespace F4MP
     static std::atomic<float> g_localGraphDir{ -1.0f };   // fraction of a turn, 0 = forward
     static std::atomic<uint32_t> g_localMoveMode{ 0xFFFFFFFF };   // ActorState::moveMode, ~0 = unknown
     constexpr uint32_t kMoveModeSprinting = 0x100;
+
+    // The local player as the main thread saw it on its last sync tick. The network thread used to read
+    // the player directly (position, sneak, weapon...) while the game was updating it - and a send between
+    // two frames repeated the last position, which read as speed 0.
+    struct LocalSample {
+        bool valid = false;
+        uint64_t seq = 0;
+        std::chrono::steady_clock::time_point at{};
+        RE::NiPoint3 pos{};
+        float heading = 0.0f, pitch = 0.0f;
+        bool sneaking = false, jumping = false, weaponDrawn = false;
+    };
+    static std::mutex g_localLock;
+    static LocalSample g_local;
+
+    // Main-thread tasks the network thread schedules: at most one of each kind waiting. During a
+    // loading screen the game runs no tasks, and thousands piled up and ran at once afterwards.
+    struct TaskGate {
+        std::atomic<bool> pending{ false };
+        template <class F>
+        void Queue(F&& fn)
+        {
+            if (pending.exchange(true)) return;
+            F4SE::GetTaskInterface()->AddTask([this, f = std::forward<F>(fn)]() mutable {
+                pending = false;
+                f();
+            });
+        }
+    };
+    static TaskGate g_gateBodies, g_gateCoop, g_gateNpcSend, g_gateNpcSync, g_gateProbe;
 
     static void BodiesSync();       // declaracion adelantada (se define mas abajo)
     static void MaybeTravelOnJoin();
@@ -516,12 +547,22 @@ namespace F4MP
                     static RE::NiPoint3 s_lastPos{};
                     static bool s_havePos = false;
                     static auto s_lastPosTime = now;
-                    const float sendDt = std::chrono::duration<float>(now - s_lastPosTime).count();
-                    s_lastPosTime = now;
+                    static Network::PlayerPositionMsg s_lastMsg{};
+                    static bool s_haveMsg = false;
 
-                    if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-                        const auto pos = player->GetPosition();
-                        const float facing = player->GetEyeHeading();
+                    LocalSample ls;
+                    {
+                        std::lock_guard l(g_localLock);
+                        ls = g_local;
+                    }
+                    static uint64_t s_sentSeq = 0;
+                    // Only a fresh sample: the same position twice reads as standing still.
+                    if (ls.valid && ls.seq != s_sentSeq && now - ls.at < std::chrono::milliseconds(500)) {
+                        s_sentSeq = ls.seq;
+                        const float sendDt = std::chrono::duration<float>(ls.at - s_lastPosTime).count();
+                        s_lastPosTime = ls.at;
+                        const auto pos = ls.pos;
+                        const float facing = ls.heading;
 
                         // Velocidad y direccion a partir del desplazamiento real.
                         float speed = 0.0f, moveDir = 0.0f;
@@ -543,10 +584,10 @@ namespace F4MP
                         // Movement over the last ~150 ms: a single send step reads 0 or double whenever
                         // sends and game frames aren't in step.
                         static std::deque<std::pair<std::chrono::steady_clock::time_point, RE::NiPoint3>> s_track;
-                        s_track.emplace_back(now, pos);
-                        while (s_track.size() > 2 && now - s_track.front().first > std::chrono::milliseconds(150)) s_track.pop_front();
+                        s_track.emplace_back(ls.at, pos);
+                        while (s_track.size() > 2 && ls.at - s_track.front().first > std::chrono::milliseconds(150)) s_track.pop_front();
                         float trackSpeed = 0.0f, trackDir = 0.0f;
-                        if (const float secs = std::chrono::duration<float>(now - s_track.front().first).count(); secs > 0.05f) {
+                        if (const float secs = std::chrono::duration<float>(ls.at - s_track.front().first).count(); secs > 0.05f) {
                             const float dx = pos.x - s_track.front().second.x, dy = pos.y - s_track.front().second.y;
                             trackSpeed = std::sqrt(dx * dx + dy * dy) / secs;
                             if (trackSpeed > 10.0f) trackDir = std::atan2(dx, dy) - facing;
@@ -563,7 +604,7 @@ namespace F4MP
                                 moveDir = trackDir;
                             }
                         }
-                        msg.pitch = player->data.angle.x;   // looking up/down: aim and replayed shots
+                        msg.pitch = ls.pitch;   // looking up/down: aim and replayed shots
                         msg.speed = speed;
                         msg.moveDir = moveDir;
                         msg.isMoving = speed > 10.0f;
@@ -572,20 +613,27 @@ namespace F4MP
                         const uint32_t mm = g_localMoveMode.load();
                         msg.isSprinting = mm != 0xFFFFFFFF ? (mm & kMoveModeSprinting) != 0 : speed > 450.0f;
                         msg.isRunning = speed > 150.0f && !msg.isSprinting;
-                        msg.isSneaking = player->IsSneaking();
-                        msg.isJumping = player->IsJumping();              // en el aire / saltando
-                        msg.weaponDrawn = player->GetWeaponMagicDrawn();  // arma en mano?
+                        msg.isSneaking = ls.sneaking;
+                        msg.isJumping = ls.jumping;              // en el aire / saltando
+                        msg.weaponDrawn = ls.weaponDrawn;  // arma en mano?
                         msg.cellId = Authority::LocalSpaceAtomic();   // interior cell / worldspace
                         lastSend = now;
                         net.SendPacket(Network::MessageType::PlayerPosition, &msg, sizeof(msg));
-                    } else {
+                        s_lastMsg = msg;
+                        s_haveMsg = true;
+                    } else if (s_haveMsg && now - lastSend >= std::chrono::milliseconds(250)) {
+                        // No new frame (loading screen, a stall): keep the others' body of us standing where
+                        // we were, or they'd forget us after 5 s and despawn it.
                         lastSend = now;
+                        s_lastMsg.speed = 0.0f;
+                        s_lastMsg.isMoving = false;
+                        net.SendPacket(Network::MessageType::PlayerPosition, &s_lastMsg, sizeof(s_lastMsg));
                     }
                 }
                 // Sincronizar cuerpos en el hilo PRINCIPAL ~60/s (para interpolar suave).
                 if (duration_cast<milliseconds>(now - lastSync).count() >= 16) {
                     lastSync = now;
-                    F4SE::GetTaskInterface()->AddTask([]() { BodiesSync(); });
+                    g_gateBodies.Queue([]() { BodiesSync(); });
                 }
 
                 // Diagnostic: how long main-thread tasks wait in the F4SE queue. After the first
@@ -593,7 +641,7 @@ namespace F4MP
                 static auto lastProbe = now;
                 if (duration_cast<milliseconds>(now - lastProbe).count() >= 1000) {
                     lastProbe = now;
-                    F4SE::GetTaskInterface()->AddTask([queued = now]() {
+                    g_gateProbe.Queue([queued = now]() {
                         const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - queued).count();
                         if (waited > 500) {
@@ -609,7 +657,7 @@ namespace F4MP
                 static auto lastCoop = now;
                 if (duration_cast<milliseconds>(now - lastCoop).count() >= 100) {
                     lastCoop = now;
-                    F4SE::GetTaskInterface()->AddTask([]() { Coop::Tick(); });
+                    g_gateCoop.Queue([]() { Coop::Tick(); });
                 }
 
                 static auto lastNpcSend = now;
@@ -617,11 +665,11 @@ namespace F4MP
                 // Every game broadcasts the NPCs it owns (~10/s) and mirrors the others' (~30/s).
                 if (duration_cast<milliseconds>(now - lastNpcSend).count() >= 100) {
                     lastNpcSend = now;
-                    F4SE::GetTaskInterface()->AddTask([]() { BroadcastNpcs(); });
+                    g_gateNpcSend.Queue([]() { BroadcastNpcs(); });
                 }
                 if (duration_cast<milliseconds>(now - lastNpcSync).count() >= 33) {
                     lastNpcSync = now;
-                    F4SE::GetTaskInterface()->AddTask([]() { NpcsSync(); });
+                    g_gateNpcSync.Queue([]() { NpcsSync(); });
                 }
             } else {
                 if (s_sentAppearance)  // just dropped: forget co-op session state
@@ -677,6 +725,9 @@ namespace F4MP
     // ================= Cuerpos de jugadores remotos (Fase A) =================
     static std::unordered_map<uint32_t, uint32_t> g_bodies;      // playerId -> formID del actor
     static std::unordered_map<uint32_t, float> g_lastHeading;    // playerId -> ultimo heading aplicado
+    // Where each body is drawn, for the name tags (the HUD runs on the render thread).
+    static std::mutex g_tagLock;
+    static std::unordered_map<uint32_t, RE::NiPoint3> g_tagBodyPos;
 
     // Used by CoopSync (main thread only, like g_bodies itself).
     bool IsHost() { return g_isHost; }
@@ -743,7 +794,10 @@ namespace F4MP
     }
     static std::unordered_set<uint32_t> g_dummies;   // "Spawn dummy" test actors: never a player body
     static std::unordered_map<uint32_t, uint32_t> g_bodyBase;  // playerId -> base the body was spawned from
-    static uint32_t g_spawnCount = 0;                // body spawns this session (capped)
+    static uint32_t g_spawnCount = 0;                // body spawns this session (for the log)
+    // Spawns in the last 5 minutes. A cap per session made the other player invisible for good in a long
+    // session: every load or cell change that removed a body used one up and never gave it back.
+    static std::deque<std::chrono::steady_clock::time_point> g_recentSpawns;
     static bool g_spawnPending = false;
     static uint32_t g_spawnFor = 0;
     static std::chrono::steady_clock::time_point g_spawnAt;
@@ -833,6 +887,19 @@ namespace F4MP
     static void SampleLocalMovement()
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
+        if (player) {
+            std::lock_guard l(g_localLock);
+            g_local.valid = true;
+            g_local.seq++;
+            g_local.at = std::chrono::steady_clock::now();
+            g_local.pos = player->GetPosition();
+            g_local.heading = player->GetEyeHeading();
+            g_local.pitch = player->data.angle.x;
+            g_local.sneaking = player->IsSneaking();
+            g_local.jumping = player->IsJumping();
+            g_local.weaponDrawn = player->GetWeaponMagicDrawn();
+        }
+        Authority::LocalSpace();   // keeps the space the network thread sends current
         float speed = -1.0f, dir = -1.0f;
         if (!player || !player->GetGraphVariableImplFloat("Speed", speed) ||
             !player->GetGraphVariableImplFloat("Direction", dir)) {
@@ -870,9 +937,13 @@ namespace F4MP
     // Host: enemies fighting one player turn on another player who is clearly closer, like they
     // would between the player and a companion. Without this, an ambush that started on the host
     // ignored the other players until they shot first. Once a second, a few switches at most.
+    static std::unordered_map<uint32_t, uint32_t> g_drivenOwner;   // NPCs mirrored here: local actor FormID -> owner
+
     static void ShareAggro()
     {
-        if (!g_isHost || g_bodies.empty()) return;
+        // Every game, for the NPCs it runs (sync/Authority): in an area a guest's game runs, its enemies
+        // ignored the host until shot.
+        if (g_bodies.empty()) return;
         static auto s_next = std::chrono::steady_clock::now();
         static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_switched;
         const auto now = std::chrono::steady_clock::now();
@@ -917,6 +988,7 @@ namespace F4MP
         for (auto& h : lists->highActorHandles) {
             auto npc = h.get();
             if (!npc || isPlayer.count(npc.get()) || npc->IsDead(false) || !npc->IsInCombat()) continue;
+            if (!Authority::IOwn(npc.get()) || g_drivenOwner.contains(npc->GetFormID())) continue;   // a mirror: its owner decides
             auto tgt = npc->currentCombatTarget.get();
             if (!tgt || !isPlayer.count(tgt.get())) continue;
             const uint32_t nid = npc->GetFormID();
@@ -1295,6 +1367,7 @@ namespace F4MP
             // Not while its equipment is still on the way: a draw asked for before the weapon was given
             // (its player arrived with the gun out) was cut by the weapon's 3D rebuild and the body
             // stayed half-drawn for good, refusing every aim and shot.
+            GraphOverride::SetWantDrawn(actor, rp.weaponDrawn);
             if (!Coop::EquipmentSettled(pid, fid)) {
                 st.lastDrawCheck = ahora;
             } else {
@@ -1476,6 +1549,14 @@ namespace F4MP
         }
 
         GraphOverride::KeepOnly(liveBodies);
+        {
+            std::lock_guard l(g_tagLock);
+            g_tagBodyPos.clear();
+            for (auto& [pid, fid] : g_bodies) {
+                auto* f = RE::TESForm::GetFormByID(fid);
+                if (auto* a = f ? f->As<RE::Actor>() : nullptr; a && a->Get3D()) g_tagBodyPos[pid] = a->GetPosition();
+            }
+        }
 
         // 2. Resolver un spawn pendiente (el placeatme es asincrono).
         if (g_spawnPending) {
@@ -1525,7 +1606,11 @@ namespace F4MP
         // 3. Iniciar un spawn para el primer jugador remoto sin cuerpo.
         // Guard rails: at most one spawn every 3 s and 20 per session, so a body that keeps
         // "vanishing" can never flood the world with copies.
-        if (g_spawnCount >= 20) return;
+        {
+            const auto t = std::chrono::steady_clock::now();
+            while (!g_recentSpawns.empty() && t - g_recentSpawns.front() > std::chrono::minutes(5)) g_recentSpawns.pop_front();
+            if (g_recentSpawns.size() >= 15) return;   // something keeps eating bodies: don't flood the world
+        }
         if (std::chrono::steady_clock::now() - g_spawnAt < std::chrono::seconds(3)) return;
         // Not during or right after a loading screen: a body placed while the cell was still
         // coming in (the joiner's fast travel to the host) existed but was never drawn.
@@ -1537,7 +1622,9 @@ namespace F4MP
         }
         for (auto& [pid, pos] : remotos) {
             if (g_bodies.find(pid) == g_bodies.end() && IsNearLocalPlayer(pos, Range::BodySpawn())) {
-                if (++g_spawnCount == 20) REX::WARN("[F4MP] body spawn limit reached; not spawning more this session");
+                ++g_spawnCount;
+                g_recentSpawns.push_back(std::chrono::steady_clock::now());
+                if (g_recentSpawns.size() == 15) REX::WARN("[F4MP] 15 body spawns in 5 minutes: pausing body spawns for a while");
                 // The player's own character if we have their appearance, else a neutral body.
                 g_spawnBase = Appearance::GetBodyBase(pid);
                 if (!g_spawnBase) {
@@ -1560,7 +1647,12 @@ namespace F4MP
     // ================= NPCs (host autoritativo) =================
     // FormIDs de NPCs que este cliente ha "tomado" (les apagamos la IA para conducirlos).
     static std::unordered_set<uint32_t> g_drivenNpcs;
-    struct NpcAnimState { bool moving = false; float smoothSpeed = 0.0f; };   // keyed by local FormID
+    struct NpcAnimState {   // keyed by local FormID
+        bool moving = false; float smoothSpeed = 0.0f;
+        bool init = false; float heading = 0.0f;
+        bool sneaking = false; int gait = 0;   // 0 none, 1 walk, 2 run
+        bool drawn = false; std::chrono::steady_clock::time_point drawAt{};
+    };
     static std::unordered_map<uint32_t, NpcAnimState> g_npcAnim;
     // Mirrored NPCs replay their owner's attacks (CoopNpcAnim) for show: the owner's game deals the
     // real damage, so a mirror hits for 0. Its own multiplier comes back when it's released.
@@ -1642,6 +1734,8 @@ namespace F4MP
             msg.isMoving = msg.speed > 10.0f;
             msg.isSneaking = actor->IsSneaking();
             msg.isDead = actor->IsDead(false);
+            msg.flags = (actor->GetWeaponMagicDrawn() ? Network::kNpcWeaponDrawn : 0) |
+                        (msg.speed > 260.0f ? Network::kNpcRunning : 0);   // NPC runs are ~300-450, walks ~80-140
             msg.health = Coop::GetHealth(actor);
             net.SendPacket(Network::MessageType::NpcState, &msg, sizeof(msg));
             count++;
@@ -1650,7 +1744,6 @@ namespace F4MP
 
     // Mirror the NPCs other players own (sync/Authority): find our copy, calm its AI and drive it
     // to the owner's state. NPCs we own run normally and are broadcast by BroadcastNpcs.
-    static std::unordered_map<uint32_t, uint32_t> g_drivenOwner;   // local actor FormID -> owner
 
     static void ReleaseDriven(uint32_t localFid)
     {
@@ -1744,6 +1837,10 @@ namespace F4MP
             if (!a || a == pl || fid >= DynamicActors::kRuntimeIdStart || claimed.contains(fid) || a->IsDisabled() || !a->Get3D())
                 return RE::BSContainer::ForEachResult::kContinue;
             if (sent.contains(fid)) { s_missing.erase(fid); return RE::BSContainer::ForEachResult::kContinue; }
+            // Our own companion (Dogmeat, Piper...) came with us: the host's world has them elsewhere, but
+            // hiding them made them vanish the moment we got near the host.
+            static auto* s_companions = RE::TESForm::GetFormByID(0x00023C01) ? RE::TESForm::GetFormByID(0x00023C01)->As<RE::TESFaction>() : nullptr;
+            if (s_companions && a->IsInFaction(s_companions)) return RE::BSContainer::ForEachResult::kContinue;
             if (++s_missing[fid] >= 2) ghosts.push_back(a);
             return RE::BSContainer::ForEachResult::kContinue;
         });
@@ -1842,10 +1939,18 @@ namespace F4MP
                                                  actual.y + delta.y * alpha,
                                                  actual.z + delta.z * alpha }, true);
             }
-            actor->SetHeading(s.angleZ);
+            auto& anim = g_npcAnim[local];
+            // Turn toward the owner's heading over a few ticks (a snap every update looked like twitching).
+            if (!anim.init) { anim.init = true; anim.heading = s.angleZ; }
+            {
+                float diff = s.angleZ - anim.heading;
+                while (diff > 3.14159265f) diff -= 6.2831853f;
+                while (diff < -3.14159265f) diff += 6.2831853f;
+                anim.heading += std::fabs(diff) < 0.02f ? diff : diff * 0.4f;
+                actor->SetHeading(anim.heading);
+            }
 
             // Animation: same bIsSynced trick as player bodies, so the graph honors Speed.
-            auto& anim = g_npcAnim[local];
             anim.smoothSpeed = anim.smoothSpeed * 0.8f + s.speed * 0.2f;
             actor->SetGraphVariableBool("bIsSynced", true);
             actor->SetGraphVariableFloat("Speed", anim.smoothSpeed);
@@ -1853,6 +1958,34 @@ namespace F4MP
             if (wantMoving != anim.moving) {
                 GraphOverride::SendEvent(actor, wantMoving ? "moveStart" : "moveStop");
                 anim.moving = wantMoving;
+                anim.gait = wantMoving ? 1 : 0;
+            }
+            // Crouched like its owner's copy (sent since the start, never applied).
+            if (anim.sneaking != s.isSneaking) {
+                actor->SetSneaking(s.isSneaking);
+                GraphOverride::SendEvent(actor, s.isSneaking ? "SneakStart" : "SneakStop");
+                anim.sneaking = s.isSneaking;
+            }
+            // Running, not walking fast: the walk animation slid at a run's speed. Same event names as bodies.
+            if (anim.moving) {
+                const bool run = (s.flags & Network::kNpcRunning) || anim.smoothSpeed > (anim.gait == 2 ? 180.0f : 240.0f);
+                const int want = run ? 2 : 1;
+                if (want != anim.gait) {
+                    const bool drawn = actor->GetWeaponMagicDrawn();
+                    const char* a = want == 2 ? (drawn ? "runStart" : "Run") : (drawn ? "walkStart" : "Walk");
+                    const char* b = want == 2 ? (drawn ? "Run" : "runStart") : (drawn ? "Walk" : "walkStart");
+                    if (GraphOverride::SendEvent(actor, a) || GraphOverride::SendEvent(actor, b)) anim.gait = want;
+                }
+            }
+            // Weapon out or away like the owner's copy (its AI is on a do-nothing package and kept whatever
+            // it had: raiders with holstered guns shooting, settlers with guns out). Twice a second at most.
+            {
+                const bool want = (s.flags & Network::kNpcWeaponDrawn) != 0;
+                const auto t = std::chrono::steady_clock::now();
+                if (actor->GetWeaponMagicDrawn() != want && t - anim.drawAt > std::chrono::milliseconds(500)) {
+                    anim.drawAt = t;
+                    actor->DrawWeaponMagicHands(want);
+                }
             }
         }
 
@@ -2102,7 +2235,7 @@ namespace F4MP
             return;
         }
         if (net.IsConnecting()) {
-            ImGuiMCP::Text("Connecting to %s... (gives up after 10 s)", net.GetTarget().c_str());
+            ImGuiMCP::Text("Connecting to %s...", net.GetTarget().c_str());
             if (ImGuiMCP::Button("Cancel")) {
                 g_retriesLeft = 0;
                 net.Disconnect();
@@ -2284,13 +2417,16 @@ namespace F4MP
             if (net.IsConnected()) {
                 for (const auto& [id, p] : net.GetRemotePlayers())
                     ImGuiMCP::Text("  player #%u  x=%.0f y=%.0f z=%.0f", id, p.x, p.y, p.z);
-                ImGuiMCP::Text("NPC role: %s", g_isHost ? "HOST (I run NPCs)" : "client (host runs NPCs)");
-                if (ImGuiMCP::Button(g_isHost ? "Stop being host" : "Become NPC host")) g_isHost = !g_isHost;
+                ImGuiMCP::Text("Role: %s", g_isHost ? "host (my game runs the shared world)" : "guest (the host's world)");
                 if (!g_isHost) ImGuiMCP::Text("NPCs mirrored: %d", (int)net.GetRemoteNpcs().size());
-                ImGuiMCP::Text("Visibility: %s", g_hideSelf ? "HIDDEN (dedicated host)" : "visible");
-                if (ImGuiMCP::Button(g_hideSelf ? "Show me (normal player)" : "Hide me (dedicated host)")) g_hideSelf = !g_hideSelf;
+                // Test tools: two hosts in one session break it, so players never see these.
+                if (g_consoleBridge || g_bodyTrace) {
+                    if (ImGuiMCP::Button(g_isHost ? "Stop being host (test)" : "Become NPC host (test)")) g_isHost = !g_isHost;
+                    ImGuiMCP::Text("Visibility: %s", g_hideSelf ? "HIDDEN (dedicated host)" : "visible");
+                    if (ImGuiMCP::Button(g_hideSelf ? "Show me (normal player)" : "Hide me (dedicated host, test)")) g_hideSelf = !g_hideSelf;
+                }
             }
-            if (ImGuiMCP::Button("Spawn dummy (test)")) {
+            if ((g_consoleBridge || g_bodyTrace) && ImGuiMCP::Button("Spawn dummy (test)")) {
                 F4SE::GetTaskInterface()->AddTask([]() { SpawnDummy(); });
             }
         }
@@ -2326,15 +2462,27 @@ namespace F4MP
         };
 
         auto remotos = net.GetRemotePlayers();
+        const uint32_t mySpace = Authority::LocalSpaceAtomic();
+        std::unordered_map<uint32_t, RE::NiPoint3> bodyAt;
+        {
+            std::lock_guard l(g_tagLock);
+            bodyAt = g_tagBodyPos;
+        }
         for (const auto& [id, p] : remotos) {
+            // Another interior / worldspace: its coordinates mean nothing here (the tag floated in a
+            // random spot of ours).
+            if (p.cellId && mySpace && p.cellId != mySpace) continue;
+            // Over the body as drawn (it trails its player's packets a little), else where they are.
+            RE::NiPoint3 at{ p.x, p.y, p.z };
+            if (auto b = bodyAt.find(id); b != bodyAt.end()) at = b->second;
             // Anchor a little above the head.
-            RE::NiPoint3 anchorS = RE::HUDMenuUtils::WorldPtToScreenPt3(RE::NiPoint3{ p.x, p.y, p.z + 135.0f });
+            RE::NiPoint3 anchorS = RE::HUDMenuUtils::WorldPtToScreenPt3(RE::NiPoint3{ at.x, at.y, at.z + 135.0f });
             if (anchorS.z <= 0.0f) continue;  // detras de la camara
             if (anchorS.x < -0.1f || anchorS.x > 1.1f || anchorS.y < -0.1f || anchorS.y > 1.1f) continue;
             const float ax = anchorS.x * W, ay = (1.0f - anchorS.y) * H;
 
-            const float dx = p.x - myPos.x, dy = p.y - myPos.y, dz = p.z - myPos.z;
-            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0f;
+            const float dx = at.x - myPos.x, dy = at.y - myPos.y, dz = at.z - myPos.z;
+            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz) * 0.0142875f;   // game units -> metres
 
             std::string name = Appearance::NameOf(id);
             if (name.empty()) name = "Player " + std::to_string(id);
@@ -2460,6 +2608,7 @@ namespace F4MP
                 AimHook::Install();
                 g_consoleBridge = GetPrivateProfileIntA("Debug", "ConsoleBridge", 0, IniPath().c_str()) != 0;
                 g_bodyTrace = GetPrivateProfileIntA("Debug", "BodyTrace", 0, IniPath().c_str()) != 0;
+                Coop::GetSettings().hitTrace = g_bodyTrace || GetPrivateProfileIntA("Debug", "HitTrace", 0, IniPath().c_str()) != 0;
                 AimHook::SetTrace(GetPrivateProfileIntA("Debug", "AimTrace", 0, IniPath().c_str()) != 0);
                 PlayerEvents::SetLogAll(g_bodyTrace);
                 PlayerEvents::Install();

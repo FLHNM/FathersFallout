@@ -134,6 +134,8 @@ void NetworkClient::Disconnect() {
         m_remoteAppearance.clear();
         m_remoteNpcs.clear();
         m_npcLastSeen.clear();
+        m_remoteStamp.clear();
+        m_npcStamp.clear();
     }
     REX::INFO("[Network] disconnected");
 }
@@ -153,9 +155,9 @@ void NetworkClient::SendPacket(MessageType type, const void* data, uint32_t size
         memcpy(buffer.data() + sizeof(MessageHeader), data, size);
     }
 
-    if (m_steam) SteamLink::Send(m_connection, buffer.data(), (uint32_t)buffer.size());
-    else m_sockets->SendMessageToConnection(m_connection, buffer.data(), (uint32_t)buffer.size(),
-        k_nSteamNetworkingSend_Reliable, nullptr);
+    const int flags = IsStreamMessage(type) ? kSendStream : kSendEvent;
+    if (m_steam) SteamLink::Send(m_connection, buffer.data(), (uint32_t)buffer.size(), flags);
+    else m_sockets->SendMessageToConnection(m_connection, buffer.data(), (uint32_t)buffer.size(), flags, nullptr);
 }
 
 void NetworkClient::SendConnectionRequest() {
@@ -204,6 +206,8 @@ void NetworkClient::OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_
                 m_remoteAppearance.clear();
         m_remoteNpcs.clear();
         m_npcLastSeen.clear();
+        m_remoteStamp.clear();
+        m_npcStamp.clear();
             }
             break;
 
@@ -240,9 +244,13 @@ void NetworkClient::PumpMessages() {
         if (m_connection == k_HSteamNetConnection_Invalid) return;
     }
 
-    SteamNetworkingMessage_t* msgs[16];
-    int msgCount = m_steam ? SteamLink::Receive(m_connection, msgs, 16)
-                           : m_sockets->ReceiveMessagesOnConnection(m_connection, msgs, 16);
+    // Everything that's waiting, not 16 per pass: a busy area (the host's 128 NPCs several times a second
+    // + positions) queued faster than that and every body/NPC on screen fell further behind.
+    for (int batch = 0; batch < 64; ++batch) {
+    SteamNetworkingMessage_t* msgs[64];
+    int msgCount = m_steam ? SteamLink::Receive(m_connection, msgs, 64)
+                           : m_sockets->ReceiveMessagesOnConnection(m_connection, msgs, 64);
+    if (msgCount <= 0) break;
     for (int i = 0; i < msgCount; ++i) {
         SteamNetworkingMessage_t* msg = msgs[i];
         if (msg->m_cbSize >= (int)sizeof(MessageHeader)) {
@@ -275,6 +283,10 @@ void NetworkClient::PumpMessages() {
                 const auto* pos = reinterpret_cast<const PlayerPositionMsg*>(payload);
                 if (pos->playerId != m_playerId) {  // ignorar la nuestra
                     std::lock_guard<std::mutex> lock(m_remoteMutex);
+                    // Unreliable: an older packet can arrive after a newer one. The server stamps each.
+                    auto& last = m_remoteStamp[pos->playerId];
+                    if (header->timestamp && header->timestamp < last) { msg->Release(); continue; }
+                    last = header->timestamp;
                     bool nuevo = m_remotePlayers.find(pos->playerId) == m_remotePlayers.end();
                     m_remotePlayers[pos->playerId] = *pos;
                     m_remoteLastSeen[pos->playerId] = std::chrono::steady_clock::now();
@@ -313,6 +325,9 @@ void NetworkClient::PumpMessages() {
                     const auto* npc = reinterpret_cast<const NpcStateMsg*>(payload);
                     std::lock_guard<std::mutex> lock(m_remoteMutex);
                     const uint64_t key = (static_cast<uint64_t>(npc->ownerId) << 32) | npc->formId;
+                    auto& last = m_npcStamp[key];
+                    if (header->timestamp && header->timestamp < last) { msg->Release(); continue; }
+                    last = header->timestamp;
                     m_remoteNpcs[key] = *npc;
                     m_npcLastSeen[key] = std::chrono::steady_clock::now();
                 }
@@ -326,6 +341,8 @@ void NetworkClient::PumpMessages() {
             }
         }
         msg->Release();
+    }
+    if (msgCount < 64) break;
     }
 }
 

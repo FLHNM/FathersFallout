@@ -14,7 +14,7 @@
 - **It never** asks for your Steam password, sends your files anywhere, or changes anything outside
   the Fallout 4 folder, your Fallout 4 saves/settings and the folders above.
 - **Check your download:** each [release](https://github.com/FLHNM/FathersFallout/releases) lists SHA-256 checksums. In PowerShell:
-  `Get-FileHash .\FathersFallout-Update16-Alpha.zip` - the result must match.
+  `Get-FileHash .\FathersFallout-Update17-Alpha.zip` - the result must match.
 
 ## Windows says "Windows protected your PC"
 

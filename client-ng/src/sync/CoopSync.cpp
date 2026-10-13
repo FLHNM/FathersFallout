@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <format>
@@ -98,6 +99,27 @@ namespace F4MP::Coop
         {
             return formId != 0 && formId != kPlayerRefId && formId < kDynamicFormIdStart &&
                    GetPlayerIdForBody(formId) == 0;
+        }
+
+        // A container/corpse as every game can name it: plugin references by FormID (owner 0); a spawned
+        // actor's corpse (runtime FormIDs differ per game) by the game that spawned it + its FormID there.
+        // Without this, random encounters' corpses weren't synced at all: both players looted everything.
+        bool NameRef(uint32_t localFid, uint32_t& owner, uint32_t& ref)
+        {
+            if (IsSyncableRef(localFid)) { owner = 0; ref = localFid; return true; }
+            if (localFid < kDynamicFormIdStart || GetPlayerIdForBody(localFid)) return false;
+            if (DynamicActors::OwnerOf(localFid, owner, ref)) return true;
+            auto* a = LookupForm<RE::Actor>(localFid);   // one of OUR spawns (announced as ours)
+            if (!a) return false;
+            owner = NetworkClient::GetInstance().GetPlayerId();
+            ref = localFid;
+            return true;
+        }
+
+        RE::TESObjectREFR* ResolveRef(uint32_t owner, uint32_t ref)
+        {
+            if (owner == 0 || owner == NetworkClient::GetInstance().GetPlayerId()) return LookupForm<RE::TESObjectREFR>(ref);
+            return DynamicActors::Resolve(owner, ref);
         }
 
         // Base FormIDs of equipped weapons and armor, sorted.
@@ -279,6 +301,7 @@ namespace F4MP::Coop
                 // Swapping a weapon while one is drawn can leave the old model in the hands (bat and
                 // pistol at once). Put it away first; the body sync draws again if its player has
                 // a weapon out.
+                GraphOverride::AllowWeaponSwap(body);
                 if (body->GetWeaponMagicDrawn()) body->DrawWeaponMagicHands(false);
 
                 // Clothing taken off with nothing put on in its place: the item left the inventory but
@@ -366,7 +389,7 @@ namespace F4MP::Coop
         // Client: the health we last forced onto each driven NPC.
         std::unordered_map<uint32_t, float> g_npcAppliedHealth;
         // Client: driven NPC (local FormID) -> its owner and its FormID in the owner's game.
-        struct NpcOwner { uint32_t ownerId; uint32_t formId; };
+        struct NpcOwner { uint32_t ownerId; uint32_t formId; Clock::time_point at; };
         std::unordered_map<uint32_t, NpcOwner> g_npcOwners;
         // Keeps bodies alive and full: their player's health lives in their own game. The damage
         // itself is forwarded per hit by HitSink (measuring health drops counted physics bumps and,
@@ -495,7 +518,7 @@ namespace F4MP::Coop
 
         void OnContainerChange(const CoopContainerChangeMsg& m)
         {
-            auto* cont = LookupForm<RE::TESObjectREFR>(m.containerFormId);
+            auto* cont = ResolveRef(m.ownerId, m.containerFormId);
             auto* obj = LookupForm<RE::TESBoundObject>(m.itemFormId);
             if (!cont || !obj || m.count == 0) return;
             if (m.count > 0) {
@@ -513,16 +536,20 @@ namespace F4MP::Coop
         {
             auto* ref = LookupForm<RE::TESObjectREFR>(m.refFormId);
             if (!ref || ref->IsDisabled()) return;
-            ref->Disable();
+            // The host's world is the real one: an item taken there is gone. A guest only hides it while
+            // connected (its own save gets it back), like the host's scrapped objects.
+            if (IsHost()) ref->Disable();
+            else Workshop::HideRef(ref);
             g_stats.applied++;
         }
 
         void OnSnapshotRequest(const CoopContainerSnapshotReqMsg& m)
         {
-            auto* cont = LookupForm<RE::TESObjectREFR>(m.containerFormId);
+            auto* cont = ResolveRef(m.ownerId, m.containerFormId);
             if (!cont || !cont->Get3D() || !Authority::IOwn(cont)) return;   // the container's owner answers
             CoopContainerSnapshotMsg out{};
             out.containerFormId = m.containerFormId;
+            out.ownerId = m.ownerId;
             for (auto& [fid, n] : CollectContents(cont)) {
                 if (out.count >= std::size(out.entries)) break;
                 out.entries[out.count++] = { fid, n };
@@ -532,7 +559,7 @@ namespace F4MP::Coop
 
         void OnSnapshot(const CoopContainerSnapshotMsg& m)
         {
-            auto* cont = LookupForm<RE::TESObjectREFR>(m.containerFormId);
+            auto* cont = ResolveRef(m.ownerId, m.containerFormId);
             if (!cont || Authority::IOwn(cont)) return;   // the owner already has the real contents
             std::unordered_map<uint32_t, int32_t> want;
             const uint16_t n = std::min<uint16_t>(m.count, static_cast<uint16_t>(std::size(m.entries)));
@@ -551,7 +578,7 @@ namespace F4MP::Coop
                 const int32_t cur = h == have.end() ? 0 : h->second;
                 if (obj && cnt > cur) AddItems(cont, obj, cnt - cur);
             }
-            g_pendingSnapshot.erase(m.containerFormId);
+            g_pendingSnapshot.erase(cont->GetFormID());
             g_stats.containerOps++;
             g_stats.applied++;
             REX::INFO("[Coop] container {:#x} matched to host ({} stacks)", m.containerFormId, n);
@@ -730,7 +757,27 @@ namespace F4MP::Coop
             }
         }
 
+        void ApplyQuestStage(const CoopQuestStageMsg& m);
+        // The join catch-up brings the host's stage for every quest at once (hundreds): applied a few per
+        // tick so the console and quest scripts aren't flooded in one frame.
+        std::deque<CoopQuestStageMsg> g_questBacklog;
+
         void OnQuestStage(const CoopQuestStageMsg& m)
+        {
+            if (m.isSnapshot) { if (g_questBacklog.size() < 4096) g_questBacklog.push_back(m); return; }
+            ApplyQuestStage(m);
+        }
+
+        void DrainQuestBacklog()
+        {
+            for (int i = 0; i < 4 && !g_questBacklog.empty(); ++i) {
+                const auto m = g_questBacklog.front();
+                g_questBacklog.pop_front();
+                ApplyQuestStage(m);
+            }
+        }
+
+        void ApplyQuestStage(const CoopQuestStageMsg& m)
         {
             auto* q = LookupForm<RE::TESQuest>(m.questFormId);
             if (!q) return;
@@ -905,6 +952,55 @@ namespace F4MP::Coop
                 REX::INFO("[Coop] player {}'s NPC {:#x}: {} -> {}", m.senderId, npc->GetFormID(), name, ok);
         }
 
+        // ---------- locks (player -> all) ----------
+        // A door or container someone picked open stayed locked for the other player (and the replayed
+        // door opening did nothing). Locks the player touches are watched for a while; a change goes out.
+        struct LockWatch { bool locked; Clock::time_point until; };
+        std::unordered_map<uint32_t, LockWatch> g_lockWatch;
+
+        bool IsLockedNow(RE::TESObjectREFR* ref)
+        {
+            auto* lock = ref ? ref->GetLock() : nullptr;
+            return lock && (lock->flags & 1) != 0;   // REFR_LOCK::Flags::kLocked
+        }
+
+        void WatchLock(RE::TESObjectREFR* ref)
+        {
+            if (!ref || !ref->GetLock() || !IsSyncableRef(ref->GetFormID())) return;
+            g_lockWatch[ref->GetFormID()] = { IsLockedNow(ref), Clock::now() + std::chrono::minutes(2) };
+        }
+
+        void PollLocks()
+        {
+            const auto now = Clock::now();
+            for (auto it = g_lockWatch.begin(); it != g_lockWatch.end();) {
+                auto* ref = LookupForm<RE::TESObjectREFR>(it->first);
+                if (!ref || now > it->second.until) { it = g_lockWatch.erase(it); continue; }
+                const bool locked = IsLockedNow(ref);
+                if (locked != it->second.locked) {
+                    it->second.locked = locked;
+                    CoopLockChangedMsg msg{};
+                    msg.refFormId = it->first;
+                    msg.locked = locked ? 1 : 0;
+                    Send(MessageType::CoopLockChanged, msg);
+                    REX::INFO("[Coop] {:#x} {}: sent", it->first, locked ? "locked" : "unlocked");
+                }
+                ++it;
+            }
+        }
+
+        void OnLockChanged(const CoopLockChangedMsg& m)
+        {
+            auto* ref = LookupForm<RE::TESObjectREFR>(m.refFormId);
+            auto* lock = ref ? ref->GetLock() : nullptr;
+            if (!lock) return;
+            const bool want = m.locked != 0;
+            if (IsLockedNow(ref) != want) lock->SetLocked(want);
+            if (auto it = g_lockWatch.find(m.refFormId); it != g_lockWatch.end()) it->second.locked = want;   // no echo
+            g_stats.applied++;
+            REX::INFO("[Coop] player {} {} {:#x} (locked here now: {})", m.senderId, want ? "locked" : "unlocked", m.refFormId, IsLockedNow(ref));
+        }
+
         // ---------- world time & weather (host -> all) ----------
 
         void SendWorldTime()
@@ -1061,7 +1157,7 @@ namespace F4MP::Coop
                     msg.count = e.itemCount;
                     msg.x = at.x; msg.y = at.y; msg.z = at.z;
                     msg.space = Authority::LocalSpace();
-                    msg.numMods = ReadMods(ref->extraList.get(), msg.mods);
+                    msg.numMods = ref ? ReadMods(ref->extraList.get(), msg.mods) : 0;
                     Send(MessageType::CoopItemDropped, msg);
                     if (auto it = g_dropByLocalRef.find(e.referenceFormID); it != g_dropByLocalRef.end()) {
                         g_dropCopies.erase(it->second);   // FormID reused: that copy is long gone
@@ -1074,15 +1170,18 @@ namespace F4MP::Coop
                     CoopWorldRefTakenMsg msg{};
                     msg.refFormId = e.referenceFormID;
                     Send(MessageType::CoopWorldRefTaken, msg);
-                } else if (e.newContainerFormID == kPlayerRefId && IsSyncableRef(e.oldContainerFormID)) {
+                } else if (uint32_t owner = 0, ref = 0; e.newContainerFormID == kPlayerRefId && e.oldContainerFormID &&
+                                                         NameRef(e.oldContainerFormID, owner, ref)) {
                     CoopContainerChangeMsg msg{};
-                    msg.containerFormId = e.oldContainerFormID;
+                    msg.containerFormId = ref;
+                    msg.ownerId = owner;
                     msg.itemFormId = e.baseObjectFormID;
                     msg.count = -e.itemCount;
                     Send(MessageType::CoopContainerChange, msg);
-                } else if (e.oldContainerFormID == kPlayerRefId && IsSyncableRef(e.newContainerFormID)) {
+                } else if (e.oldContainerFormID == kPlayerRefId && e.newContainerFormID && NameRef(e.newContainerFormID, owner, ref)) {
                     CoopContainerChangeMsg msg{};
-                    msg.containerFormId = e.newContainerFormID;
+                    msg.containerFormId = ref;
+                    msg.ownerId = owner;
                     msg.itemFormId = e.baseObjectFormID;
                     msg.count = e.itemCount;
                     Send(MessageType::CoopContainerChange, msg);
@@ -1105,6 +1204,7 @@ namespace F4MP::Coop
                 auto* by = e.actionRef.get();
                 if (!target || !by || by->GetFormID() != kPlayerRefId) return RE::BSEventNotifyControl::kContinue;
                 if (g_settings.building && !g_hostMismatch) Workshop::OnLocalActivate(target);
+                if (g_settings.items && !g_hostMismatch) WatchLock(target);
                 if (!g_settings.items) return RE::BSEventNotifyControl::kContinue;
                 const uint32_t fid = target->GetFormID();
                 // Picking up a dropped item: the container event that follows has no reference
@@ -1125,7 +1225,8 @@ namespace F4MP::Coop
                     REX::INFO("[Coop] picked up player {}'s drop {:#x}: sent", msg.ownerId, msg.ownerRefFormId);
                     return RE::BSEventNotifyControl::kContinue;
                 }
-                if (!IsSyncableRef(fid)) return RE::BSEventNotifyControl::kContinue;
+                uint32_t owner = 0, ref = 0;
+                if (!NameRef(fid, owner, ref)) return RE::BSEventNotifyControl::kContinue;
 
                 auto* base = target->GetObjectReference();
                 const bool isContainer = base && base->GetFormType() == RE::ENUM_FORM_ID::kCONT;
@@ -1135,7 +1236,8 @@ namespace F4MP::Coop
 
                 if (g_pendingSnapshot.insert(fid).second) {
                     CoopContainerSnapshotReqMsg msg{};
-                    msg.containerFormId = fid;
+                    msg.containerFormId = ref;
+                    msg.ownerId = owner;
                     Send(MessageType::CoopContainerSnapshotReq, msg);
                 }
                 return RE::BSEventNotifyControl::kContinue;
@@ -1169,7 +1271,7 @@ namespace F4MP::Coop
 
         // A real attack on a remote player's body (an actor's hit, not a physics bump): forward the
         // damage the engine computed for it to that player, once per hit.
-        bool g_bodyHitTrace = true;   // diagnostics: every hit by/on a player (cheap, hits are rare)
+        
 
         class HitSink final : public RE::BSTEventSink<RE::TESHitEvent>
         {
@@ -1188,7 +1290,7 @@ namespace F4MP::Coop
                 }
                 auto* target = targetPtr.get();
                 auto* cause = causePtr.get();
-                if (g_bodyHitTrace && (cause == RE::PlayerCharacter::GetSingleton() ||
+                if (g_settings.hitTrace && (cause == RE::PlayerCharacter::GetSingleton() ||
                         (target && GetPlayerIdForBody(target->GetFormID())))) {
                     REX::INFO("[HitTrace] target {:#x} cause {:#x} usesHitData {} health {:.1f} flags {:#x}",
                         target ? target->GetFormID() : 0u, cause ? cause->GetFormID() : 0u, e.usesHitData,
@@ -1214,9 +1316,15 @@ namespace F4MP::Coop
                     // Our player hit an NPC someone else's game runs: that game applies the hit.
                     // (Measuring the copy's health drops sent phantom hits whenever the copy
                     // couldn't reach the owner's health, e.g. a different max.)
+                    // Not mirrored any more (its area became ours, or the owner stopped sending it): the hit
+                    // already counted here, forwarding it to the old owner would land on a copy.
                     auto it = g_npcOwners.find(target->GetFormID());
-                    if (it == g_npcOwners.end() || cause->GetFormID() != kPlayerRefId || dmg <= 0.0f)
+                    if (it == g_npcOwners.end() || Clock::now() - it->second.at > std::chrono::seconds(1) ||
+                        cause->GetFormID() != kPlayerRefId || dmg <= 0.0f)
                         return RE::BSEventNotifyControl::kContinue;
+                    // A blast is set off again in the owner's game (Explosions.cpp) and hurts the real NPC
+                    // there: forwarding our copy's blast damage too counted every grenade twice.
+                    if (blast) return RE::BSEventNotifyControl::kContinue;
                     CoopNpcDamageMsg msg{};
                     msg.ownerId = it->second.ownerId;
                     msg.npcFormId = it->second.formId;
@@ -1341,6 +1449,9 @@ namespace F4MP::Coop
             case MessageType::CoopAnimEvent:
                 if (auto* m = As<CoopAnimEventMsg>(item); m && g_settings.combatAnims) OnAnimEvent(*m);
                 break;
+            case MessageType::CoopLockChanged:
+                if (auto* m = As<CoopLockChangedMsg>(item); m && g_settings.items) OnLockChanged(*m);
+                break;
             case MessageType::CoopWorldTime:
                 if (auto* m = As<CoopWorldTimeMsg>(item); m && g_settings.worldTime) OnWorldTime(*m);
                 break;
@@ -1381,8 +1492,8 @@ namespace F4MP::Coop
             if (!blob.empty()) {
                 net.SendPacket(MessageType::CoopAppearance, blob.data(), static_cast<uint32_t>(blob.size()));
                 g_stats.sent++;
-                static bool s_dumped = false;   // debugging/test aid: the exact bytes we send
-                if (!s_dumped) {
+                static bool s_dumped = false;   // debugging/test aid ([Debug] BodyTrace): the exact bytes we send
+                if (!s_dumped && g_settings.hitTrace) {
                     s_dumped = true;
                     if (FILE* f = std::fopen("Data/F4SE/Plugins/F4MP_appearance.bin", "wb")) {
                         std::fwrite(blob.data(), 1, blob.size(), f);
@@ -1421,7 +1532,11 @@ namespace F4MP::Coop
             CheckAppliedQuests();
             PollQuests();
         }
+        if (g_settings.quests) {
+            DrainQuestBacklog();
+        }
 
+        if (g_settings.items) PollLocks();
         SendCombatEvents();
         RetryAnimEvents();
         GraphOverride::CaptureNpcEvents(g_settings.combatAnims);
@@ -1452,6 +1567,8 @@ namespace F4MP::Coop
         Explosions::Reset();
         g_pendingSnapshot.clear();
         g_questStages.clear();
+        g_questBacklog.clear();
+        g_lockWatch.clear();
         g_questBaseline = false;
         g_snapshotRequested = false;
         g_helloSent = false;
@@ -1495,7 +1612,7 @@ namespace F4MP::Coop
         const float cur = actor->GetActorValue(*hp);
         const uint32_t local = actor->GetFormID();
 
-        g_npcOwners[local] = { ownerId, formId };   // our hits on it go to the owner (HitSink)
+        g_npcOwners[local] = { ownerId, formId, Clock::now() };   // our hits on it go to the owner (HitSink)
 
         if (hostDead) {
             if (!actor->IsDead(false)) actor->KillImpl(nullptr, 0.0f, true, false);

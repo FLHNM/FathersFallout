@@ -155,6 +155,12 @@ namespace Network::SteamLink
             }
         }
 
+        // Passed on the way it came: positions/NPC states unreliable (newest wins), events reliable.
+        int RelayFlags(const SteamNetworkingMessage_t* a_msg)
+        {
+            return (a_msg->m_nFlags & kSendReliable) ? kSendReliable : 1;   // 1 = unreliable, no Nagle delay
+        }
+
         void PumpRelay()
         {
             std::lock_guard l(g_lock);
@@ -166,7 +172,7 @@ namespace Network::SteamLink
                 for (int i = 0; i < n; ++i) {
                     const auto* d = static_cast<const uint8_t*>(msgs[i]->m_pData);
                     if (p.localUp)
-                        g_gns->SendMessageToConnection(p.local, d, static_cast<uint32_t>(msgs[i]->m_cbSize), k_nSteamNetworkingSend_Reliable, nullptr);
+                        g_gns->SendMessageToConnection(p.local, d, static_cast<uint32_t>(msgs[i]->m_cbSize), RelayFlags(msgs[i]), nullptr);
                     else
                         p.toLocal.emplace_back(d, d + msgs[i]->m_cbSize);
                     msgs[i]->Release();
@@ -184,7 +190,7 @@ namespace Network::SteamLink
                 if (p.localUp) {
                     n = g_gns->ReceiveMessagesOnConnection(p.local, msgs, 32);
                     for (int i = 0; i < n; ++i) {
-                        g_api.send(g_api.sockets, p.steam, msgs[i]->m_pData, static_cast<uint32_t>(msgs[i]->m_cbSize), kSendReliable, nullptr);
+                        g_api.send(g_api.sockets, p.steam, msgs[i]->m_pData, static_cast<uint32_t>(msgs[i]->m_cbSize), RelayFlags(msgs[i]), nullptr);
                         msgs[i]->Release();
                     }
                 }
@@ -381,9 +387,9 @@ namespace Network::SteamLink
         return g_api.connectP2P(g_api.sockets, id, kVirtualPort, 0, nullptr);
     }
 
-    bool Send(HSteamNetConnection a_conn, const void* a_data, uint32_t a_size)
+    bool Send(HSteamNetConnection a_conn, const void* a_data, uint32_t a_size, int a_flags)
     {
-        return g_ready && g_api.send(g_api.sockets, a_conn, a_data, a_size, kSendReliable, nullptr) == 1;
+        return g_ready && g_api.send(g_api.sockets, a_conn, a_data, a_size, a_flags, nullptr) == 1;
     }
 
     int Receive(HSteamNetConnection a_conn, SteamNetworkingMessage_t** a_out, int a_max)

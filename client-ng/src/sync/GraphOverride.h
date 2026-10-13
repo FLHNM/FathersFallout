@@ -43,6 +43,10 @@ namespace F4MP::GraphOverride
     unsigned long long BlockedCount();
     // True once after the engine sent the body an event that may have reset its locomotion state.
     bool TakeResync(RE::Actor* a_body);
+    // Its player's weapon state: the engine's own draw/holster events against it are dropped.
+    void SetWantDrawn(RE::Actor* a_body, bool a_drawn);
+    // Our equipment change is about to holster/redraw the body's weapon: let it through for a moment.
+    void AllowWeaponSwap(RE::Actor* a_body);
 
     // NPCs (not bodies): combat and idle events (attacks, reloads, throws, idles) the engine sent them, as
     // (FormID, event). Collected only while capture is on; any thread, drained on the main thread.

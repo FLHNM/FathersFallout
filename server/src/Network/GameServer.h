@@ -92,6 +92,7 @@ struct ChatMessageMsg {
 
 // Estado de un NPC difundido por el host (debe coincidir con la del cliente). El
 // servidor solo la REENVIA a los demas; no interpreta su contenido.
+constexpr uint8_t kNpcWeaponDrawn = 1, kNpcRunning = 2;
 struct NpcStateMsg {
     uint32_t formId;
     float x, y, z;
@@ -100,6 +101,7 @@ struct NpcStateMsg {
     bool isMoving;
     bool isSneaking;
     bool isDead;
+    uint8_t flags;       // kNpcWeaponDrawn | kNpcRunning (was padding: same size as before)
     float health;      // must match client-ng NpcStateMsg byte-for-byte
     uint32_t ownerId;
 };
@@ -115,7 +117,7 @@ struct DamageDealtMsg {
 
 #pragma pack(pop)
 
-constexpr uint32_t PROTOCOL_VERSION = 11;   // must match client-ng/src/network/NetworkClient.h
+constexpr uint32_t PROTOCOL_VERSION = 12;   // must match client-ng/src/network/NetworkClient.h
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 constexpr uint32_t MAX_PLAYERS = 64;
 

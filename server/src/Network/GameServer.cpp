@@ -304,10 +304,12 @@ void GameServer::BroadcastMessage(MessageType type, const void* data, uint32_t s
         memcpy(buffer.data() + sizeof(MessageHeader), data, size);
     }
 
+    // Positions and NPC states: unreliable, newest wins (a lost one must not hold up the rest).
+    const int flags = (type == MessageType::PlayerPosition || type == MessageType::NpcState)
+                          ? k_nSteamNetworkingSend_UnreliableNoNagle : k_nSteamNetworkingSend_Reliable;
     for (const auto& [conn, client] : m_clients) {
         if (client.isConnected && client.id != excludeId) {
-            m_sockets->SendMessageToConnection(conn, buffer.data(), (uint32_t)buffer.size(),
-                k_nSteamNetworkingSend_Reliable, nullptr);
+            m_sockets->SendMessageToConnection(conn, buffer.data(), (uint32_t)buffer.size(), flags, nullptr);
         }
     }
 }
@@ -336,9 +338,22 @@ void GameServer::SendMessageToClient(uint32_t clientId, MessageType type, const 
     }
 }
 
+// Payload at least as big as the message's struct: a short or malformed packet is dropped instead of
+// read past its end.
+template <class T>
+static const T* PayloadAs(const SteamNetworkingMessage_t* msg)
+{
+    return (size_t)msg->m_cbSize >= sizeof(MessageHeader) + sizeof(T)
+               ? reinterpret_cast<const T*>(static_cast<const uint8_t*>(msg->m_pData) + sizeof(MessageHeader)) : nullptr;
+}
+
 void GameServer::ProcessMessages() {
-    SteamNetworkingMessage_t* msgs[32];
-    int msgCount = m_sockets->ReceiveMessagesOnPollGroup(m_pollGroup, msgs, 32);
+    // Everything waiting, not 32 per tick: with the host's NPC stream the queue grew faster than that
+    // (~1000-2000 messages/s at most) and every player fell further behind.
+    for (int batch = 0; batch < 256; ++batch) {
+    SteamNetworkingMessage_t* msgs[64];
+    int msgCount = m_sockets->ReceiveMessagesOnPollGroup(m_pollGroup, msgs, 64);
+    if (msgCount <= 0) break;
 
     for (int i = 0; i < msgCount; ++i) {
         SteamNetworkingMessage_t* msg = msgs[i];
@@ -348,19 +363,19 @@ void GameServer::ProcessMessages() {
 
             switch (header->type) {
                 case MessageType::ConnectionRequest:
-                    HandleConnectionRequest(msg->m_conn, reinterpret_cast<const ConnectionRequestMsg*>(payload));
+                    if (auto* m = PayloadAs<ConnectionRequestMsg>(msg)) HandleConnectionRequest(msg->m_conn, m);
                     break;
                 case MessageType::PlayerPosition:
-                    HandlePlayerPosition(msg->m_conn, reinterpret_cast<const PlayerPositionMsg*>(payload));
+                    if (auto* m = PayloadAs<PlayerPositionMsg>(msg)) HandlePlayerPosition(msg->m_conn, m);
                     break;
                 case MessageType::NpcState:
-                    HandleNpcState(msg->m_conn, reinterpret_cast<const NpcStateMsg*>(payload));
+                    if (auto* m = PayloadAs<NpcStateMsg>(msg)) HandleNpcState(msg->m_conn, m);
                     break;
                 case MessageType::PlayerAppearance:
-                    HandlePlayerAppearance(msg->m_conn, reinterpret_cast<const PlayerAppearanceMsg*>(payload));
+                    if (auto* m = PayloadAs<PlayerAppearanceMsg>(msg)) HandlePlayerAppearance(msg->m_conn, m);
                     break;
                 case MessageType::ChatMessage:
-                    HandleChatMessage(msg->m_conn, reinterpret_cast<const ChatMessageMsg*>(payload));
+                    if (auto* m = PayloadAs<ChatMessageMsg>(msg)) HandleChatMessage(msg->m_conn, m);
                     break;
                 default:
                     if (static_cast<uint16_t>(header->type) >= static_cast<uint16_t>(MessageType::CoopFirst)) {
@@ -372,6 +387,8 @@ void GameServer::ProcessMessages() {
             }
         }
         msg->Release();
+    }
+    if (msgCount < 64) break;
     }
 }
 
