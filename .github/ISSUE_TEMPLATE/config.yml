@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Player guide (install, host, join)
+    url: https://github.com/FLHNM/FathersFallout/blob/main/docs/PLAYER_GUIDE.md
+    about: Read this first - most setup questions are answered here.
+  - name: FAQ (safety, Windows warnings, saves, mods)
+    url: https://github.com/FLHNM/FathersFallout/blob/main/docs/FAQ.md
+    about: Is it safe? Why does Windows warn? Will it break my save?

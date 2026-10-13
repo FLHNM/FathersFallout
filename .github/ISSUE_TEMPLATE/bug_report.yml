@@ -1,0 +1,78 @@
+name: Bug report
+description: Something went wrong while playing co-op
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Check [Known issues](https://github.com/FLHNM/FathersFallout/blob/main/docs/KNOWN_ISSUES.md) first.
+
+        **Get your log:** right after playing, open the launcher and press **[ SHARE LOG ]**. It saves
+        `FathersFallout-log-<date>.txt` on your Desktop with your IP addresses, Steam IDs and Windows user
+        name removed. Drag that file into the "Logs" box below. **Don't paste the raw log from Documents** -
+        this page is public.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect? Steps to make it happen again help a lot.
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Were you the host or a guest?
+      options:
+        - Host
+        - Guest
+        - Not connected yet
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How did you connect?
+      options:
+        - Through Steam
+        - By IP (internet)
+        - By IP (same house / LAN)
+        - Couldn't connect
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Update
+      description: Shown on the left of the launcher (e.g. UPDATE 16 (ALPHA))
+      placeholder: Update 16
+    validations:
+      required: true
+  - type: dropdown
+    id: store
+    attributes:
+      label: Your copy of Fallout 4
+      options:
+        - Steam
+        - GOG
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: when
+    attributes:
+      label: Roughly when in the session?
+      description: e.g. "right after joining", "about 20 minutes in, at Red Rocket"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Drag in your cleaned log from [ SHARE LOG ] - and the other player's too if you can (most bugs need both sides).
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: Everyone was on the same update
+        - label: Everyone had the same plugins (base game + DLC only, or exactly the same mods)

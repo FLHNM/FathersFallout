@@ -1,0 +1,13 @@
+# build output
+build/
+.xmake/
+.deps/
+third_party/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.log
+vsxmake*/
+.vs/

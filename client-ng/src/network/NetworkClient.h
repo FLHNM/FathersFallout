@@ -1,0 +1,454 @@
+// FathersFallout - online co-op for Fallout 4
+// Copyright (C) 2026 FatherLamb. Based on F4MP by Jous99 (public domain). Licensed under the GNU
+// GPL v3 with additional terms: see LICENSE and NOTICE.
+
+#ifndef F4MPCLIENT_NETWORKCLIENT_H
+#define F4MPCLIENT_NETWORKCLIENT_H
+
+#include <cstdint>
+#include <string>
+#include <functional>
+#include <mutex>
+#include <unordered_map>
+#include <chrono>
+#include <vector>
+
+#include <steam/steamnetworkingsockets.h>
+#include <steam/isteamnetworkingsockets.h>
+#include <steam/isteamnetworkingutils.h>
+
+namespace Network {
+
+enum class MessageType : uint16_t {
+    Invalid = 0,
+    ConnectionRequest = 1,
+    ConnectionAccepted = 2,
+    ConnectionRejected = 3,
+    Disconnect = 4,
+    PlayerPosition = 10,
+    PlayerRotation = 11,
+    PlayerAnimation = 12,
+    PlayerAppearance = 13,
+    ChatMessage = 20,
+    DamageDealt = 30,
+    EntitySpawn = 40,
+    EntityState = 41,
+    NpcState = 50,      // el host difunde el estado de un NPC (por FormID)
+
+    // Co-op sync (>= 60). The server relays these to everyone except the sender and
+    // stamps the first uint32 (senderId) with the authoritative id.
+    CoopFirst = 60,
+    CoopEquipment = 60,             // player -> all: equipped weapon/armor base forms
+    CoopPlayerDamage = 61,          // host -> all: damage a host NPC dealt to a player's body
+    CoopNpcDamage = 62,             // client -> host: damage the client dealt to a host-owned NPC
+    CoopContainerChange = 70,       // player -> all: items moved into/out of a world container
+    CoopWorldRefTaken = 71,         // player -> all: world item picked up (disable it)
+    CoopContainerSnapshotReq = 72,  // client -> host: send me this container's contents
+    CoopContainerSnapshot = 73,     // host -> all: authoritative contents of a container
+    CoopItemDropped = 74,           // player -> all: dropped an item on the ground (others place a copy)
+    CoopDropTaken = 75,             // player -> all: picked up a dropped item (others remove their copy)
+    CoopBuildPlaced = 76,           // player -> all: built a workshop object (others place a copy)
+    CoopBuildMoved = 77,            // player -> all: moved a workshop object
+    CoopBuildRemoved = 78,          // player -> all: scrapped/stored a workshop object
+    CoopRefActivated = 79,          // player -> all: opened a door / flipped a switch
+    CoopQuestStage = 80,            // host -> all: stage changed; client -> host with isRequest
+    CoopQuestSnapshotReq = 81,      // client -> host: send me every visible quest's stage
+    CoopHello = 90,                 // on connect: load-order fingerprint (host answers with its own)
+    CoopAppearance = 91,            // variable length: the sender's own character (see sync/Appearance.cpp)
+    CoopWorldTime = 92,             // host -> all: clock, date and weather
+    CoopAnimEvent = 93,             // player -> all: combat animation event to replay on the sender's body
+    CoopDynamicActor = 100,         // host -> all: a runtime-created actor and how to spawn a copy
+    CoopPlayerVitals = 102,         // player -> all: own health (for name tags)
+    CoopPropMoved = 101,            // player -> all: a loose prop they carry (hold E) or that's still settling
+    CoopExplosion = 103,            // player -> all: an explosion went off near them (form + place)
+    CoopWorldReq = 104,             // joiner -> host: show me your world around here (builds, scrapping)
+    CoopWorldSnapshot = 105,        // host -> joiner: a snapshot follows (the joiner hides its own builds)
+    CoopRefsHidden = 106,           // host -> joiner: plugin references the host scrapped (targetId 0: scrapped live, to all)
+    CoopFurniture = 107,            // player -> all: the furniture they sit/lie on (CoopRefActivatedMsg; ref 0 = got up)
+    CoopNpcAnim = 108,              // NPC owner -> all: combat animation event of an NPC it runs (attacks, reloads)
+};
+
+#pragma pack(push, 1)
+
+struct MessageHeader {
+    MessageType type;
+    uint32_t size;
+    uint64_t timestamp;
+};
+
+struct ConnectionRequestMsg {
+    char playerName[64];
+    uint32_t protocolVersion;
+};
+
+struct ConnectionAcceptedMsg {
+    uint32_t playerId;
+    uint32_t currentPlayers;
+    uint32_t maxPlayers;
+};
+
+// (tipo Disconnect) el servidor la envia cuando un jugador se va o es expulsado,
+// para eliminar su cuerpo AL INSTANTE sin esperar al timeout de 5 s.
+struct PlayerLeftMsg {
+    uint32_t playerId;
+};
+
+struct PlayerPositionMsg {
+    uint32_t playerId;
+    float x, y, z;
+    float pitch;         // look up/down (rad, + = down, as the game's angle.x); was the unused velocityX
+    float velocityY, velocityZ;
+    float angleZ;        // heading de vista (rad): hacia donde mira el jugador
+    float speed;         // velocidad de movimiento (unidades/seg)
+    float moveDir;       // direccion del movimiento relativa al facing (rad, 0 = adelante)
+    uint32_t cellId;
+    bool isMoving;
+    bool isRunning;
+    bool isSprinting;
+    bool isSneaking;
+    bool isJumping;
+    bool weaponDrawn;   // arma/magia en mano (postura de combate)
+};
+
+// Apariencia del jugador (Fase 2A): se envia una vez al conectar y se reparte.
+struct PlayerAppearanceMsg {
+    uint32_t playerId;
+    uint32_t raceFormID;
+    uint32_t hairColor;      // RGBA empaquetado (BGSColorForm::color)
+    int32_t  sex;            // 0 male, 1 female, -1 none
+    uint8_t  skinR, skinG, skinB, skinA;  // bodyTintColor del NPC
+    uint8_t  numHeadParts;
+    uint8_t  _pad[3];
+    uint32_t headParts[16];  // formIDs de head parts (pelo, ojos, barba, cejas...)
+};
+
+struct ChatMessageMsg {
+    uint32_t senderId;
+    char message[256];
+    uint8_t channel;
+};
+
+// Estado de un NPC que difunde el HOST. El FormID identifica al mismo NPC en las dos
+// maquinas (para NPCs "fijos" del mundo, el FormID coincide). El cliente busca su NPC
+// local por ese FormID y lo conduce a este estado.
+struct NpcStateMsg {
+    uint32_t formId;     // FormID del NPC (identidad comun entre maquinas)
+    float x, y, z;
+    float angleZ;        // heading
+    float speed;         // para animacion (mas adelante)
+    bool isMoving;
+    bool isSneaking;
+    bool isDead;         // para muerte (mas adelante)
+    float health;        // current Health actor value on the owner
+    uint32_t ownerId;    // player whose game runs this NPC (sync/Authority)
+};
+
+// ---- Co-op messages: every struct starts with senderId (stamped by the server) ----
+
+struct CoopPlayerDamageMsg {
+    uint32_t senderId;
+    uint32_t targetPlayerId;
+    float    damage;
+};
+
+struct CoopNpcDamageMsg {
+    uint32_t senderId;
+    uint32_t ownerId;        // only this player's game applies it (runtime IDs differ per game)
+    uint32_t npcFormId;
+    float    damage;
+};
+
+struct CoopContainerChangeMsg {
+    uint32_t senderId;
+    uint32_t containerFormId;
+    uint32_t itemFormId;
+    int32_t  count;          // > 0 added to the container, < 0 taken from it
+};
+
+struct CoopWorldRefTakenMsg {
+    uint32_t senderId;
+    uint32_t refFormId;
+};
+
+// A drop is named by who dropped it and the FormID of the item on THEIR ground.
+// One attached object mod (OMOD) of a weapon/armor instance: a pipe pistol and a pipe SMG are the
+// same base weapon with different mods.
+struct CoopModEntry {
+    uint32_t modFormId;
+    uint8_t  index;
+    uint8_t  rank;
+    uint8_t  pad[2];
+};
+constexpr size_t kMaxItemMods = 24;
+
+struct CoopEquipmentMsg {
+    uint32_t senderId;
+    uint8_t  count;
+    uint8_t  numWeaponMods;  // mods on the equipped weapon (a pipe pistol vs the base pipe gun's SMG)
+    uint8_t  _pad[2];
+    uint32_t forms[24];      // base FormIDs of equipped WEAP/ARMO
+    uint32_t weaponFormId;   // which of them the mods belong to (0 = none)
+    CoopModEntry weaponMods[kMaxItemMods];
+};
+
+struct CoopItemDroppedMsg {
+    uint32_t senderId;
+    uint32_t refFormId;      // the dropped reference in the sender's game
+    uint32_t itemFormId;     // base object
+    int32_t  count;
+    float    x, y, z;
+    uint32_t space;          // interior cell / worldspace (Authority::LocalSpace)
+    uint8_t  numMods;        // the item's attached mods (none for plain items)
+    uint8_t  pad[3];
+    CoopModEntry mods[kMaxItemMods];
+};
+
+struct CoopExplosionMsg {
+    uint32_t senderId;
+    uint32_t explosionFormId;   // BGSExplosion
+    float    x, y, z;
+    uint32_t space;             // interior cell / worldspace (Authority::LocalSpace)
+};
+
+struct CoopWorldReqMsg {
+    uint32_t senderId;
+    float    x, y, z;
+    uint32_t space;
+};
+
+struct CoopWorldSnapshotMsg {
+    uint32_t senderId;
+    uint32_t targetId;         // the joiner who asked
+    float    x, y, z;          // centre of the area
+    float    radius;
+    uint32_t builds, hidden;   // what follows (CoopBuildPlaced / CoopRefsHidden)
+};
+
+constexpr size_t kMaxRefsPerMsg = 60;
+struct CoopRefsHiddenMsg {
+    uint32_t senderId;
+    uint32_t targetId;
+    uint32_t count;
+    uint32_t refs[kMaxRefsPerMsg];
+};
+
+struct CoopDropTakenMsg {
+    uint32_t senderId;
+    uint32_t ownerId;        // who dropped it
+    uint32_t ownerRefFormId; // CoopItemDroppedMsg::refFormId
+};
+
+// Workshop objects are named (owner key, ref): the builder's PERMANENT player key (F4MP_player_key.txt,
+// not the session id, which changes on every connect) and the object's FormID in the builder's game.
+// Both survive a restart, so builds stay linked across sessions (the links live in each co-save).
+// Angles in radians, as in the reference's own data.
+struct CoopBuildPlacedMsg {
+    uint32_t senderId;
+    uint32_t ownerKey;       // the builder's permanent key
+    uint32_t refFormId;
+    uint32_t baseFormId;
+    uint32_t workshopFormId; // the settlement's workbench (a plugin ref: same on every machine)
+    float    x, y, z;
+    float    ax, ay, az;
+};
+
+struct CoopBuildMovedMsg {
+    uint32_t senderId;
+    uint32_t ownerId;        // owner's permanent key
+    uint32_t ownerRefFormId;
+    float    x, y, z;
+    float    ax, ay, az;
+};
+
+struct CoopBuildRemovedMsg {
+    uint32_t senderId;
+    uint32_t ownerId;        // owner's permanent key
+    uint32_t ownerRefFormId;
+};
+
+// ownerId = owner's permanent key; 0 = a plugin reference (same FormID everywhere, e.g. a vanilla door).
+struct CoopRefActivatedMsg {
+    uint32_t senderId;
+    uint32_t ownerId;
+    uint32_t ownerRefFormId;
+};
+
+struct CoopPlayerVitalsMsg {
+    uint32_t senderId;
+    float    health;
+    float    maxHealth;
+    uint8_t  dead;
+};
+
+// A loose physics prop (cup, can, tire...) someone is carrying, ~10/s, then while it falls/settles.
+struct CoopPropMovedMsg {
+    uint32_t senderId;
+    uint32_t refFormId;      // plugin reference (same everywhere)
+    float    x, y, z;
+    float    ax, ay, az;
+    uint8_t  held;           // 1 = in their hands, 0 = let go (settling or at rest)
+};
+
+struct CoopContainerSnapshotReqMsg {
+    uint32_t senderId;
+    uint32_t containerFormId;
+};
+
+struct CoopContainerSnapshotMsg {
+    uint32_t senderId;
+    uint32_t containerFormId;
+    uint16_t count;
+    uint16_t _pad;
+    struct Entry { uint32_t itemFormId; int32_t count; } entries[96];
+};
+
+struct CoopQuestStageMsg {
+    uint32_t senderId;
+    uint32_t questFormId;
+    uint16_t stage;
+    uint8_t  isRequest;      // 1 = client asks the host to set this stage
+    uint8_t  isSnapshot;     // 1 = part of a join snapshot (only apply forward progress)
+};
+
+struct CoopQuestSnapshotReqMsg {
+    uint32_t senderId;
+};
+
+struct CoopDynamicActorMsg {
+    uint32_t senderId;
+    uint32_t hostRefId;      // the actor's runtime FormID on the host (>= 0xFF000000)
+    uint32_t spawnFormId;    // master-file record placeatme can use (NPC_ or leveled list)
+    float x, y, z;
+    float angleZ;
+};
+
+// Every sync message identifies things by FormID, and FormIDs depend on the exact plugin list.
+struct CoopWorldTimeMsg {
+    uint32_t senderId;
+    float    gameHour;       // 0-24
+    float    gameDay;
+    float    gameMonth;
+    float    gameYear;
+    float    timeScale;
+    uint32_t weatherFormId;  // 0 = none (host indoors)
+};
+
+struct CoopAnimEventMsg {
+    uint32_t senderId;
+    char     name[44];       // graph event, e.g. attackStartAuto, meleeattackStart, rifleSightedStart
+};
+
+struct CoopNpcAnimMsg {
+    uint32_t senderId;
+    uint32_t npcFormId;      // the owner's FormID (runtime actors: mapped by sync/DynamicActors)
+    char     name[44];       // graph event the owner's engine sent the NPC
+};
+
+struct CoopHelloMsg {
+    uint32_t senderId;
+    uint32_t loadOrderHash;  // FNV-1a over lowercase file names, full plugins then light (.esl)
+    uint16_t fullCount;
+    uint16_t lightCount;
+    uint8_t  isHost;
+    uint8_t  isReply;        // host's answer to a newcomer's hello (don't answer it again)
+    uint8_t  _pad[2];
+    float    loadedRadius;   // area this game always has loaded (game units), for ownership
+};
+
+#pragma pack(pop)
+
+// Raw co-op message waiting to be applied on the game's main thread.
+struct CoopInboxItem {
+    MessageType type;
+    std::vector<uint8_t> payload;
+};
+
+constexpr uint32_t PROTOCOL_VERSION = 11;   // 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
+constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
+
+class NetworkClient {
+public:
+    static NetworkClient& GetInstance();
+
+    bool Initialize();
+    void Shutdown();
+
+    bool Connect(const std::string& address, uint16_t port = DEFAULT_SERVER_PORT);
+    void Disconnect();
+
+    bool IsConnected() const { return m_connected; }
+    // Transport opened but not accepted yet (no answer from the server so far).
+    bool IsConnecting() const { return m_connection != k_HSteamNetConnection_Invalid && !m_connected; }
+    // Why the last attempt/connection ended ("" if none), and "ip:port" of the last Connect.
+    std::string GetLastError() { std::lock_guard<std::mutex> l(m_statusMutex); return m_lastError; }
+    std::string GetTarget() { std::lock_guard<std::mutex> l(m_statusMutex); return m_target; }
+    // True if the last close happened before the server accepted us (a failed attempt).
+    bool LastCloseWasAttempt() const { return m_lastCloseWasAttempt; }
+
+    void SetPlayerName(const std::string& name) { m_playerName = name; }
+    bool IsSteam() const { return m_steam; }
+    ISteamNetworkingSockets* Sockets() const { return m_sockets; }
+
+    void SendPacket(MessageType type, const void* data, uint32_t size);
+
+    // Llamar periodicamente: procesa callbacks de GNS y mensajes entrantes.
+    void PumpMessages();
+
+    uint32_t GetPlayerId() const { return m_playerId; }
+
+    // Copia del estado de los jugadores remotos (id -> ultima posicion).
+    std::unordered_map<uint32_t, PlayerPositionMsg> GetRemotePlayers();
+
+    // Apariencia recibida de un jugador remoto. Devuelve false si aun no llego.
+    bool GetAppearance(uint32_t playerId, PlayerAppearanceMsg& out);
+
+    // NPCs broadcast by their owners, keyed by (ownerId << 32 | formId): runtime FormIDs from
+    // two different owners can be equal.
+    std::unordered_map<uint64_t, NpcStateMsg> GetRemoteNpcs();
+
+    // Takes every pending co-op message (type >= CoopFirst). Call from the main thread.
+    std::vector<CoopInboxItem> DrainCoopInbox();
+
+private:
+    NetworkClient() = default;
+
+    static void OnConnStatusChangedStatic(SteamNetConnectionStatusChangedCallback_t* info);
+    void OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_t* info);
+    void SendConnectionRequest();
+
+    ISteamNetworkingSockets* m_sockets = nullptr;
+    ISteamNetworkingUtils* m_utils = nullptr;
+
+    HSteamNetConnection m_connection = k_HSteamNetConnection_Invalid;
+    bool m_steam = false;     // m_connection is a Steam peer-to-peer connection (SteamLink)
+    int m_steamState = 0;     // its last polled state
+    bool m_ownSteamEvent = false;
+
+    bool m_connected = false;
+    std::mutex m_statusMutex;
+    std::string m_lastError;
+    std::string m_target;
+    bool m_lastCloseWasAttempt = false;
+    bool m_initialized = false;
+    uint32_t m_playerId = 0;
+    std::string m_playerName = "Wastelander";
+
+    std::mutex m_mutex;
+
+    // Jugadores remotos (actualizado desde PumpMessages).
+    std::mutex m_remoteMutex;
+    std::unordered_map<uint32_t, PlayerPositionMsg> m_remotePlayers;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> m_remoteLastSeen;
+    std::unordered_map<uint32_t, PlayerAppearanceMsg> m_remoteAppearance;
+
+    // NPCs difundidos por el host (formId -> estado) + cuando se vio cada uno.
+    std::unordered_map<uint64_t, NpcStateMsg> m_remoteNpcs;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_npcLastSeen;
+
+    std::mutex m_coopMutex;
+    std::vector<CoopInboxItem> m_coopInbox;
+};
+
+}
+
+#endif

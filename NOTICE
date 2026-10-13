@@ -1,0 +1,48 @@
+FathersFallout - online co-op for Fallout 4
+Copyright (C) 2026 FatherLamb. All rights reserved where the license allows.
+
+FathersFallout is made by FatherLamb (YouTube: FatherLamb). "FathersFallout" and "FatherLamb" are
+the names of this project and its author.
+
+LICENSE
+-------
+FathersFallout is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License version 3 (see LICENSE), with the additional terms below, which are
+permitted by section 7 of that license. It comes WITHOUT ANY WARRANTY.
+
+ADDITIONAL TERMS (GPL v3, section 7)
+------------------------------------
+1. Attribution (7b). Anyone who conveys this program or a work based on it must keep, in the
+   program's "About"/credits text, its README and its NOTICE file, the line
+       "FathersFallout - Copyright (C) 2026 FatherLamb"
+   and the credits to the original authors listed below.
+2. Modified versions (7c). A modified version must be clearly marked as modified, must not be
+   presented as the original or as an official release, and must not be called "FathersFallout".
+3. Names (7e). No rights are granted to use the names "FathersFallout" or "FatherLamb", or any
+   logo or artwork of the project, for a modified version, its promotion, or to suggest
+   endorsement by FatherLamb. Only FatherLamb publishes official FathersFallout releases.
+
+Original artwork, logos, videos and other non-code material made for FathersFallout are
+Copyright (C) 2026 FatherLamb and are not covered by the GPL; they may not be reused without
+permission.
+
+OFFICIAL RELEASES
+-----------------
+Official FathersFallout releases come only from FatherLamb. The source code of every release is
+public (as the GPL requires) at https://github.com/FLHNM/FathersFallout - the official
+source and release page.
+
+CREDITS
+-------
+FathersFallout builds on:
+- F4MP - Copyright (C) 2020 Alin Octavian, Benjamin Kyd. GNU GPL v3. (server, original design)
+- F4MP rework by Jous99 (github.com/Jous99/F4MP), dedicated to the public domain
+  (see LICENSES/Unlicense-Jous99-F4MP.txt).
+- CommonLibF4 - GNU GPL v3 (see client-ng/lib/commonlibf4/LICENSE).
+- Valve GameNetworkingSockets (BSD 3-Clause), Protocol Buffers (BSD 3-Clause), Abseil and
+  OpenSSL (Apache 2.0), spdlog and fmt (MIT), nlohmann/json (MIT).
+Players also need, from their own authors (not included): F4SE (Fallout 4 Script Extender),
+Address Library for F4SE Plugins, F4SE Menu Framework.
+
+Fallout 4 is a trademark of Bethesda Softworks LLC, a ZeniMax Media company. FathersFallout is a
+free fan-made mod, not affiliated with or endorsed by Bethesda Softworks or ZeniMax Media.

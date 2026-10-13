@@ -1,0 +1,11 @@
+name: Idea / feature request
+description: Something you'd like co-op to do
+labels: ["idea"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: What should it do, and why would it make co-op better?
+    validations:
+      required: true

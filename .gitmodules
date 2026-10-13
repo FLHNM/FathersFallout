@@ -1,0 +1,3 @@
+[submodule "client-ng/lib/commonlibf4"]
+	path = client-ng/lib/commonlibf4
+	url = https://github.com/libxse/commonlibf4.git
