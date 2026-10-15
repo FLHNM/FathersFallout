@@ -24,6 +24,7 @@ namespace F4MP::Appearance
     {
         constexpr uint32_t kFormatVersion = 1;
         constexpr uint32_t kPlayerTemplate = 0x00000007;
+        constexpr uint32_t kBodyRegions = 5;   // MRSV on every vanilla NPC that has one
         // Runtime FormIDs for the per-player body bases. The engine hands out runtime IDs from
         // 0xFF000000 upward; this block sits far above anything a session reaches.
         constexpr uint32_t kBaseIdStart = 0xFFF00000;
@@ -190,8 +191,12 @@ namespace F4MP::Appearance
                 for (auto& s : look.morphSliders) sliders->emplace(s.key, s.value);
                 npc->morphSliderValues = sliders;
             }
+            // Body sculpt regions (neck, chest, arms, butt, legs). Vanilla NPCs have none or all 5;
+            // a character that never touched them sends 0, and an EMPTY list crashed the game as
+            // soon as the body's 3D was built. Pad to 5 neutral values.
             if (auto* regions = GameNew<RE::BSTArray<float>>()) {
                 for (float v : look.regionSliders) regions->push_back(v);
+                while (regions->size() < kBodyRegions) regions->push_back(0.0f);
                 npc->morphRegionSliderValues = regions;
             }
             if (auto* bones = GameNew<RE::BSTHashMap<std::uint32_t, RE::BGSCharacterMorph::Transform>>()) {
@@ -267,6 +272,8 @@ namespace F4MP::Appearance
         std::vector<float> regions;
         if (npc->morphRegionSliderValues)
             for (float v : *npc->morphRegionSliderValues) regions.push_back(v);
+        // Also padded here, so a game without the BuildBase padding (Update 19) doesn't crash on us.
+        if (regions.size() < kBodyRegions) regions.resize(kBodyRegions, 0.0f);
         std::vector<BoneRegion> bones;
         if (npc->facialBoneRegionSliderValues)
             for (auto& [k, t] : *npc->facialBoneRegionSliderValues)

@@ -2677,6 +2677,11 @@ namespace F4MP
 
     static void RegisterMenu()
     {
+        // Called on both kPostLoad and kPostPostLoad. Registered twice, the limiter ran twice per
+        // frame and held the game at 30 FPS while its own counter (time between calls) said 60.
+        static bool s_registered = false;
+        if (s_registered) return;
+        s_registered = true;
         if (!F4SEMenuFramework::IsInstalled()) {
             REX::INFO("[F4MP] F4SE Menu Framework NOT installed: no menu");
             return;
