@@ -4,6 +4,7 @@
 
 #include "pch.h"
 #include "sync/Authority.h"
+#include "sync/DynamicActors.h"
 #include "sync/CoopSync.h"
 #include "sync/Range.h"
 #include "network/NetworkClient.h"
@@ -71,6 +72,7 @@ namespace F4MP::Authority
     void SetHost(uint32_t playerId) { g_hostId = playerId; }
     uint32_t HostId() { return IsHost() ? MyId() : g_hostId; }
     uint32_t MyId() { return Network::NetworkClient::GetInstance().GetPlayerId(); }
+    bool HostAreaKnown() { return IsHost() || Find(HostId()) != nullptr; }
 
     void Refresh()
     {
@@ -93,6 +95,19 @@ namespace F4MP::Authority
     }
 
     bool IOwn(const RE::TESObjectREFR* ref)
+    {
+        if (!ref) return false;
+        // : the guest's random encounter was copied to the host, the host's copy ran its own
+        // AI in the host's area (and was echoed back as the host's), while the guest's original stood
+        // elsewhere: the host watched raiders shoot the guest, who saw nobody.
+        if (const uint32_t fid = ref->GetFormID(); fid >= DynamicActors::kRuntimeIdStart) {
+            if (DynamicActors::IsMirrorCopy(fid)) return false;
+            if (DynamicActors::IsOurAnnounced(fid)) return true;
+        }
+        return IOwnArea(ref);
+    }
+
+    bool IOwnArea(const RE::TESObjectREFR* ref)
     {
         if (!ref) return false;
         const uint32_t space = SpaceOf(ref);

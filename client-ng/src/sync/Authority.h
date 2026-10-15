@@ -28,8 +28,13 @@ namespace F4MP::Authority
     void Refresh();
 
     uint32_t MyId();
+    bool HostAreaKnown();   // we are the host, or the host's position has arrived
     uint32_t OwnerOf(uint32_t space, const RE::NiPoint3& pos);
-    bool IOwn(const RE::TESObjectREFR* ref);   // sticky per reference to avoid edge flicker
+    // Whether our game runs this reference. Runtime actors (random encounters...) stay with the game
+    // that made them wherever the players go: our copies of another player's are never ours.
+    bool IOwn(const RE::TESObjectREFR* ref);
+    // Who has the spot loaded, ignoring the rule above (sticky per reference to avoid edge flicker).
+    bool IOwnArea(const RE::TESObjectREFR* ref);
 
     void Reset();
 }

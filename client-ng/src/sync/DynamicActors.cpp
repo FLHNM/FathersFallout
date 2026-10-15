@@ -39,11 +39,14 @@ namespace F4MP::DynamicActors
 
         // owner side
         std::unordered_map<uint32_t, Clock::time_point> g_lastAnnounced;
+        std::unordered_set<uint32_t> g_ourHostile;   // announced ones hostile to our player: stay ours
         // mirror side
         std::unordered_map<uint64_t, Announce> g_announced;       // (owner, ref) -> latest announce
         std::unordered_map<uint64_t, uint32_t> g_map;             // (owner, ref) -> local FormID
         std::unordered_set<uint32_t> g_mappedLocal;                // local FormIDs we created
         std::unordered_set<uint32_t> g_suppressed;
+        // Copies we removed: never "ours" afterwards, even if the game keeps the reference around for a while.
+        std::unordered_set<uint32_t> g_retired;
         bool g_suppress = true;
 
         struct InFlight
@@ -74,7 +77,7 @@ namespace F4MP::DynamicActors
         bool IsCoopOwned(RE::TESObjectREFR* ref)
         {
             const uint32_t fid = ref->GetFormID();
-            if (GetPlayerIdForBody(fid) != 0 || g_mappedLocal.contains(fid)) return true;
+            if (GetPlayerIdForBody(fid) != 0 || g_mappedLocal.contains(fid) || g_retired.contains(fid)) return true;
             auto* base = ref->GetObjectReference();
             const uint32_t b = base ? base->GetFormID() : 0;
             if (b == 0x00000007 || b == 0x0003C62E || b == 0x0018E8F2 || b >= 0xFFF00000) return true;
@@ -124,8 +127,18 @@ namespace F4MP::DynamicActors
             return 0;
         }
 
+        // A copy we just placed, in the half second before it's mapped: it looked like a spawn of our own,
+        // was announced and its gear sent, and the other game made a copy of the copy.
+        bool IsPendingCopy(uint32_t fid)
+        {
+            return g_inFlight && fid >= kRuntimeIdStart && !g_flight.before.contains(fid);
+        }
+
         void RemoveLocal(uint32_t fid)
         {
+            // The copy stays in the world until the disable takes effect: in that moment it looked like a spawn
+            // of our own and was announced back as ours. Retired = never ours again.
+            g_retired.insert(fid);
             if (auto* ref = Lookup<RE::TESObjectREFR>(fid)) {
                 ref->Disable();
                 ref->SetWantsDelete(true);
@@ -138,14 +151,20 @@ namespace F4MP::DynamicActors
     {
         if (!actor) return;
         const uint32_t hostId = actor->GetFormID();
-        if (hostId < kRuntimeIdStart || IsCoopOwned(actor) || !Authority::IOwn(actor)) return;
+        if (hostId < kRuntimeIdStart || IsCoopOwned(actor) || IsPendingCopy(hostId)) return;
+        // Not before we know where the host is: right after joining every spot looked like ours, and the
+        // settlers around a guest were claimed ahead of the host's own.
+        if (!Authority::HostAreaKnown()) return;
+        // Enemies are claimed once, where we had the area when they appeared, and stay ours (Authority::IOwn).
+        // Everyone else is announced only while their spot is ours.
+        if (!g_ourHostile.contains(hostId) && !Authority::IOwnArea(actor)) return;
         const auto now = Clock::now();
-        auto& last = g_lastAnnounced[hostId];
-        if (now - last < kAnnounceEvery) return;
-        last = now;
+        if (auto it = g_lastAnnounced.find(hostId); it != g_lastAnnounced.end() && now - it->second < kAnnounceEvery) return;
 
         const uint32_t spawnForm = SpawnFormFor(actor);
-        if (!spawnForm) return;
+        if (!spawnForm) return;   // nothing the others could copy: not claimed, area rules apply
+        g_lastAnnounced[hostId] = now;
+        if (auto* pl = Player(); pl && !actor->IsDead(false) && actor->GetHostileToActor(pl)) g_ourHostile.insert(hostId);
         Network::CoopDynamicActorMsg msg{};
         msg.hostRefId = hostId;
         msg.spawnFormId = spawnForm;
@@ -170,7 +189,12 @@ namespace F4MP::DynamicActors
         return it == g_map.end() ? nullptr : Lookup<RE::Actor>(it->second);
     }
 
-    bool IsMirrorCopy(uint32_t localFormId) { return g_mappedLocal.contains(localFormId); }
+    bool IsMirrorCopy(uint32_t localFormId)
+    {
+        return g_mappedLocal.contains(localFormId) || g_retired.contains(localFormId) || IsPendingCopy(localFormId);
+    }
+
+    bool IsOurAnnounced(uint32_t localFormId) { return g_ourHostile.contains(localFormId) && !g_mappedLocal.contains(localFormId); }
 
     bool OwnerOf(uint32_t localFormId, uint32_t& ownerId, uint32_t& ownerRefId)
     {
@@ -233,6 +257,16 @@ namespace F4MP::DynamicActors
             else ++it;
         }
 
+        // Removed copies the game has freed: the runtime ID may come back as a spawn of our own.
+        std::erase_if(g_retired, [](uint32_t fid) { return Lookup<RE::TESObjectREFR>(fid) == nullptr; });
+
+        // Our own announced actors that are gone: a reused runtime ID mustn't count as ours.
+        for (auto it = g_lastAnnounced.begin(); it != g_lastAnnounced.end();) {
+            auto* a = Lookup<RE::Actor>(it->first);
+            if (!a || a->IsDeleted() || now - it->second > std::chrono::minutes(2)) { g_ourHostile.erase(it->first); it = g_lastAnnounced.erase(it); }
+            else ++it;
+        }
+
         // 3. Start the next spawn (one at a time).
         if (!g_inFlight) {
             for (auto& [key, a] : g_announced) {
@@ -257,7 +291,8 @@ namespace F4MP::DynamicActors
             s_lastSweep = now;
             std::vector<RE::Actor*> ghosts;
             ForEachRuntimeActor(Range::Loaded(), [&](RE::Actor* a) {
-                if (!IsCoopOwned(a) && !a->IsDisabled() && !Authority::IOwn(a)) ghosts.push_back(a);
+                if (!IsCoopOwned(a) && !a->IsDisabled() && !g_ourHostile.contains(a->GetFormID()) && !Authority::IOwnArea(a))
+                    ghosts.push_back(a);
             });
             for (auto* a : ghosts) {
                 a->Disable();
@@ -278,10 +313,12 @@ namespace F4MP::DynamicActors
         g_mappedLocal.clear();
         g_announced.clear();
         g_lastAnnounced.clear();
+        g_ourHostile.clear();
         // Our own spawns we hid while another player ran the area: back in our world.
         for (uint32_t fid : g_suppressed)
             if (auto* a = Lookup<RE::Actor>(fid); a && a->IsDisabled() && !a->IsDeleted()) a->Enable(false);
         g_suppressed.clear();
+        g_retired.clear();
         g_inFlight = false;
     }
 }

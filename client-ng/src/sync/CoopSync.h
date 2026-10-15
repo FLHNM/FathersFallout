@@ -56,10 +56,15 @@ namespace F4MP::Coop
     void RegisterSinks();   // once, at kGameDataReady
     void Tick();            // ~10/s while connected
     void OnDisconnected();  // forget all per-session state
+    void OnGameLoaded();    // kPostLoadGame: hits sent before the load are dropped for a moment
 
     // Mirror side of NPC sync: copy the owner's health/death onto a mirrored NPC and forward
     // any damage our player dealt to it to the owner. Called from NpcsSync.
     void ApplyNpcVitals(RE::Actor* actor, uint32_t ownerId, uint32_t formId, float ownerHealth, bool ownerDead);
+
+    // A mirrored NPC's weapon was just swapped to its owner's (the model rebuilt holstered while the game
+    // still counts it as drawn): true once, when it should be drawn again. Called from NpcsSync.
+    bool TakeNpcRedraw(uint32_t localFormId);
 
     // Another player's health as they last reported it (any thread). False if not heard yet.
     bool GetPlayerVitals(uint32_t playerId, float& health, float& maxHealth, bool& dead);

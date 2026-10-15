@@ -117,7 +117,7 @@ struct DamageDealtMsg {
 
 #pragma pack(pop)
 
-constexpr uint32_t PROTOCOL_VERSION = 12;   // must match client-ng/src/network/NetworkClient.h
+constexpr uint32_t PROTOCOL_VERSION = 14;   // must match client-ng/src/network/NetworkClient.h
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 constexpr uint32_t MAX_PLAYERS = 64;
 

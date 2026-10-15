@@ -27,8 +27,11 @@ namespace F4MP::DynamicActors
     // Our local copy of an owner's runtime actor, or nullptr if not spawned (yet).
     RE::Actor* Resolve(uint32_t ownerId, uint32_t ownerRefId);
 
-    // Whether this local runtime actor is our copy of another player's.
+    // Whether this local runtime actor is our copy of another player's (or one being spawned as one).
     bool IsMirrorCopy(uint32_t localFormId);
+    // One of our own hostile runtime actors (a random encounter's enemies) we announced: ours to run until
+    // it's gone, wherever players go. Friendly ones (settlers, traders) follow the area rules.
+    bool IsOurAnnounced(uint32_t localFormId);
     // Our copy of another player's runtime actor -> (that player, their FormID for it).
     bool OwnerOf(uint32_t localFormId, uint32_t& ownerId, uint32_t& ownerRefId);
 

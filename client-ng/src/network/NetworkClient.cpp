@@ -334,7 +334,7 @@ void NetworkClient::PumpMessages() {
             } else if (static_cast<uint16_t>(header->type) >= static_cast<uint16_t>(MessageType::CoopFirst)) {
                 // Co-op sync: queue the raw payload; CoopSync applies it on the main thread.
                 const size_t payloadSize = (size_t)msg->m_cbSize - sizeof(MessageHeader);
-                CoopInboxItem item{ header->type, {} };
+                CoopInboxItem item{ header->type, {}, std::chrono::steady_clock::now() };
                 item.payload.assign(static_cast<const uint8_t*>(payload), static_cast<const uint8_t*>(payload) + payloadSize);
                 std::lock_guard<std::mutex> lock(m_coopMutex);
                 m_coopInbox.push_back(std::move(item));

@@ -39,6 +39,21 @@
 
 namespace F4MP
 {
+    // Actor::weaponState is a 3-bit field of a signed enum: "want to holster" (4) and "holstering" (5) read
+    // back as -4 / -3, so comparisons with those states never matched and GetWeaponMagicDrawn said "away"
+    // mid-holster.
+    static int WeaponStateOf(const RE::Actor* a) { return static_cast<int>(a->weaponState) & 7; }
+
+    // An AI holstering against its player's / owner's state: the graph's Unequip was dropped
+    // (GraphOverride), so the model is still in the hands; put the state back to drawn.
+    static bool KeepDrawn(RE::Actor* a)
+    {
+        const int ws = WeaponStateOf(a);
+        if (ws != 4 && ws != 5) return false;
+        a->SetWeaponState(RE::WEAPON_STATE::kDrawn);
+        return true;
+    }
+
     static char g_serverAddr[64] = "127.0.0.1";
     static int  g_serverPort = 7779;
     static char g_playerName[64] = "Wastelander";
@@ -151,6 +166,39 @@ namespace F4MP
         }
     }
 
+    // ---- The pre-war intro: no co-op until the character has left Vault 111 ----
+    // A save from the intro (the autosave after making the character, or quitting before the vault) loaded,
+    // auto-connected and travelled to the host: the intro broke, the player was stuck in pre-war Sanctuary
+    // and the connection timed out (seen in Update 17 over the internet).
+    static std::atomic<bool> g_inIntro{ false };
+
+    // Main thread. Pre-war world or pre-war vault, or the Vault 111 cryo cells before Out of Time started.
+    static bool RefreshInIntro()
+    {
+        bool intro = false;
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        auto* cell = pl ? pl->GetParentCell() : nullptr;
+        if (cell) {
+            const uint32_t c = cell->GetFormID();
+            const uint32_t ws = cell->worldSpace ? cell->worldSpace->GetFormID() : 0;
+            constexpr uint32_t kSanctuaryHillsWorld = 0x000A7FF4, kPrewarVault111 = 0x000CA260, kPrewarVault111Ext = 0x000A8031;
+            constexpr uint32_t kVault111Cryo = 0x000016D8, kVault111Start = 0x000016D9, kMQ102 = 0x0001CC2A;
+            if (ws == kSanctuaryHillsWorld || c == kPrewarVault111 || c == kPrewarVault111Ext) intro = true;
+            if (c == kVault111Cryo || c == kVault111Start) {
+                auto* f = RE::TESForm::GetFormByID(kMQ102);
+                auto* q = f ? f->As<RE::TESQuest>() : nullptr;
+                intro = q && q->currentStage == 0;   // still frozen: Out of Time hasn't begun
+            }
+        }
+        g_inIntro = intro;
+        return intro;
+    }
+
+    static void NotifyIntro()
+    {
+        Notify("FathersFallout: finish the intro first - leave Vault 111 and save, then load that save to play co-op");
+    }
+
     static std::string g_serverExe;            // F4MP.ini [Connect] ServerExe=
     static std::atomic<int> g_retriesLeft{ 0 };  // automatic reconnect attempts left
 
@@ -212,6 +260,7 @@ namespace F4MP
     // Menu button and auto-connect both come here. Runs off the main thread (may wait on the server).
     static void ConnectNow(int a_retries)
     {
+        if (g_inIntro) { NotifyIntro(); return; }
         std::thread([a_retries]() {
             auto& net = Network::NetworkClient::GetInstance();
             if (net.IsConnected() || net.IsConnecting()) return;
@@ -347,6 +396,35 @@ namespace F4MP
                     std::sscanf(cmd.c_str() + 11, "%d %f", &mode, &scale);
                     AimHook::SetSpine(mode, scale);
                     REX::INFO("[Bridge] body spine mode {} scale {:.2f}", mode, scale);
+                    continue;
+                }
+                // Test helper: "f4mp:actor <hex>" logs how an actor is drawn (an NPC you can target but not see).
+                if (cmd.rfind("f4mp:actor ", 0) == 0) {
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 11, nullptr, 16));
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    if (!a) { REX::INFO("[Bridge] no such actor"); continue; }
+                    auto* root = a->Get3D();
+                    auto* fade = root ? root->IsFadeNode() : nullptr;
+                    auto* cell = a->GetParentCell();
+                    const auto p = a->GetPosition();
+                    int children = 0, culled = 0;
+                    if (auto* node = root ? root->IsNode() : nullptr)
+                        for (auto& c : node->children) { ++children; if (c && c->GetAppCulled()) ++culled; }
+                    REX::INFO("[Bridge] actor {:#x}: 3D {} culled {} fade {:.2f} children {} ({} culled) disabled {} dead {} cell {:#x} attached {} pos {:.0f} {:.0f} {:.0f}",
+                        a->GetFormID(), root != nullptr, root && root->GetAppCulled(), fade ? fade->currentFade : -1.0f, children, culled,
+                        a->IsDisabled(), a->IsDead(false), cell ? cell->GetFormID() : 0u, cell && cell->IsAttached(), p.x, p.y, p.z);
+                    std::string eq;
+                    if (auto* mh = a->currentProcess ? a->currentProcess->middleHigh : nullptr) {
+                        RE::BSAutoLock l{ mh->equippedItemsLock };
+                        for (auto& e : mh->equippedItems)
+                            if (e.item.object) {
+                                auto* w = e.item.object->As<RE::TESObjectWEAP>();
+                                auto* ammo = w ? (e.item.instanceData ? static_cast<RE::TESObjectWEAP::InstanceData*>(e.item.instanceData.get())->ammo : w->weaponData.ammo) : nullptr;
+                                eq += std::format(" {:08X}{}", e.item.object->GetFormID(),
+                                    ammo ? std::format("(ammo {:08X} x{})", ammo->GetFormID(), a->GetInventoryObjectCount(ammo)) : "");
+                            }
+                    }
+                    REX::INFO("[Bridge]   drawn {} state {} equipped:{}", a->GetWeaponMagicDrawn(), static_cast<int>(a->weaponState) & 7, eq);
                     continue;
                 }
                 // Test helper: "f4mp:pitchscale <graph units per radian>" for the bodies' aim.
@@ -752,6 +830,8 @@ namespace F4MP
                            std::vector<std::chrono::steady_clock::time_point> redraws;
                            // Standing still: is the body still getting closer to its spot, or blocked?
                            std::chrono::steady_clock::time_point idleCheckAt{}; float idleCheckLag = 0.0f; bool blocked = false;
+                           bool parked = false;   // stuck off its spot while its player stands: put there once, then left alone
+                           RE::NiPoint3 idleCheckTarget{};
                            // The received speed jumps 0 / 1x / 2x between packets (sends and frames aren't in
                            // step): smoothed for the gait, and "standing" only after 250 ms without movement.
                            float rxSmooth = 0.0f; float lastRxSpeed = 0.0f; std::chrono::steady_clock::time_point lastRxMoveAt{};
@@ -1022,6 +1102,21 @@ namespace F4MP
 
     static void BodiesSync()
     {
+        // An intro save loaded while connected: leave the session before anything travels or syncs.
+        {
+            static std::chrono::steady_clock::time_point s_next{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= s_next) {
+                s_next = now + std::chrono::seconds(1);
+                auto& n = Network::NetworkClient::GetInstance();
+                if (RefreshInIntro() && (n.IsConnected() || n.IsConnecting())) {
+                    REX::WARN("[F4MP] in the pre-war intro while connected: leaving the session");
+                    n.Disconnect();
+                    g_retriesLeft = 0;
+                    NotifyIntro();
+                }
+            }
+        }
         {
             // A load stalls this task: a gap of a second or more since the last call counts too.
             static std::chrono::steady_clock::time_point s_lastCall{};
@@ -1208,18 +1303,37 @@ namespace F4MP
                 if (idle) st.rxSmooth = 0.0f;
                 if (!idle) {
                     st.blocked = false;
+                    st.parked = false;
                     st.idleCheckAt = {};
                 } else if (st.idleCheckAt == std::chrono::steady_clock::time_point{}) {
                     st.idleCheckAt = ahora;
                     st.idleCheckLag = lagXY;
+                    st.idleCheckTarget = objetivo;
                 } else if (ahora - st.idleCheckAt > std::chrono::milliseconds(300)) {
                     // Close by and < 4 units closer in 0.3 s. Not further off: a body left alone with a
                     // walk still playing walks off on the animation's own motion, and must be brought back.
-                    st.blocked = lagXY < 64.0f && lagXY > st.idleCheckLag - 4.0f;
+                    // Only while its spot really stays put (a sender's speed of 0 alone isn't proof).
+                    const RE::NiPoint3 tm = objetivo - st.idleCheckTarget;
+                    const bool spotStill = tm.x * tm.x + tm.y * tm.y + tm.z * tm.z < 8.0f * 8.0f;
+                    const bool noProgress = lagXY > st.idleCheckLag - 4.0f;
+                    st.blocked = lagXY < 64.0f && noProgress;
+                    // Further off, or at another height (stairs, a floor inside), and not getting there: it
+                    // was pushed every tick for good, that push read as walking, and the body walked in place
+                    // after every interior load. Put it on the spot once and leave it.
+                    if (spotStill && noProgress && !st.parked && !(st.blocked && std::fabs(delta.z) < 48.0f) && (lagXY >= 24.0f || std::fabs(delta.z) >= 48.0f)) {
+                        actor->SetPosition(objetivo, true);
+                        st.parked = true;
+                        st.havePos = false;
+                        static int s_logged = 0;
+                        if (s_logged++ < 20)
+                            REX::INFO("[F4MP] body of player {} stuck {:.0f} units off (height {:.0f}) while its player stands: placed", pid, lagXY, delta.z);
+                    }
+                    if (st.parked && (lagXY > 200.0f || !spotStill)) st.parked = false;   // drifted off / its spot moved
                     st.idleCheckAt = ahora;
                     st.idleCheckLag = lagXY;
+                    st.idleCheckTarget = objetivo;
                 }
-                const bool settled = idle && std::fabs(delta.z) < 48.0f && (lagXY < 24.0f || st.blocked);
+                const bool settled = idle && (st.parked || (std::fabs(delta.z) < 48.0f && (lagXY < 24.0f || st.blocked)));
                 if (!settled) {
                     const float alpha = 0.35f;            // suavizado por tick (~60/s)
                     RE::NiPoint3 nueva{ actual.x + delta.x * alpha,
@@ -1371,7 +1485,11 @@ namespace F4MP
             if (!Coop::EquipmentSettled(pid, fid)) {
                 st.lastDrawCheck = ahora;
             } else {
-                const bool actual = actor->GetWeaponMagicDrawn();
+                if (rp.weaponDrawn && st.drawReached && KeepDrawn(actor)) {
+                    static int s_kept = 0;
+                    if (s_kept++ < 20) REX::INFO("[F4MP] body of player {}: its AI started holstering - kept drawn", pid);
+                }
+                const bool actual = WeaponStateOf(actor) >= 3;
                 const bool changed = st.weaponDrawn != rp.weaponDrawn;
                 // Reached the wanted state since our last request? Then a later difference means
                 // something else changed it (0.5 s to correct). Not reached yet: the draw animation
@@ -1385,10 +1503,8 @@ namespace F4MP
                     // Stuck half-way (wants to draw / drawing, or the same for holstering) since our last
                     // request: asking again does nothing, the state machine thinks it's under way. Put
                     // the state back to where the request starts from first.
-                    const auto ws = actor->weaponState;
-                    const bool stuck = drifted && !st.drawReached &&
-                                       (ws == RE::WEAPON_STATE::kWantToDraw || ws == RE::WEAPON_STATE::kDrawing ||
-                                        ws == RE::WEAPON_STATE::kWantToSheathe || ws == RE::WEAPON_STATE::kSheathing);
+                    const int ws = WeaponStateOf(actor);
+                    const bool stuck = drifted && !st.drawReached && ws != 0 && ws != 3;
                     if (stuck) {
                         actor->SetWeaponState(rp.weaponDrawn ? RE::WEAPON_STATE::kSheathed : RE::WEAPON_STATE::kDrawn);
                         // Inside nothing ever picked the request up: it sat at "want to
@@ -1397,7 +1513,7 @@ namespace F4MP
                         static int s_stuck = 0;
                         if (s_stuck++ < 20)
                             REX::INFO("[F4MP] body of player {}: weapon stuck in state {} - reset, {} again", pid,
-                                static_cast<int>(ws) & 7, rp.weaponDrawn ? "drawing" : "holstering");
+                                ws, rp.weaponDrawn ? "drawing" : "holstering");
                     }
                     actor->DrawWeaponMagicHands(rp.weaponDrawn);
                     st.weaponDrawn = rp.weaponDrawn;
@@ -1405,7 +1521,7 @@ namespace F4MP
                     st.drawReached = false;
                     if (drifted && g_bodyTrace)
                         REX::INFO("[Trace] p{} weapon {} again (state {}, process {})", pid, rp.weaponDrawn ? "drawn" : "holstered",
-                            static_cast<int>(ws) & 7, actor->currentProcess ? static_cast<int>(actor->currentProcess->processLevel) : -1);
+                            ws, actor->currentProcess ? static_cast<int>(actor->currentProcess->processLevel) : -1);
                 }
                 // Something else still fights the weapon state: 3 undone in 5 s = re-calm the AI.
                 if (undone) {
@@ -1651,7 +1767,7 @@ namespace F4MP
         bool moving = false; float smoothSpeed = 0.0f;
         bool init = false; float heading = 0.0f;
         bool sneaking = false; int gait = 0;   // 0 none, 1 walk, 2 run
-        bool drawn = false; std::chrono::steady_clock::time_point drawAt{};
+        bool drawn = false; bool ownerDrawn = false; std::chrono::steady_clock::time_point drawAt{};
     };
     static std::unordered_map<uint32_t, NpcAnimState> g_npcAnim;
     // Mirrored NPCs replay their owner's attacks (CoopNpcAnim) for show: the owner's game deals the
@@ -1881,7 +1997,10 @@ namespace F4MP
             {
                 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_why;
                 auto& w = s_why[fid];
-                if (std::chrono::steady_clock::now() - w > std::chrono::seconds(30) && (!actor || !actor->Get3D() || Authority::IOwn(actor))) {
+                // Every 30 s per NPC filled shared logs; the first 80 tell the story.
+                static int s_lines = 0;
+                if (s_lines < 80 && std::chrono::steady_clock::now() - w > std::chrono::seconds(30) && (!actor || !actor->Get3D() || Authority::IOwn(actor))) {
+                    ++s_lines;
                     w = std::chrono::steady_clock::now();
                     REX::INFO("[World] host NPC {:#x} from player {}: actor {} 3D {} ours {} disabled {}", fid, owner, actor != nullptr,
                         actor && actor->Get3D(), actor && Authority::IOwn(actor), actor && actor->IsDisabled());
@@ -1903,6 +2022,14 @@ namespace F4MP
                 REX::INFO("[F4MP] NPC {:#x} mirrored from player {}", local, owner);
             }
             g_drivenOwner[local] = owner;
+            // Its own AI must never fight: it went for a body or the player on sight (testing: a mirrored radroach
+            // bit the bot's body nonstop; : a copy shot the guest). The owner's attacks are replayed.
+            if (actor->IsInCombat()) {
+                actor->StopCombat();
+                actor->InitiateDoNothingPackage();
+                static int s_calmed = 0;
+                if (s_calmed++ < 20) REX::INFO("[F4MP] mirrored NPC {:#x} went into combat on its own: stopped", local);
+            }
 
             // Dead here but alive in its owner's game (the museum raiders were long dead in
             // the guest's save, yet the host's shot at him while she saw corpses). Not right away: our
@@ -1982,9 +2109,40 @@ namespace F4MP
             {
                 const bool want = (s.flags & Network::kNpcWeaponDrawn) != 0;
                 const auto t = std::chrono::steady_clock::now();
-                if (actor->GetWeaponMagicDrawn() != want && t - anim.drawAt > std::chrono::milliseconds(500)) {
+                GraphOverride::SetMirrorDrawn(local, want);
+                if (want != anim.ownerDrawn) {
+                    anim.ownerDrawn = want;
+                    static int s_logged = 0;
+                    if (s_logged++ < 40) REX::INFO("[F4MP] mirrored NPC {:#x}: owner's copy has its weapon {} (flags {:#x}, ours drawn {} state {})", local,
+                        want ? "out" : "away", s.flags, actor->GetWeaponMagicDrawn(), static_cast<int>(actor->weaponState) & 7);
+                }
+                const bool kept = want && KeepDrawn(actor);
+                if (kept) {
+                    static int s_kept = 0;
+                    if (s_kept++ < 20) REX::INFO("[F4MP] mirrored NPC {:#x}: its AI started holstering - kept drawn", local);
+                }
+                if (Coop::TakeNpcRedraw(local) && want) {
+                    anim.drawAt = t;
+                    actor->DrawWeaponMagicHands(true);
+                } else if (!kept && (WeaponStateOf(actor) >= 3) != want && t - anim.drawAt > std::chrono::milliseconds(1500)) {
+                    // Asked before and still not there: stuck half-way ("want to draw" that nothing picks up,
+                    // as bodies did; testing: a mirrored Preston never drew). Reset the state and use the graph's
+                    // own draw/holster event, then ask again.
+                    const int ws = WeaponStateOf(actor);
+                    if (anim.drawAt != std::chrono::steady_clock::time_point{} && ws != 0 && ws != 3) {
+                        actor->SetWeaponState(want ? RE::WEAPON_STATE::kSheathed : RE::WEAPON_STATE::kDrawn);
+                        GraphOverride::SendEvent(actor, want ? "WeapEquip" : "Unequip");
+                        static int s_stuck = 0;
+                        if (s_stuck++ < 20)
+                            REX::INFO("[F4MP] mirrored NPC {:#x}: weapon stuck in state {} - reset, {} again", local,
+                                ws, want ? "drawing" : "holstering");
+                    }
                     anim.drawAt = t;
                     actor->DrawWeaponMagicHands(want);
+                    static int s_draws = 0;
+                    if (s_draws++ < 30)
+                        REX::INFO("[F4MP] mirrored NPC {:#x}: weapon {} (state {} -> {}, drawn now {})", local, want ? "drawn" : "away",
+                            ws, WeaponStateOf(actor), WeaponStateOf(actor) >= 3);
                 }
             }
         }
@@ -2146,7 +2304,7 @@ namespace F4MP
         FinishTravel();
         auto& net = Network::NetworkClient::GetInstance();
         if (!net.IsConnected()) { g_travelDone = false; return; }
-        if (g_isHost || !g_travelOnJoin || g_travelDone) return;
+        if (g_isHost || !g_travelOnJoin || g_travelDone || g_inIntro) return;
         auto remotos = net.GetRemotePlayers();
         auto host = remotos.find(Authority::HostId());
         if (host == remotos.end() || host->second.cellId == 0) return;   // where the host is isn't known yet
@@ -2290,6 +2448,7 @@ namespace F4MP
             if (ImGuiMCP::Button("Join")) {
                 g_isHost = false;
                 SaveConnectIni(s_auto);
+                RefreshInIntro();
                 ConnectNow(2);
             }
             ImGuiMCP::EndDisabled();
@@ -2303,6 +2462,7 @@ namespace F4MP
                 g_isHost = true;
                 std::snprintf(g_serverAddr, sizeof(g_serverAddr), "127.0.0.1");
                 SaveConnectIni(s_auto);
+                RefreshInIntro();
                 ConnectNow(2);
             }
             if (g_serverExe.empty())
@@ -2553,6 +2713,7 @@ namespace F4MP
             g_travelOnJoin = GetPrivateProfileIntA("Connect", "TravelOnJoin", 1, ini) != 0;
         }
         if (!GetPrivateProfileIntA("Connect", "AutoConnect", 0, ini)) return;
+        if (RefreshInIntro()) { NotifyIntro(); REX::INFO("[F4MP] auto-connect skipped: this save is in the pre-war intro"); return; }
         s_done = true;
 
         GetPrivateProfileStringA("Connect", "Server", g_serverAddr, g_serverAddr, sizeof(g_serverAddr), ini);
@@ -2577,6 +2738,7 @@ namespace F4MP
         // would break it. New players join once they've left Vault 111 and saved.
         if (a_msg->type == F4SE::MessagingInterface::kPostLoadGame) {
             F4MP::Workshop::OnGameLoaded();
+            F4MP::Coop::OnGameLoaded();
             AutoConnectFromIni();
         }
 

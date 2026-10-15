@@ -77,12 +77,22 @@ namespace F4MP::GraphOverride
         // NPCs mirrored from another player's game (their FormIDs): their own AI's idles are dropped.
         std::mutex g_mirrorLock;
         std::unordered_set<std::uint32_t> g_mirrors;
+        std::unordered_map<std::uint32_t, bool> g_mirrorDrawn;   // whether its owner's copy has the weapon out
+        std::atomic<unsigned long long> g_mirrorWeaponBlocked{ 0 };
         std::atomic<unsigned long long> g_idlesBlocked{ 0 };
 
         bool IsMirror(std::uint32_t a_fid)
         {
             std::lock_guard l(g_mirrorLock);
             return g_mirrors.contains(a_fid);
+        }
+
+        // -1: not a mirror or not known yet; else 1/0 = its owner's copy has the weapon out / away.
+        int MirrorWantsDrawn(std::uint32_t a_fid)
+        {
+            std::lock_guard l(g_mirrorLock);
+            auto it = g_mirrorDrawn.find(a_fid);
+            return it == g_mirrorDrawn.end() ? -1 : (it->second ? 1 : 0);
         }
 
         void Hook(const Holder* a_self, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>& a_mgr)
@@ -173,6 +183,18 @@ namespace F4MP::GraphOverride
                 // A mirrored NPC idles only as its owner's copy does (CoopNpcAnim): its own AI picked
                 // other idles than the owner's.
                 const char* ev = a_event.c_str();
+                // Its own AI holstering a gun its owner's copy holds out (an idle NPC on a do-nothing package
+                // puts its weapon away right after every draw), or drawing one the owner keeps away.
+                if (ev) {
+                    const int want = MirrorWantsDrawn(static_cast<RE::Actor*>(a_self)->GetFormID());
+                    if ((want == 1 && _stricmp(ev, "Unequip") == 0) || (want == 0 && _stricmp(ev, "WeapEquip") == 0)) {
+                        const auto n = g_mirrorWeaponBlocked.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (n <= 20 || n % 200 == 0)
+                            REX::INFO("[GraphOverride] mirrored NPC {:#x}: its AI's {} dropped (owner has the weapon {}) (#{})",
+                                static_cast<RE::Actor*>(a_self)->GetFormID(), ev, want ? "out" : "away", n);
+                        return true;
+                    }
+                }
                 if (ev && IsNpcIdleEvent(ev) && IsMirror(static_cast<RE::Actor*>(a_self)->GetFormID())) {
                     const auto n = g_idlesBlocked.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (n <= 20 || n % 500 == 0)
@@ -430,13 +452,20 @@ namespace F4MP::GraphOverride
     {
         std::lock_guard l(g_mirrorLock);
         if (a_on) g_mirrors.insert(a_formId);
-        else g_mirrors.erase(a_formId);
+        else { g_mirrors.erase(a_formId); g_mirrorDrawn.erase(a_formId); }
+    }
+
+    void SetMirrorDrawn(std::uint32_t a_formId, bool a_drawn)
+    {
+        std::lock_guard l(g_mirrorLock);
+        if (g_mirrors.contains(a_formId)) g_mirrorDrawn[a_formId] = a_drawn;
     }
 
     void ClearMirrors()
     {
         std::lock_guard l(g_mirrorLock);
         g_mirrors.clear();
+        g_mirrorDrawn.clear();
     }
 
     unsigned long long CallCount() { return g_calls.load(); }

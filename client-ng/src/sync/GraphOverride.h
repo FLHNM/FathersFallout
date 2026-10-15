@@ -56,6 +56,8 @@ namespace F4MP::GraphOverride
     // from another player's game plays only the idles its owner sends, not ones its own AI picks.
     bool IsNpcIdleEvent(const char* a_event);
     void SetMirror(std::uint32_t a_formId, bool a_on);
+    // Whether a mirrored NPC's owner has its weapon out: its own AI's draw/holster against that is dropped.
+    void SetMirrorDrawn(std::uint32_t a_formId, bool a_drawn);
     void ClearMirrors();
 
     unsigned long long CallCount();      // diagnostics: how often the hook ran / overrode

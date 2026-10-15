@@ -15,6 +15,7 @@
 #include "sync/Workshop.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -63,10 +64,8 @@ namespace F4MP::Coop
         }
 
         // The object mods attached to an item reference (its instance data), for sending.
-        uint8_t ReadMods(const RE::ExtraDataList* extra, CoopModEntry* out)
+        uint8_t ReadInstanceMods(const RE::BGSObjectInstanceExtra* inst, CoopModEntry* out)
         {
-            if (!extra) return 0;
-            auto* inst = extra->GetByType<RE::BGSObjectInstanceExtra>();
             if (!inst || !inst->values) return 0;
             uint8_t n = 0;
             for (auto& d : inst->GetIndexData()) {
@@ -75,6 +74,11 @@ namespace F4MP::Coop
                 out[n++] = { d.objectID, d.index, d.rank, {} };
             }
             return n;
+        }
+
+        uint8_t ReadMods(const RE::ExtraDataList* extra, CoopModEntry* out)
+        {
+            return extra ? ReadInstanceMods(extra->GetByType<RE::BGSObjectInstanceExtra>(), out) : 0;
         }
 
         // Puts the sender's mods on our copy (it was created with the base object's defaults).
@@ -161,6 +165,46 @@ namespace F4MP::Coop
         void AddItems(RE::TESObjectREFR* container, RE::TESBoundObject* obj, int32_t count)
         {
             container->AddObjectToContainer(obj, nullptr, count, nullptr, RE::ITEM_REMOVE_REASON::kNone);
+        }
+
+        // One item with the sender's mods, straight into a container: a fresh stack whose instance data
+        // carries them (a modded gun put in a box came out as the plain base gun on the other side).
+        bool AddModdedItem(RE::TESObjectREFR* container, RE::TESBoundObject* obj, const CoopModEntry* mods, uint8_t count)
+        {
+            RE::BSTSmartPointer<RE::ExtraDataList> list{ new RE::ExtraDataList() };
+            auto* inst = new RE::BGSObjectInstanceExtra();
+            int ok = 0;
+            for (uint8_t i = 0; i < std::min<uint8_t>(count, static_cast<uint8_t>(kMaxItemMods)); ++i)
+                if (auto* mod = LookupForm<RE::BGSMod::Attachment::Mod>(mods[i].modFormId)) {
+                    inst->AddMod(*mod, mods[i].index, mods[i].rank, false);
+                    ++ok;
+                }
+            if (!ok) { delete inst; return false; }
+            list->AddExtra(inst);
+            container->AddObjectToContainer(obj, list, 1, nullptr, RE::ITEM_REMOVE_REASON::kNone);
+            return true;
+        }
+
+        // The mods on the stack that just moved into a container. The event's unique ID is 0 for the
+        // player's items (seen in game), so: the event's stack when it names one, else the first stack of
+        // that item we haven't reported yet (two pipe pistols put in one after another are two stacks).
+        std::unordered_map<uint64_t, std::unordered_set<const RE::ExtraDataList*>> g_reportedStacks;   // (container, item)
+
+        uint8_t ReadMovedStackMods(RE::TESObjectREFR* container, uint32_t baseId, uint16_t uniqueId, CoopModEntry* out)
+        {
+            auto* inv = container ? container->inventoryList : nullptr;
+            if (!inv) return 0;
+            auto& reported = g_reportedStacks[(static_cast<uint64_t>(container->GetFormID()) << 32) | baseId];
+            for (auto& item : inv->data) {
+                if (!item.object || item.object->GetFormID() != baseId) continue;
+                for (auto* s = item.stackData.get(); s; s = s->nextStack.get()) {
+                    auto* uid = s->extra ? s->extra->GetByType<RE::ExtraUniqueID>() : nullptr;
+                    if (uniqueId && uid && uid->uniqueID == uniqueId) return ReadMods(s->extra.get(), out);
+                }
+                for (auto* s = item.stackData.get(); s; s = s->nextStack.get())
+                    if (s->extra && reported.insert(s->extra.get()).second) return ReadMods(s->extra.get(), out);
+            }
+            return 0;
         }
 
         void RemoveItems(RE::TESObjectREFR* container, RE::TESBoundObject* obj, int32_t count)
@@ -422,7 +466,7 @@ namespace F4MP::Coop
         // test saw only the host's name tag after spawning it right at the end of a fast-travel
         // load. Log each body's render state now and then, undo a stuck fade-in or cull, and
         // replace a body whose 3D never shows up.
-        struct BodyVis { Clock::time_point firstSeen{}, no3DSince{}, lastLog{}; bool no3D = false; };
+        struct BodyVis { Clock::time_point firstSeen{}, no3DSince{}, lastLog{}, lastFadeLog{}; bool no3D = false; };
         std::unordered_map<uint32_t, BodyVis> g_bodyVis;
 
         void WatchBodyVisibility(uint32_t pid, RE::Actor* body)
@@ -455,7 +499,11 @@ namespace F4MP::Coop
                 REX::WARN("[Body] player {}: body 3D was culled, shown again", pid);
             }
             if (fade && fade->currentFade < 0.5f && now - v.firstSeen > std::chrono::seconds(4)) {
-                REX::WARN("[Body] player {}: body stuck faded out ({:.2f}), forced visible", pid, fade->currentFade);
+                // Some fades come back every frame (seen 10/s after a body rebuild): log the first few.
+                if (now - v.lastFadeLog > std::chrono::seconds(5)) {
+                    v.lastFadeLog = now;
+                    REX::WARN("[Body] player {}: body stuck faded out ({:.2f}), forced visible", pid, fade->currentFade);
+                }
                 fade->currentFade = 1.0f;
             }
         }
@@ -473,6 +521,8 @@ namespace F4MP::Coop
             }
         }
 
+        std::atomic<int64_t> g_loadedAtMs{ 0 };   // steady clock, last kPostLoadGame
+
         void OnPlayerDamage(const CoopPlayerDamageMsg& m)
         {
             auto& net = NetworkClient::GetInstance();
@@ -480,17 +530,29 @@ namespace F4MP::Coop
             auto* pl = RE::PlayerCharacter::GetSingleton();
             auto* hp = HealthAV();
             if (!pl || !hp || m.damage <= 0.0f || m.damage > 100000.0f) return;
+            // Hits that queued up while we lay dead and the save reloaded landed on the fresh character
+            //.
+            const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+            if (pl->IsDead(false) || nowMs - g_loadedAtMs.load() < 3000) {
+                static int s_dropped = 0;
+                if (s_dropped++ < 20) REX::INFO("[Coop] player {}'s hit for {:.1f} dropped (dead or just loaded)", m.senderId, m.damage);
+                return;
+            }
             pl->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, -m.damage);
             g_stats.applied++;
             const float left = pl->GetActorValue(*hp);
-            REX::INFO("[Coop] player {} hit us for {:.1f} ({:.0f} health left)", m.senderId, m.damage, left);
+            if (m.byNpc) REX::INFO("[Coop] an NPC in player {}'s game hit us for {:.1f} ({:.0f} health left)", m.senderId, m.damage, left);
+            else REX::INFO("[Coop] player {} hit us for {:.1f} ({:.0f} health left)", m.senderId, m.damage, left);
             // Health alone can sit at 0 without the player dying; the real hit would have killed.
             if (left <= 0.0f && !pl->IsDead(false)) {
+                // Only a real PvP shot names the other player's body as the killer (an NPC's kill credited to
+                // the friend's body: 's "killed by player 1").
                 RE::Actor* attacker = nullptr;
-                for (auto& [pid, bodyId] : GetBodies())
-                    if (pid == m.senderId) attacker = LookupForm<RE::Actor>(bodyId);
+                if (!m.byNpc)
+                    for (auto& [pid, bodyId] : GetBodies())
+                        if (pid == m.senderId) attacker = LookupForm<RE::Actor>(bodyId);
                 pl->KillImpl(attacker, m.damage, true, false);
-                REX::INFO("[Coop] killed by player {}", m.senderId);
+                REX::INFO("[Coop] killed by {} {}", m.byNpc ? "an NPC in player" : "player", m.senderId);
             }
         }
 
@@ -512,6 +574,212 @@ namespace F4MP::Coop
             REX::INFO("[Coop] player {} hit our NPC {:#x} for {:.1f}", m.senderId, m.npcFormId, m.damage);
         }
 
+        // ---------- NPC equipment ----------
+        // What an NPC wears and holds as its own game shows it. Armor from the biped (the models really
+        // on it; skin and race parts aren't in its inventory), the weapon from its equipped items, that
+        // weapon's mods from its inventory stack or, drawn, from the model in its hands.
+        struct Worn
+        {
+            std::vector<uint32_t> forms;   // sorted: armor + weapon
+            uint32_t weapon = 0;
+            uint8_t numMods = 0;
+            CoopModEntry mods[kMaxItemMods]{};
+        };
+
+        bool IsWeapon(const RE::TESForm* f) { return f && f->GetFormType() == RE::ENUM_FORM_ID::kWEAP; }
+
+        Worn ReadWorn(RE::Actor* a)
+        {
+            Worn w;
+            if (!a) return w;
+            auto* biped = a->biped.get();
+            if (biped) {
+                for (std::size_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kEditorTotal); ++i) {
+                    auto* obj = biped->object[i].parent.object;
+                    auto* bound = obj && obj->GetFormType() == RE::ENUM_FORM_ID::kARMO ? obj->As<RE::TESBoundObject>() : nullptr;
+                    if (bound && a->GetInventoryObjectCount(bound) > 0) w.forms.push_back(bound->GetFormID());
+                }
+            }
+            auto* mh = a->currentProcess ? a->currentProcess->middleHigh : nullptr;
+            if (mh) {
+                RE::BSAutoLock l{ mh->equippedItemsLock };
+                for (auto& e : mh->equippedItems)
+                    if (IsWeapon(e.item.object)) { w.weapon = e.item.object->GetFormID(); break; }
+            }
+            if (w.weapon) {
+                w.forms.push_back(w.weapon);
+                // Mods: the equipped stack, else the drawn model's, else the only modded stack it carries.
+                const RE::BGSObjectInstanceExtra* drawnMods = nullptr;
+                if (biped)
+                    for (std::size_t i = std::to_underlying(RE::BIPED_OBJECT::kEditorTotal); i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i)
+                        if (auto& b = biped->object[i]; b.parent.object && b.parent.object->GetFormID() == w.weapon && b.modExtra) { drawnMods = b.modExtra; break; }
+                uint8_t anyMods = 0;
+                CoopModEntry any[kMaxItemMods]{};
+                if (auto* inv = a->inventoryList)
+                    for (auto& item : inv->data) {
+                        if (!item.object || item.object->GetFormID() != w.weapon) continue;
+                        for (auto* st = item.stackData.get(); st && !w.numMods; st = st->nextStack.get()) {
+                            if (st->IsEquipped()) w.numMods = ReadMods(st->extra.get(), w.mods);
+                            else if (!anyMods) anyMods = ReadMods(st->extra.get(), any);
+                        }
+                    }
+                if (!w.numMods && drawnMods) w.numMods = ReadInstanceMods(drawnMods, w.mods);
+                if (!w.numMods && anyMods) { w.numMods = anyMods; std::copy_n(any, anyMods, w.mods); }
+            }
+            std::sort(w.forms.begin(), w.forms.end());
+            w.forms.erase(std::unique(w.forms.begin(), w.forms.end()), w.forms.end());
+            return w;
+        }
+
+        std::vector<uint32_t> WornKey(const Worn& w)
+        {
+            auto k = ModKey(w.weapon, w.mods, w.numMods);
+            k.insert(k.end(), w.forms.begin(), w.forms.end());
+            return k;
+        }
+
+        struct SentWorn { std::vector<uint32_t> key; Clock::time_point at; };
+        std::unordered_map<uint32_t, SentWorn> g_npcWornSent;                   // owner: our FormID -> last sent
+        std::unordered_map<uint64_t, Worn> g_npcWornWant;                       // mirror: (owner, owner FormID) -> latest
+        std::unordered_map<uint32_t, std::vector<uint32_t>> g_npcWornApplied;   // mirror: local FormID -> applied key
+        std::unordered_map<uint32_t, Clock::time_point> g_npcRedrawAt;          // mirror: weapon swapped, draw it again after
+
+        // Owner side, once a second: every NPC our game runs, sent when it changes and every 10 s (late
+        // joiners, freshly spawned copies).
+        void SendNpcEquipment()
+        {
+            static Clock::time_point s_next{};
+            const auto now = Clock::now();
+            if (now < s_next) return;
+            s_next = now + std::chrono::seconds(1);
+            auto* pl = RE::PlayerCharacter::GetSingleton();
+            auto* tes = RE::TES::GetSingleton();
+            if (!pl || !tes) return;
+            std::vector<RE::Actor*> mine;
+            tes->ForEachReferenceInRange(pl->GetPosition(), Range::Loaded(), [&](RE::TESObjectREFR* ref) {
+                auto* a = ref ? ref->As<RE::Actor>() : nullptr;
+                const uint32_t fid = a ? a->GetFormID() : 0;
+                // Body bases are built at runtime (>= FFF00000): a body just spawned isn't registered yet.
+                auto* base = a ? a->GetObjectReference() : nullptr;
+                if (base && base->GetFormID() >= 0xFFF00000) return RE::BSContainer::ForEachResult::kContinue;
+                if (a && a != pl && !a->IsDisabled() && !a->IsDead(false) && a->Get3D() && !GetPlayerIdForBody(fid) &&
+                    !(fid >= kDynamicFormIdStart && DynamicActors::IsMirrorCopy(fid)) && Authority::IOwn(a))
+                    mine.push_back(a);
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+            int sent = 0;
+            for (auto* a : mine) {
+                if (sent >= 16) break;
+                const Worn w = ReadWorn(a);
+                auto key = WornKey(w);
+                auto& last = g_npcWornSent[a->GetFormID()];
+                if (last.key == key && now - last.at < std::chrono::seconds(10)) continue;
+                if (last.key != key)
+                    REX::INFO("[NpcGear] our NPC {:#x}: weapon {:08X} ({} mods), {} items sent", a->GetFormID(), w.weapon, w.numMods, w.forms.size());
+                last = { std::move(key), now };
+                CoopNpcEquipmentMsg msg{};
+                msg.npcFormId = a->GetFormID();
+                msg.count = static_cast<uint8_t>(std::min<size_t>(w.forms.size(), std::size(msg.forms)));
+                for (uint8_t i = 0; i < msg.count; ++i) msg.forms[i] = w.forms[i];
+                msg.weaponFormId = w.weapon;
+                msg.numWeaponMods = w.numMods;
+                std::copy_n(w.mods, w.numMods, msg.weaponMods);
+                Send(MessageType::CoopNpcEquipment, msg);
+                ++sent;
+            }
+        }
+
+        void OnNpcEquipment(const CoopNpcEquipmentMsg& m)
+        {
+            Worn w;
+            const uint8_t n = std::min<uint8_t>(m.count, static_cast<uint8_t>(std::size(m.forms)));
+            w.forms.assign(m.forms, m.forms + n);
+            std::sort(w.forms.begin(), w.forms.end());
+            w.weapon = m.weaponFormId;
+            w.numMods = std::min<uint8_t>(m.numWeaponMods, static_cast<uint8_t>(kMaxItemMods));
+            std::copy_n(m.weaponMods, w.numMods, w.mods);
+            g_npcWornWant[(static_cast<uint64_t>(m.senderId) << 32) | m.npcFormId] = std::move(w);
+        }
+
+        // Mirror side: dress and arm our copy as its owner's is (a few NPCs per tick: equipping rebuilds models).
+        void ApplyNpcEquipment()
+        {
+            auto* mgr = RE::ActorEquipManager::GetSingleton();
+            if (!mgr) return;
+            int done = 0;
+            const auto now = Clock::now();
+            for (auto& [key, want] : g_npcWornWant) {
+                if (done >= 3) break;
+                const uint32_t owner = static_cast<uint32_t>(key >> 32), fid = static_cast<uint32_t>(key);
+                auto* a = fid >= kDynamicFormIdStart ? DynamicActors::Resolve(owner, fid) : LookupForm<RE::Actor>(fid);
+                if (!a || !a->Get3D() || a->IsDead(false) || Authority::IOwn(a)) continue;
+                const uint32_t local = a->GetFormID();
+                auto o = g_npcOwners.find(local);   // only while mirrored (driven by NpcsSync)
+                if (o == g_npcOwners.end() || o->second.ownerId != owner || now - o->second.at > std::chrono::seconds(2)) continue;
+                auto wantKey = WornKey(want);
+                auto& applied = g_npcWornApplied[local];
+                if (applied == wantKey) continue;
+                ++done;
+
+                const Worn cur = ReadWorn(a);
+                auto has = [](const std::vector<uint32_t>& v, uint32_t f) { return std::binary_search(v.begin(), v.end(), f); };
+                int off = 0, on = 0;
+                // Armor it wears here but not there: off (left in its inventory; looting matches the owner's).
+                // Not when the owner listed none at all: a model still loading there reads as naked.
+                const bool ownerHasArmor = std::any_of(want.forms.begin(), want.forms.end(), [](uint32_t f) { return !IsWeapon(LookupForm<RE::TESForm>(f)); });
+                for (uint32_t f : cur.forms) {
+                    auto* obj = LookupForm<RE::TESBoundObject>(f);
+                    if (!obj || IsWeapon(obj) || has(want.forms, f) || !ownerHasArmor) continue;
+                    RE::BGSObjectInstance inst(obj, nullptr);
+                    if (mgr->UnequipObject(a, &inst, 1, nullptr, 0, false, true, false, true, nullptr)) ++off;
+                }
+                for (uint32_t f : want.forms) {
+                    auto* obj = LookupForm<RE::TESBoundObject>(f);
+                    if (!obj || IsWeapon(obj) || has(cur.forms, f)) continue;
+                    if (a->GetInventoryObjectCount(obj) == 0) AddItems(a, obj, 1);
+                    RE::BGSObjectInstance inst(obj, nullptr);
+                    if (mgr->EquipObject(a, inst, 0, 1, nullptr, false, true, false, true, false)) ++on;
+                }
+                // The weapon: the owner's one with its mods (a pipe pistol, not the base pipe gun's default build).
+                const bool sameWeapon = cur.weapon == want.weapon &&
+                    ModKey(cur.weapon, cur.mods, cur.numMods) == ModKey(want.weapon, want.mods, want.numMods);
+                bool weaponChanged = false;
+                if (want.weapon && !sameWeapon) {
+                    if (auto* obj = LookupForm<RE::TESBoundObject>(want.weapon)) {
+                        uint32_t stackId = 0;
+                        RE::TBO_InstanceData* data = nullptr;
+                        if (want.numMods) {
+                            const auto n = static_cast<int32_t>(a->GetInventoryObjectCount(obj));
+                            if (n > 0) RemoveItems(a, obj, n);   // its own build of that gun
+                            WantMods wm;
+                            wm.weapon = want.weapon;
+                            wm.count = want.numMods;
+                            std::copy_n(want.mods, want.numMods, wm.mods);
+                            GiveModdedWeapon(a, obj, wm);
+                            data = StackInstance(a, obj, stackId);
+                        } else if (a->GetInventoryObjectCount(obj) == 0) {
+                            AddItems(a, obj, 1);
+                        }
+                        // Rounds for it (its caliber after mods): an NPC holding a gun it has no ammo for
+                        // never drew it, so the copy stood empty-handed while its owner's fired.
+                        auto* weap = obj->As<RE::TESObjectWEAP>();
+                        RE::TESAmmo* ammo = data ? static_cast<RE::TESObjectWEAP::InstanceData*>(data)->ammo : nullptr;
+                        if (!ammo && weap) ammo = weap->weaponData.ammo;
+                        if (ammo && a->GetInventoryObjectCount(ammo) < 20) AddItems(a, ammo, 40);
+                        RE::BGSObjectInstance inst(obj, data);
+                        weaponChanged = mgr->EquipObject(a, inst, stackId, 1, nullptr, false, true, false, true, false);
+                    }
+                }
+                if (weaponChanged) {
+                    a->Reset3D(false, 0, true, 0);   // else the old gun's model stays in its hands
+                    g_npcRedrawAt[local] = now + std::chrono::milliseconds(800);   // NpcsSync draws the new one
+                }
+                applied = std::move(wantKey);
+                REX::INFO("[NpcGear] mirror {:#x} (player {}'s {:#x}): weapon {:08X} -> {:08X} ({} mods{}), armor {} off {} on", local, owner,
+                    fid, cur.weapon, want.weapon, want.numMods, weaponChanged ? ", equipped" : "", off, on);
+            }
+        }
+
         // ---------- items ----------
 
         std::unordered_set<uint32_t> g_pendingSnapshot;  // containers we asked the host about
@@ -521,7 +789,20 @@ namespace F4MP::Coop
             auto* cont = ResolveRef(m.ownerId, m.containerFormId);
             auto* obj = LookupForm<RE::TESBoundObject>(m.itemFormId);
             if (!cont || !obj || m.count == 0) return;
-            if (m.count > 0) {
+            if (m.count > 0 && m.numMods > 0) {
+                int32_t added = 0;
+                for (int32_t i = 0; i < std::min(m.count, 20); ++i)
+                    if (AddModdedItem(cont, obj, m.mods, m.numMods)) ++added;
+                if (added < m.count) AddItems(cont, obj, m.count - added);
+                CoopModEntry back[kMaxItemMods]{};
+                uint8_t seen = 0;
+                if (auto* inv = cont->inventoryList)
+                    for (auto& it : inv->data)
+                        if (it.object == obj)
+                            for (auto* st = it.stackData.get(); st && !seen; st = st->nextStack.get()) seen = ReadMods(st->extra.get(), back);
+                REX::INFO("[Coop] player {} put {:08X} x{} with {} mod(s) into {:#x}: {} modded, stack reads {} mod(s)", m.senderId,
+                    m.itemFormId, m.count, m.numMods, cont->GetFormID(), added, seen);
+            } else if (m.count > 0) {
                 AddItems(cont, obj, m.count);
             } else {
                 const int32_t have = static_cast<int32_t>(cont->GetInventoryObjectCount(obj));
@@ -1184,6 +1465,9 @@ namespace F4MP::Coop
                     msg.ownerId = owner;
                     msg.itemFormId = e.baseObjectFormID;
                     msg.count = e.itemCount;
+                    msg.numMods = ReadMovedStackMods(LookupForm<RE::TESObjectREFR>(e.newContainerFormID), e.baseObjectFormID, e.uniqueID, msg.mods);
+                    if (msg.numMods)
+                        REX::INFO("[Coop] put {:08X} x{} with {} mod(s) into {:#x}: sent", e.baseObjectFormID, e.itemCount, msg.numMods, e.newContainerFormID);
                     Send(MessageType::CoopContainerChange, msg);
                 }
                 return RE::BSEventNotifyControl::kContinue;
@@ -1233,6 +1517,12 @@ namespace F4MP::Coop
                 auto* actor = target->As<RE::Actor>();
                 const bool isCorpse = actor && actor->IsDead(false);
                 if (!isContainer && !isCorpse) return RE::BSEventNotifyControl::kContinue;
+                // What's already inside isn't what we'll put in (ReadMovedStackMods).
+                if (auto* inv = target->inventoryList)
+                    for (auto& item : inv->data)
+                        if (item.object)
+                            for (auto* st = item.stackData.get(); st; st = st->nextStack.get())
+                                if (st->extra) g_reportedStacks[(static_cast<uint64_t>(fid) << 32) | item.object->GetFormID()].insert(st->extra.get());
 
                 if (g_pendingSnapshot.insert(fid).second) {
                     CoopContainerSnapshotReqMsg msg{};
@@ -1272,6 +1562,22 @@ namespace F4MP::Coop
         // A real attack on a remote player's body (an actor's hit, not a physics bump): forward the
         // damage the engine computed for it to that player, once per hit.
         
+
+        // Our player, or a companion following our player in our own game (Dogmeat, Piper...). Their hits on an
+        // NPC another game runs went nowhere: the copy's health is the owner's, so a companion's bites and
+        // shots did nothing to the other player's enemies.
+        bool IsOurSide(RE::TESObjectREFR* cause)
+        {
+            if (!cause) return false;
+            const uint32_t fid = cause->GetFormID();
+            if (fid == kPlayerRefId) return true;
+            auto* a = cause->As<RE::Actor>();
+            if (!a || GetPlayerIdForBody(fid)) return false;
+            if (auto o = g_npcOwners.find(fid); o != g_npcOwners.end() && Clock::now() - o->second.at < std::chrono::seconds(2))
+                return false;   // a copy of someone else's companion: theirs counts in their game
+            static auto* s_companions = LookupForm<RE::TESFaction>(0x00023C01);   // CurrentCompanionFaction
+            return s_companions && a->IsInFaction(s_companions);
+        }
 
         class HitSink final : public RE::BSTEventSink<RE::TESHitEvent>
         {
@@ -1320,7 +1626,7 @@ namespace F4MP::Coop
                     // already counted here, forwarding it to the old owner would land on a copy.
                     auto it = g_npcOwners.find(target->GetFormID());
                     if (it == g_npcOwners.end() || Clock::now() - it->second.at > std::chrono::seconds(1) ||
-                        cause->GetFormID() != kPlayerRefId || dmg <= 0.0f)
+                        !IsOurSide(cause) || dmg <= 0.0f)
                         return RE::BSEventNotifyControl::kContinue;
                     // A blast is set off again in the owner's game (Explosions.cpp) and hurts the real NPC
                     // there: forwarding our copy's blast damage too counted every grenade twice.
@@ -1331,13 +1637,15 @@ namespace F4MP::Coop
                     msg.damage = dmg;
                     Send(MessageType::CoopNpcDamage, msg);
                     g_stats.damageForwarded++;
-                    REX::INFO("[Coop] we hit player {}'s NPC {:#x} for {:.1f}: forwarded", msg.ownerId, msg.npcFormId, dmg);
+                    REX::INFO("[Coop] {} hit player {}'s NPC {:#x} for {:.1f}: forwarded",
+                        cause->GetFormID() == kPlayerRefId ? "we" : "our companion", msg.ownerId, msg.npcFormId, dmg);
                     return RE::BSEventNotifyControl::kContinue;
                 }
                 if (dmg <= 0.0f) return RE::BSEventNotifyControl::kContinue;
                 CoopPlayerDamageMsg msg{};
                 msg.targetPlayerId = pid;
                 msg.damage = dmg;
+                msg.byNpc = cause->GetFormID() == kPlayerRefId ? 0u : 1u;
                 Send(MessageType::CoopPlayerDamage, msg);
                 g_stats.damageForwarded++;
                 REX::INFO("[Coop] body of player {} hit by {:#x} for {:.1f}: forwarded", pid, cause->GetFormID(), dmg);
@@ -1359,6 +1667,18 @@ namespace F4MP::Coop
             if (item.type != MessageType::CoopPlayerDamage && item.type != MessageType::CoopPlayerVitals &&
                 !FormIdSyncAllowed(sender)) return;
 
+            // Attack/reload replays that waited out a loading screen (25 of one raider's at once
+            // right after an interior load) would all play now: shots nobody fired. Only fresh ones.
+            if (item.type == MessageType::CoopNpcAnim || item.type == MessageType::CoopAnimEvent) {
+                const auto now = Clock::now();
+                const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                if (now - item.receivedAt > std::chrono::milliseconds(1500) || nowMs - g_loadedAtMs.load() < 2000) {
+                    static int s_stale = 0;
+                    if (s_stale++ < 10) REX::INFO("[Coop] stale combat animation dropped (waited {} ms)",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - item.receivedAt).count());
+                    return;
+                }
+            }
             switch (item.type) {
             case MessageType::CoopDynamicActor:
                 if (auto* m = As<CoopDynamicActorMsg>(item); m && m->senderId != Authority::MyId())
@@ -1385,6 +1705,9 @@ namespace F4MP::Coop
                 break;
             case MessageType::CoopWorldSnapshot:
                 if (auto* m = As<CoopWorldSnapshotMsg>(item); m && g_settings.building) Workshop::OnWorldSnapshot(*m);
+                break;
+            case MessageType::CoopNpcEquipment:
+                if (auto* m = As<CoopNpcEquipmentMsg>(item); m && g_settings.equipment && m->senderId != Authority::MyId()) OnNpcEquipment(*m);
                 break;
             case MessageType::CoopNpcAnim:
                 if (auto* m = As<CoopNpcAnimMsg>(item); m && g_settings.combatAnims) OnNpcAnim(*m);
@@ -1512,6 +1835,8 @@ namespace F4MP::Coop
         if (g_settings.equipment) {
             PollLocalEquipment();
             ApplyEquipmentToBodies();
+            SendNpcEquipment();
+            ApplyNpcEquipment();
         }
         // A body is only ever hit by NPCs running on our game (mirrored ones have their AI off),
         // so every game forwards hits on bodies to their players.
@@ -1549,6 +1874,11 @@ namespace F4MP::Coop
         }
     }
 
+    void OnGameLoaded()
+    {
+        g_loadedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+    }
+
     void OnDisconnected()
     {
         g_lastSentEquip.clear();
@@ -1557,6 +1887,11 @@ namespace F4MP::Coop
         g_wantMods.clear();
         g_appliedEquip.clear();
         g_appliedMods.clear();
+        g_npcWornSent.clear();
+        g_npcWornWant.clear();
+        g_npcWornApplied.clear();
+        g_npcRedrawAt.clear();
+        g_reportedStacks.clear();
         g_animRetry.clear();
         GraphOverride::ClearMirrors();
         DynamicActors::Reset();
@@ -1603,6 +1938,14 @@ namespace F4MP::Coop
         const WantMods& wm = g_wantMods[playerId];
         auto mods = g_appliedMods.find(bodyId);
         return mods != g_appliedMods.end() && mods->second == ModKey(wm.weapon, wm.mods, wm.count);
+    }
+
+    bool TakeNpcRedraw(uint32_t localFormId)
+    {
+        auto it = g_npcRedrawAt.find(localFormId);
+        if (it == g_npcRedrawAt.end() || Clock::now() < it->second) return false;
+        g_npcRedrawAt.erase(it);
+        return true;
     }
 
     void ApplyNpcVitals(RE::Actor* actor, uint32_t ownerId, uint32_t formId, float hostHealth, bool hostDead)

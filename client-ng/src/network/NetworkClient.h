@@ -67,6 +67,7 @@ enum class MessageType : uint16_t {
     CoopFurniture = 107,            // player -> all: the furniture they sit/lie on (CoopRefActivatedMsg; ref 0 = got up)
     CoopNpcAnim = 108,              // NPC owner -> all: combat animation event of an NPC it runs (attacks, reloads)
     CoopLockChanged = 109,          // player -> all: a door/container they unlocked (lockpick, key) or locked
+    CoopNpcEquipment = 110,         // NPC owner -> all: what an NPC it runs wears and holds (weapon mods included)
 };
 
 #pragma pack(push, 1)
@@ -159,6 +160,7 @@ struct CoopPlayerDamageMsg {
     uint32_t senderId;
     uint32_t targetPlayerId;
     float    damage;
+    uint32_t byNpc;          // 1 = an NPC in the sender's game hit the body, 0 = the sender's own shot (PvP)
 };
 
 struct CoopNpcDamageMsg {
@@ -168,20 +170,6 @@ struct CoopNpcDamageMsg {
     float    damage;
 };
 
-struct CoopContainerChangeMsg {
-    uint32_t senderId;
-    uint32_t containerFormId;
-    uint32_t itemFormId;
-    int32_t  count;          // > 0 added to the container, < 0 taken from it
-    uint32_t ownerId;        // 0: plugin reference; else the game whose runtime actor (a spawned enemy's corpse) it is
-};
-
-struct CoopWorldRefTakenMsg {
-    uint32_t senderId;
-    uint32_t refFormId;
-};
-
-// A drop is named by who dropped it and the FormID of the item on THEIR ground.
 // One attached object mod (OMOD) of a weapon/armor instance: a pipe pistol and a pipe SMG are the
 // same base weapon with different mods.
 struct CoopModEntry {
@@ -191,6 +179,22 @@ struct CoopModEntry {
     uint8_t  pad[2];
 };
 constexpr size_t kMaxItemMods = 24;
+
+struct CoopContainerChangeMsg {
+    uint32_t senderId;
+    uint32_t containerFormId;
+    uint32_t itemFormId;
+    int32_t  count;          // > 0 added to the container, < 0 taken from it
+    uint32_t ownerId;        // 0: plugin reference; else the game whose runtime actor (a spawned enemy's corpse) it is
+    uint8_t  numMods;        // the moved stack's attached mods (a modded gun put in a box stays modded)
+    uint8_t  pad[3];
+    CoopModEntry mods[kMaxItemMods];
+};
+
+struct CoopWorldRefTakenMsg {
+    uint32_t senderId;
+    uint32_t refFormId;
+};
 
 struct CoopEquipmentMsg {
     uint32_t senderId;
@@ -202,6 +206,7 @@ struct CoopEquipmentMsg {
     CoopModEntry weaponMods[kMaxItemMods];
 };
 
+// A drop is named by who dropped it and the FormID of the item on THEIR ground.
 struct CoopItemDroppedMsg {
     uint32_t senderId;
     uint32_t refFormId;      // the dropped reference in the sender's game
@@ -212,6 +217,20 @@ struct CoopItemDroppedMsg {
     uint8_t  numMods;        // the item's attached mods (none for plain items)
     uint8_t  pad[3];
     CoopModEntry mods[kMaxItemMods];
+};
+
+// The owner's NPC as it is dressed and armed in the owner's game: spawned enemies roll their leveled gear
+// on every machine (a raider with a pipe pistol here swung a bat there), and story NPCs carry what each
+// save gave them.
+struct CoopNpcEquipmentMsg {
+    uint32_t senderId;
+    uint32_t npcFormId;      // the owner's FormID (runtime actors: mapped by sync/DynamicActors)
+    uint8_t  count;
+    uint8_t  numWeaponMods;
+    uint8_t  _pad[2];
+    uint32_t forms[24];      // worn armor and the equipped weapon (base FormIDs)
+    uint32_t weaponFormId;   // the equipped weapon (0 = none)
+    CoopModEntry weaponMods[kMaxItemMods];
 };
 
 struct CoopExplosionMsg {
@@ -374,6 +393,7 @@ struct CoopHelloMsg {
 struct CoopInboxItem {
     MessageType type;
     std::vector<uint8_t> payload;
+    std::chrono::steady_clock::time_point receivedAt{};
 };
 
 // Positions and NPC states are sent many times a second and only the newest one matters: unreliable, so a
@@ -383,7 +403,7 @@ inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosi
 constexpr int kSendStream = 1;     // k_nSteamNetworkingSend_UnreliableNoNagle
 constexpr int kSendEvent = 8;      // k_nSteamNetworkingSend_Reliable
 
-constexpr uint32_t PROTOCOL_VERSION = 12;   // 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
+constexpr uint32_t PROTOCOL_VERSION = 14;   // 14: player hits say whether an NPC did it (Update 19); 13: NPC equipment, item mods in containers (Update 18); 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 
 class NetworkClient {
