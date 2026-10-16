@@ -52,6 +52,20 @@ namespace F4MP::FrameLimiter
 
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
+        // Loading screens: no cap. The game loads faster the more frames it gets (a player report:
+        // "extremely long loading times" for the host), and nothing is synced while loading.
+        static int s_loadFrames = 0;
+        static LONGLONG s_loadStart = 0;
+        auto* ui = RE::UI::GetSingleton();
+        if (ui && ui->GetMenuOpen("LoadingMenu")) {
+            if (!s_loadFrames++) s_loadStart = now.QuadPart;
+            g_last = now;
+            return;
+        }
+        if (s_loadFrames) {
+            REX::INFO("[F4MP] loading screen: {:.1f} s, {} frames uncapped", static_cast<double>(now.QuadPart - s_loadStart) / g_freq.QuadPart, s_loadFrames);
+            s_loadFrames = 0;
+        }
         if (now.QuadPart < deadline) {
             WaitUntil(deadline);
         } else if (now.QuadPart - deadline > period) {

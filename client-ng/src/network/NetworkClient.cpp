@@ -4,6 +4,7 @@
 
 #include "network/NetworkClient.h"
 #include "network/SteamLink.h"
+#include "sync/LoadOrder.h"
 
 #include <chrono>
 #include <cstring>
@@ -288,7 +289,9 @@ void NetworkClient::PumpMessages() {
                     if (header->timestamp && header->timestamp < last) { msg->Release(); continue; }
                     last = header->timestamp;
                     bool nuevo = m_remotePlayers.find(pos->playerId) == m_remotePlayers.end();
-                    m_remotePlayers[pos->playerId] = *pos;
+                    auto& stored = m_remotePlayers[pos->playerId];
+                    stored = *pos;
+                    stored.cellId = F4MP::LoadOrder::ToLocal(pos->playerId, pos->cellId);   // their cell/worldspace in our numbering
                     m_remoteLastSeen[pos->playerId] = std::chrono::steady_clock::now();
                     if (nuevo) {
                         REX::INFO("[Network] new player {} at x={:.0f} y={:.0f} z={:.0f}",
@@ -316,13 +319,18 @@ void NetworkClient::PumpMessages() {
                     m_remotePlayers.erase(left->playerId);
                     m_remoteLastSeen.erase(left->playerId);
                     m_remoteAppearance.erase(left->playerId);
+                    F4MP::LoadOrder::Forget(left->playerId);
                     REX::INFO("[Network] player {} disconnected: body removed", left->playerId);
                 }
             } else if (header->type == MessageType::NpcState) {
                 // El host difunde el estado de un NPC: lo guardamos por FormID.
                 const size_t payloadSize = (size_t)msg->m_cbSize - sizeof(MessageHeader);
                 if (payloadSize >= sizeof(NpcStateMsg)) {
-                    const auto* npc = reinterpret_cast<const NpcStateMsg*>(payload);
+                    NpcStateMsg translated = *reinterpret_cast<const NpcStateMsg*>(payload);
+                    const auto* npc = &translated;
+                    // The owner's FormID in our numbering (other mods/Creation Club content): 0 = not in our game.
+                    translated.formId = F4MP::LoadOrder::ToLocal(npc->ownerId, npc->formId);
+                    if (!translated.formId) { msg->Release(); continue; }
                     std::lock_guard<std::mutex> lock(m_remoteMutex);
                     const uint64_t key = (static_cast<uint64_t>(npc->ownerId) << 32) | npc->formId;
                     auto& last = m_npcStamp[key];

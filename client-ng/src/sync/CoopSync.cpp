@@ -11,6 +11,7 @@
 #include "sync/Explosions.h"
 #include "sync/DynamicActors.h"
 #include "sync/Authority.h"
+#include "sync/LoadOrder.h"
 #include "sync/Range.h"
 #include "sync/Workshop.h"
 
@@ -37,6 +38,8 @@ namespace F4MP::Coop
     {
         constexpr uint32_t kPlayerRefId = 0x14;
         constexpr uint32_t kDynamicFormIdStart = 0xFF000000;  // runtime refs: IDs differ per machine
+        // CoopPlayerDamageMsg::byNpc: 0 = PvP, 1 = an NPC (0.19 games), else the NPC's FormID in the sender's game.
+        constexpr uint32_t kNpcCauseMin = 0x800;
 
         Settings g_settings;
         Stats g_stats;
@@ -538,6 +541,21 @@ namespace F4MP::Coop
                 if (s_dropped++ < 20) REX::INFO("[Coop] player {}'s hit for {:.1f} dropped (dead or just loaded)", m.senderId, m.damage);
                 return;
             }
+            // An NPC we can't see hit us (it isn't in our world, isn't loaded, or its plugin isn't installed):
+            // no hits from enemies we can't fight back.
+            if (m.byNpc >= kNpcCauseMin) {
+                RE::Actor* npc = m.byNpc >= DynamicActors::kRuntimeIdStart ? DynamicActors::Resolve(m.senderId, m.byNpc)
+                                                                           : LookupForm<RE::Actor>(m.byNpc);
+                const bool visible = npc && npc->Get3D() && !npc->IsDisabled() && !npc->IsDead(false) &&
+                                     npc->GetPosition().GetDistance(pl->GetPosition()) < 12000.0f;
+                if (!visible) {
+                    static int s_unseen = 0;
+                    if (s_unseen++ < 30)
+                        REX::WARN("[Coop] player {}'s NPC {:#x} hit us for {:.1f}, but it isn't here for us ({}): ignored", m.senderId,
+                            m.byNpc, m.damage, !npc ? "no such NPC" : !npc->Get3D() ? "not loaded" : npc->IsDisabled() ? "disabled" : npc->IsDead(false) ? "dead here" : "far away");
+                    return;
+                }
+            }
             pl->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, -m.damage);
             g_stats.applied++;
             const float left = pl->GetActorValue(*hp);
@@ -916,10 +934,42 @@ namespace F4MP::Coop
             Send(MessageType::CoopHello, msg);
         }
 
+        // Our plugin names by load-order slot: lets every other game translate our FormIDs (sync/LoadOrder).
+        void SendPluginList()
+        {
+            const auto list = LoadOrder::BuildMyList(IsHost());
+            std::vector<uint8_t> payload(4, 0);   // senderId, stamped by the server
+            payload.insert(payload.end(), list.begin(), list.end());
+            NetworkClient::GetInstance().SendPacket(MessageType::CoopPluginList, payload.data(), static_cast<uint32_t>(payload.size()));
+            g_stats.sent++;
+        }
+
+        void OnPluginList(uint32_t sender, const std::vector<uint8_t>& payload)
+        {
+            if (payload.size() <= 4 || sender == Authority::MyId()) return;
+            const bool fresh = !LoadOrder::Known(sender);
+            LoadOrder::OnList(sender, payload.data() + 4, payload.size() - 4);
+            if (!LoadOrder::Known(sender)) return;
+            // Their FormIDs are translated from now on: nothing has to be paused any more.
+            g_badSenders.erase(sender);
+            if (sender == Authority::HostId()) g_hostMismatch = false;
+            const auto diff = LoadOrder::Differences(sender);
+            if (fresh && !diff.empty()) {
+                std::string who = Appearance::NameOf(sender);
+                if (who.empty()) who = std::format("Player {}", sender);
+                const std::string text = std::format("FathersFallout: {}'s mods differ from yours. {}Things from those mods won't show for both of you.", who, diff);
+                REX::WARN("[LoadOrder] notice: {}", text);
+                RE::SendHUDMessage::ShowHUDMessage(text.c_str(), nullptr, false, false);
+            }
+        }
+
         void OnHello(const CoopHelloMsg& m)
         {
             const auto& fp = MyFingerprint();
-            const bool same = m.loadOrderHash == fp.hash;
+            // A known plugin list beats the fingerprint: different lists are translated, not paused.
+            const bool same = m.loadOrderHash == fp.hash || LoadOrder::Known(m.senderId);
+            // A newcomer: tell them our plugins (everyone answers, so guests learn each other's lists too).
+            if (!m.isReply && m.senderId != Authority::MyId()) SendPluginList();
             Authority::SetRemoteRadius(m.senderId, m.loadedRadius);
             if (m.isHost) Authority::SetHost(m.senderId);
             if (IsHost()) {
@@ -945,6 +995,7 @@ namespace F4MP::Coop
         // FormID-based messages are unsafe across different plugin lists.
         bool FormIdSyncAllowed(uint32_t senderId)
         {
+            if (LoadOrder::Known(senderId)) return true;   // their FormIDs are translated
             if (g_hostMismatch) return false;
             return !(IsHost() && g_badSenders.contains(senderId));
         }
@@ -1566,6 +1617,13 @@ namespace F4MP::Coop
         // Our player, or a companion following our player in our own game (Dogmeat, Piper...). Their hits on an
         // NPC another game runs went nowhere: the copy's health is the owner's, so a companion's bites and
         // shots did nothing to the other player's enemies.
+        // A copy of an NPC another player's game runs (its hits count there, not here).
+        bool IsMirroredNpc(uint32_t fid)
+        {
+            auto o = g_npcOwners.find(fid);
+            return o != g_npcOwners.end() && Clock::now() - o->second.at < std::chrono::seconds(2);
+        }
+
         bool IsOurSide(RE::TESObjectREFR* cause)
         {
             if (!cause) return false;
@@ -1611,6 +1669,16 @@ namespace F4MP::Coop
                     if (s_logged++ < 30) REX::INFO("[Coop] body {:#x}'s replayed shot hit us for {:.1f}: given back", cause->GetFormID(), back);
                     return RE::BSEventNotifyControl::kContinue;
                 }
+                // A copy of another player's NPC hit us: its owner's game decides what its attacks do and
+                // sends the real hit (CoopPlayerDamage). Counting this one too hurt twice.
+                if (auto* pl = RE::PlayerCharacter::GetSingleton(); target == pl && cause && cause != pl &&
+                        e.usesHitData && !e.hitData.flags.all(RE::HitData::Flag::kExplosion) && IsMirroredNpc(cause->GetFormID())) {
+                    const float back = e.hitData.healthDamage;
+                    if (back > 0.0f) if (auto* hp = HealthAV()) pl->RestoreActorValue(*hp, back);
+                    static int s_mirrorBack = 0;
+                    if (s_mirrorBack++ < 30) REX::INFO("[Coop] mirrored NPC {:#x}'s replayed attack hit us for {:.1f}: given back (its owner sends the real hit)", cause->GetFormID(), back);
+                    return RE::BSEventNotifyControl::kContinue;
+                }
                 // Explosions are set off again in every nearby game (Explosions.cpp), and each game
                 // hurts its own player with them: a blast on a body here must not count again.
                 const bool blast = !e.usesHitData || e.hitData.flags.all(RE::HitData::Flag::kExplosion);
@@ -1642,10 +1710,15 @@ namespace F4MP::Coop
                     return RE::BSEventNotifyControl::kContinue;
                 }
                 if (dmg <= 0.0f) return RE::BSEventNotifyControl::kContinue;
+                // Our copy of an NPC someone else runs: the real one is in its owner's game, which sends
+                // the hit itself (this one doubled every hit on a player standing in another's area).
+                if (cause->GetFormID() != kPlayerRefId && IsMirroredNpc(cause->GetFormID())) return RE::BSEventNotifyControl::kContinue;
                 CoopPlayerDamageMsg msg{};
                 msg.targetPlayerId = pid;
                 msg.damage = dmg;
-                msg.byNpc = cause->GetFormID() == kPlayerRefId ? 0u : 1u;
+                // Which NPC: the target only takes the hit if it can see that NPC (a player report: enemies
+                // nobody could see kept hurting both players).
+                msg.byNpc = cause->GetFormID() == kPlayerRefId ? 0u : std::max(cause->GetFormID(), kNpcCauseMin);
                 Send(MessageType::CoopPlayerDamage, msg);
                 g_stats.damageForwarded++;
                 REX::INFO("[Coop] body of player {} hit by {:#x} for {:.1f}: forwarded", pid, cause->GetFormID(), dmg);
@@ -1657,13 +1730,153 @@ namespace F4MP::Coop
         ActivateSink g_activateSink;
         HitSink g_hitSink;
 
+        // Every FormID in a message is the sender's (or, where noted, a key that names the object in its
+        // owner's game and is only compared, never looked up). Players with other mods or Creation Club
+        // content number the same forms differently: rewrite them into ours (sync/LoadOrder).
+        template <class T>
+        T* Mut(CoopInboxItem& item)
+        {
+            return item.payload.size() >= sizeof(T) ? reinterpret_cast<T*>(item.payload.data()) : nullptr;
+        }
+
+        void TranslateInbound(CoopInboxItem& item, uint32_t sender)
+        {
+            auto tr = [sender](uint32_t& fid) { fid = LoadOrder::ToLocal(sender, fid); };
+            auto mods = [&](CoopModEntry* m, uint8_t& n) {
+                uint8_t kept = 0;
+                for (uint8_t i = 0; i < std::min<uint8_t>(n, static_cast<uint8_t>(kMaxItemMods)); ++i) {
+                    tr(m[i].modFormId);
+                    if (m[i].modFormId) m[kept++] = m[i];
+                }
+                n = kept;
+            };
+            // Worn/held lists: items from a plugin we don't have are left out, not sent on as 0.
+            auto forms = [&](uint32_t* f, uint8_t& n, size_t cap) {
+                uint8_t kept = 0;
+                for (uint8_t i = 0; i < std::min<size_t>(n, cap); ++i) {
+                    tr(f[i]);
+                    if (f[i]) f[kept++] = f[i];
+                }
+                n = kept;
+            };
+            switch (item.type) {
+            case MessageType::CoopDynamicActor:
+                if (auto* m = Mut<CoopDynamicActorMsg>(item)) tr(m->spawnFormId);   // hostRefId: a runtime ID
+                break;
+            case MessageType::CoopAppearance: {
+                // sync/Appearance.cpp Header v1: race @8, head part count @13, hair/beard colour and face
+                // details @20/24/28, head parts after the 116-byte header.
+                auto& b = item.payload;
+                uint32_t version = 0;
+                if (b.size() < 116 || (std::memcpy(&version, b.data() + 4, 4), version != 1)) break;
+                auto at = [&](size_t off) { uint32_t v; std::memcpy(&v, b.data() + off, 4); tr(v); std::memcpy(b.data() + off, &v, 4); };
+                at(8); at(20); at(24); at(28);
+                const size_t parts = b[13];
+                for (size_t i = 0; i < parts && 116 + i * 4 + 4 <= b.size(); ++i) at(116 + i * 4);
+                break;
+            }
+            case MessageType::CoopEquipment:
+                if (auto* m = Mut<CoopEquipmentMsg>(item)) {
+                    forms(m->forms, m->count, std::size(m->forms));
+                    tr(m->weaponFormId);
+                    mods(m->weaponMods, m->numWeaponMods);
+                }
+                break;
+            case MessageType::CoopNpcEquipment:
+                if (auto* m = Mut<CoopNpcEquipmentMsg>(item)) {
+                    tr(m->npcFormId);
+                    forms(m->forms, m->count, std::size(m->forms));
+                    tr(m->weaponFormId);
+                    mods(m->weaponMods, m->numWeaponMods);
+                }
+                break;
+            case MessageType::CoopNpcAnim:
+                if (auto* m = Mut<CoopNpcAnimMsg>(item)) tr(m->npcFormId);
+                break;
+            case MessageType::CoopNpcDamage:
+                if (auto* m = Mut<CoopNpcDamageMsg>(item)) tr(m->npcFormId);   // the hitter's copy, by its own FormID
+                break;
+            case MessageType::CoopPlayerDamage:
+                if (auto* m = Mut<CoopPlayerDamageMsg>(item); m && m->byNpc >= kNpcCauseMin) tr(m->byNpc);
+                break;
+            case MessageType::CoopWorldReq:
+                if (auto* m = Mut<CoopWorldReqMsg>(item)) tr(m->space);
+                break;
+            case MessageType::CoopRefsHidden:
+                if (auto* m = Mut<CoopRefsHiddenMsg>(item))
+                    for (uint32_t i = 0; i < std::min<uint32_t>(m->count, static_cast<uint32_t>(kMaxRefsPerMsg)); ++i) tr(m->refs[i]);
+                break;
+            case MessageType::CoopExplosion:
+                if (auto* m = Mut<CoopExplosionMsg>(item)) { tr(m->explosionFormId); tr(m->space); }
+                break;
+            case MessageType::CoopContainerChange:
+                if (auto* m = Mut<CoopContainerChangeMsg>(item)) { tr(m->containerFormId); tr(m->itemFormId); mods(m->mods, m->numMods); }
+                break;
+            case MessageType::CoopItemDropped:   // refFormId: the drop's key in the dropper's game
+                if (auto* m = Mut<CoopItemDroppedMsg>(item)) { tr(m->itemFormId); tr(m->space); mods(m->mods, m->numMods); }
+                break;
+            case MessageType::CoopBuildPlaced:   // refFormId: the build's key in the builder's game
+                if (auto* m = Mut<CoopBuildPlacedMsg>(item)) { tr(m->baseFormId); tr(m->workshopFormId); }
+                break;
+            case MessageType::CoopRefActivated:
+            case MessageType::CoopFurniture:
+                if (auto* m = Mut<CoopRefActivatedMsg>(item); m && m->ownerId == 0) tr(m->ownerRefFormId);   // a plugin reference
+                break;
+            case MessageType::CoopPropMoved:
+                if (auto* m = Mut<CoopPropMovedMsg>(item)) tr(m->refFormId);
+                break;
+            case MessageType::CoopWorldRefTaken:
+                if (auto* m = Mut<CoopWorldRefTakenMsg>(item)) tr(m->refFormId);
+                break;
+            case MessageType::CoopContainerSnapshotReq:
+                if (auto* m = Mut<CoopContainerSnapshotReqMsg>(item)) tr(m->containerFormId);
+                break;
+            case MessageType::CoopContainerSnapshot:
+                if (auto* m = Mut<CoopContainerSnapshotMsg>(item)) {
+                    tr(m->containerFormId);
+                    for (uint16_t i = 0; i < std::min<uint16_t>(m->count, static_cast<uint16_t>(std::size(m->entries))); ++i) tr(m->entries[i].itemFormId);
+                }
+                break;
+            case MessageType::CoopQuestStage:
+                if (auto* m = Mut<CoopQuestStageMsg>(item)) tr(m->questFormId);
+                break;
+            case MessageType::CoopLockChanged:
+                if (auto* m = Mut<CoopLockChangedMsg>(item)) tr(m->refFormId);
+                break;
+            case MessageType::CoopWorldTime:
+                if (auto* m = Mut<CoopWorldTimeMsg>(item)) tr(m->weatherFormId);
+                break;
+            default:
+                break;   // no FormIDs, or only keys (drop taken, build moved/removed)
+            }
+        }
+
+        void DispatchOne(const CoopInboxItem& item);
+
         void Dispatch(const CoopInboxItem& item)
+        {
+            const uint32_t sender = item.payload.size() >= 4 ? *reinterpret_cast<const uint32_t*>(item.payload.data()) : 0;
+            if (item.type == MessageType::CoopHello || item.type == MessageType::CoopPluginList ||
+                !LoadOrder::Known(sender) || LoadOrder::Identical(sender)) {
+                DispatchOne(item);
+                return;
+            }
+            CoopInboxItem copy = item;
+            TranslateInbound(copy, sender);
+            DispatchOne(copy);
+        }
+
+        void DispatchOne(const CoopInboxItem& item)
         {
             if (item.type == MessageType::CoopHello) {
                 if (auto* m = As<CoopHelloMsg>(item)) OnHello(*m);
                 return;
             }
             const uint32_t sender = item.payload.size() >= 4 ? *reinterpret_cast<const uint32_t*>(item.payload.data()) : 0;
+            if (item.type == MessageType::CoopPluginList) {
+                OnPluginList(sender, item.payload);
+                return;
+            }
             if (item.type != MessageType::CoopPlayerDamage && item.type != MessageType::CoopPlayerVitals &&
                 !FormIdSyncAllowed(sender)) return;
 
@@ -1785,7 +1998,7 @@ namespace F4MP::Coop
     }
 
     Settings& GetSettings() { return g_settings; }
-    bool IsLoadOrderMismatch() { return g_hostMismatch; }
+    bool IsLoadOrderMismatch() { return g_hostMismatch && !LoadOrder::Known(Authority::HostId()); }
     size_t MismatchedPlayers() { return g_badSenders.size(); }
     const Stats& GetStats() { return g_stats; }
 
@@ -1806,6 +2019,7 @@ namespace F4MP::Coop
         if (!g_helloSent) {
             g_helloSent = true;
             SendHello(false);
+            SendPluginList();
         }
         // Our own character, on connect and every 10 s (late joiners; receivers ignore repeats).
         static Clock::time_point s_lastLook{};
@@ -1829,7 +2043,7 @@ namespace F4MP::Coop
         Authority::Refresh();
         for (auto& item : net.DrainCoopInbox()) Dispatch(item);
         SendOwnVitals();   // health on name tags works whatever the plugin lists
-        if (g_hostMismatch) return;
+        if (IsLoadOrderMismatch()) return;
         if (g_settings.building) Workshop::Tick();
 
         if (g_settings.equipment) {
@@ -1881,6 +2095,7 @@ namespace F4MP::Coop
 
     void OnDisconnected()
     {
+        LoadOrder::Reset();
         g_lastSentEquip.clear();
         g_lastSentMods.clear();
         g_wantEquip.clear();

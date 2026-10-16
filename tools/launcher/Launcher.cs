@@ -32,8 +32,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.19.1.0")]
-[assembly: AssemblyFileVersion("0.19.1.0")]
+[assembly: AssemblyVersion("0.20.0.0")]
+[assembly: AssemblyFileVersion("0.20.0.0")]
 
 namespace F4MPLauncher
 {
@@ -323,7 +323,7 @@ namespace F4MPLauncher
                 var sf = new StringFormat { Alignment = StringAlignment.Center };
                 using (var b = new SolidBrush(Pip.Mid)) g.DrawString("by FatherLamb", f, b, new RectangleF(0, H - 118, LeftW, 20), sf);
                 using (var b = new SolidBrush(Pip.Dim)) {
-                    g.DrawString("UPDATE 19  (ALPHA)", f, b, new RectangleF(0, H - 98, LeftW, 20), sf);
+                    g.DrawString("UPDATE 20  (ALPHA)", f, b, new RectangleF(0, H - 98, LeftW, 20), sf);
                     g.DrawString("Copyright (C) 2026 FatherLamb\nGNU GPL v3 + NOTICE terms\nNot affiliated with Bethesda", f, b, new RectangleF(0, H - 70, LeftW, 60), sf);
                 }
             }

@@ -8,6 +8,7 @@
 #include "network/SteamLink.h"
 #include "sync/CoopSync.h"
 #include "sync/FrameLimiter.h"
+#include "sync/CrashLog.h"
 #include "sync/Appearance.h"
 #include "sync/DynamicActors.h"
 #include "sync/Range.h"
@@ -169,7 +170,7 @@ namespace F4MP
     // ---- The pre-war intro: no co-op until the character has left Vault 111 ----
     // A save from the intro (the autosave after making the character, or quitting before the vault) loaded,
     // auto-connected and travelled to the host: the intro broke, the player was stuck in pre-war Sanctuary
-    // and the connection timed out (seen in Update 17 over the internet).
+    // and the connection timed out (player report, Update 17 over the internet).
     static std::atomic<bool> g_inIntro{ false };
 
     // Main thread. Pre-war world or pre-war vault, or the Vault 111 cryo cells before Out of Time started.
@@ -2794,6 +2795,7 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     F4SE::Init(a_f4se);
     REX::INFO("[F4MP] FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb (GPL v3 + NOTICE)");
     REX::INFO("[F4MP] plugin loaded (CommonLibF4)");
+    F4MP::CrashLog::Install();
 
     F4SE::GetMessagingInterface()->RegisterListener(F4MP::OnMessage);
     F4MP::Workshop::RegisterSerialization();

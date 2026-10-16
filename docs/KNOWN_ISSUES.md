@@ -1,6 +1,6 @@
 # Known issues & what's being worked on
 
-Update 19 (alpha). Already known - no need to report these unless you have new details.
+Update 20 (alpha). Already known - no need to report these unless you have new details.
 
 ## Known issues
 
@@ -16,7 +16,7 @@ Update 19 (alpha). Already known - no need to report these unless you have new d
 | Companions | Your companion stays with you when you join, but the host doesn't see them yet. |
 | Far-away NPCs | Guests with a lower view distance (`uGridsToLoad`) see fewer of the host's NPCs far away. Close by, everyone sees the same people. |
 | Random encounters | The small radiant quests that pop up on the road belong to the host's game; guests see the creatures and people, but not those quests in their log. |
-| Mods | Different plugin lists = items, quests and NPCs stop syncing (red warning in the F1 menu). |
+| Mods | Different plugin lists work since Update 20, but things from a mod only one player has don't show for the others (a message on connect names those mods). Overhaul mods can still make the games disagree. With an Update 19 player, different lists still pause sync. |
 | GOG | Not tested yet. IP join only. |
 | Players | Tested with 2 players. |
 | Host leaving | Ends the session for everyone (guests keep playing in their own world). |

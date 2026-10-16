@@ -16,9 +16,9 @@ Everything you need to install, host and join. The same guide ships in the downl
   [F4SE](https://f4se.silverlock.org/),
   [Address Library for F4SE Plugins](https://www.nexusmods.com/fallout4/mods/47327),
   [F4SE Menu Framework](https://www.nexusmods.com/fallout4/mods/105090).
-- **The same plugins for everyone** - only the base game + DLC (+ the free Creation Club items the
-  game installs for everyone, and the High Resolution Texture Pack if the host has it).
-  See `LOAD ORDER.txt` in the download.
+- **Best: the same plugins for everyone** - the base game + DLC (+ the same Creation Club items).
+  Different mods no longer break sync (Update 20), but things from a mod only one player has won't
+  show for the others. See `LOAD ORDER.txt` in the download.
 - **Everyone on the same update.** Older versions are refused when they connect.
 
 ## 2. Install (about 2 minutes)

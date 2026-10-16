@@ -38,9 +38,12 @@ Use a copy of your character for co-op. Either way, back up `Documents\My Games\
 
 ## Can I use other mods?
 
-Every player must have exactly the same plugins (`.esp/.esm/.esl`) in the same order, or items,
-quests and NPCs stop syncing (the F1 menu shows a red warning). The simplest: base game + DLC only.
-Texture or mesh mods without plugins are fine.
+Since Update 20, yes, with limits. Every game sends its plugin list (`.esp/.esm/.esl`) when it
+connects and translates the other players' items, NPCs and quests into its own load order, so mods
+everyone has work even in a different order. Things from a mod only one player has don't show for
+the others, and a message on connect names the mods that differ. Mods that change the base game
+(overhauls, leveled lists) can still make the games disagree, so the cleanest co-op is everyone on
+the same mods, or base game + DLC only. Texture or mesh mods without plugins are fine.
 
 ## Steam join can't find my friend
 

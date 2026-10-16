@@ -68,6 +68,7 @@ enum class MessageType : uint16_t {
     CoopNpcAnim = 108,              // NPC owner -> all: combat animation event of an NPC it runs (attacks, reloads)
     CoopLockChanged = 109,          // player -> all: a door/container they unlocked (lockpick, key) or locked
     CoopNpcEquipment = 110,         // NPC owner -> all: what an NPC it runs wears and holds (weapon mods included)
+    CoopPluginList = 111,           // variable length: the sender's plugin names by load-order index (sync/LoadOrder.cpp)
 };
 
 #pragma pack(push, 1)
