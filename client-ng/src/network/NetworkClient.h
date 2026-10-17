@@ -64,11 +64,13 @@ enum class MessageType : uint16_t {
     CoopWorldReq = 104,             // joiner -> host: show me your world around here (builds, scrapping)
     CoopWorldSnapshot = 105,        // host -> joiner: a snapshot follows (the joiner hides its own builds)
     CoopRefsHidden = 106,           // host -> joiner: plugin references the host scrapped (targetId 0: scrapped live, to all)
-    CoopFurniture = 107,            // player -> all: the furniture they sit/lie on (CoopRefActivatedMsg; ref 0 = got up)
+    CoopFurniture = 107,            // player -> all: the furniture they sit/lie on and its marker (CoopSeatMsg; ref 0 = got up)
     CoopNpcAnim = 108,              // NPC owner -> all: combat animation event of an NPC it runs (attacks, reloads)
     CoopLockChanged = 109,          // player -> all: a door/container they unlocked (lockpick, key) or locked
     CoopNpcEquipment = 110,         // NPC owner -> all: what an NPC it runs wears and holds (weapon mods included)
     CoopPluginList = 111,           // variable length: the sender's plugin names by load-order index (sync/LoadOrder.cpp)
+    CoopNpcActivity = 112,          // NPC owner -> all: the furniture an NPC it runs uses and the idle it plays (sync/Activity)
+    CoopPowerArmor = 113,           // player -> all: in power armor or not, and the frame's pieces (sync/Activity)
 };
 
 #pragma pack(push, 1)
@@ -304,6 +306,35 @@ struct CoopRefActivatedMsg {
     uint32_t ownerRefFormId;
 };
 
+// A seat: the furniture (named like CoopRefActivatedMsg: owner key 0 = plugin reference) and which of its
+// markers (a bench has several, a campfire has a sit and a cook spot). ref 0 = not on any furniture.
+struct CoopSeatMsg {
+    uint32_t senderId;
+    uint32_t ownerId;
+    uint32_t ownerRefFormId;
+    uint32_t marker;
+};
+
+// What an NPC is busy with, sent by the game that runs it on change and every few seconds.
+struct CoopNpcActivityMsg {
+    uint32_t senderId;
+    uint32_t npcFormId;      // the owner's FormID (runtime actors: mapped by sync/DynamicActors)
+    uint32_t seatOwnerId;    // its furniture, as in CoopSeatMsg (seatRefFormId 0 = none)
+    uint32_t seatRefFormId;
+    uint32_t marker;
+    uint32_t idleFormId;     // the idle it plays outside furniture (TESIdleForm), 0 = none
+};
+
+// Power armor: in it (frame + pieces) or out. The pieces are also in CoopEquipmentMsg, but a body wearing
+// them as plain armor looked broken: it gets a frame of its own instead.
+struct CoopPowerArmorMsg {
+    uint32_t senderId;
+    uint8_t  inArmor;
+    uint8_t  count;
+    uint8_t  _pad[2];
+    uint32_t pieces[8];      // ARMO FormIDs of the pieces on the frame (helmet, torso, arms, legs)
+};
+
 struct CoopPlayerVitalsMsg {
     uint32_t senderId;
     float    health;
@@ -404,7 +435,7 @@ inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosi
 constexpr int kSendStream = 1;     // k_nSteamNetworkingSend_UnreliableNoNagle
 constexpr int kSendEvent = 8;      // k_nSteamNetworkingSend_Reliable
 
-constexpr uint32_t PROTOCOL_VERSION = 14;   // 14: player hits say whether an NPC did it (Update 19); 13: NPC equipment, item mods in containers (Update 18); 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
+constexpr uint32_t PROTOCOL_VERSION = 15;   // 15: NPC furniture/idles, seat markers, power armor (Update 21); 14: player hits say whether an NPC did it (Update 19); 13: NPC equipment, item mods in containers (Update 18); 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 
 class NetworkClient {

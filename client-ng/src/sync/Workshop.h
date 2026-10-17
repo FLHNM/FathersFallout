@@ -8,6 +8,7 @@
 
 namespace RE { class TESObjectREFR; }
 namespace Network {
+    struct CoopSeatMsg;
     struct CoopBuildPlacedMsg;
     struct CoopBuildMovedMsg;
     struct CoopBuildRemovedMsg;
@@ -41,8 +42,12 @@ namespace F4MP::Workshop
     void OnGameLoaded();
     // Furniture: our player's seat is sent (FurnitureTick), the sender's body sits on ours.
     void FurnitureTick();
-    void OnFurniture(const Network::CoopRefActivatedMsg& m);
+    void OnFurniture(const Network::CoopSeatMsg& m);
     bool BodySeated(uint32_t playerId);   // the body is on furniture: don't move or animate it
+    // Furniture named for the network: a shared build (owner key, its FormID there) or a plugin
+    // reference (0, FormID). False for furniture only this game has. LocalSeat: back to our FormID (0 = none).
+    bool SeatKey(RE::TESObjectREFR* furniture, uint32_t& owner, uint32_t& ref);
+    uint32_t LocalSeat(uint32_t owner, uint32_t ref);
     // Hide one of our references while connected (an NPC the host's world doesn't have here).
     void HideRef(RE::TESObjectREFR* ref);   // kPostLoadGame: show what a save made while connected had hidden
     void RegisterSerialization();   // once, at plugin load: build links in the co-save

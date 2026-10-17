@@ -14,6 +14,7 @@
 #include "sync/LoadOrder.h"
 #include "sync/Range.h"
 #include "sync/Workshop.h"
+#include "sync/Activity.h"
 
 #include <algorithm>
 #include <atomic>
@@ -208,6 +209,14 @@ namespace F4MP::Coop
                     if (s->extra && reported.insert(s->extra.get()).second) return ReadMods(s->extra.get(), out);
             }
             return 0;
+        }
+
+        // An armor with the power armor keyword: the frame item and the pieces that go on it.
+        bool IsPowerArmorItem(RE::TESForm* f)
+        {
+            auto* armo = f ? f->As<RE::TESObjectARMO>() : nullptr;
+            auto* kw = RE::PowerArmor::GetArmorKeyword();
+            return armo && kw && static_cast<RE::BGSKeywordForm*>(armo)->HasKeyword(kw);
         }
 
         void RemoveItems(RE::TESObjectREFR* container, RE::TESBoundObject* obj, int32_t count)
@@ -1819,8 +1828,21 @@ namespace F4MP::Coop
                 if (auto* m = Mut<CoopBuildPlacedMsg>(item)) { tr(m->baseFormId); tr(m->workshopFormId); }
                 break;
             case MessageType::CoopRefActivated:
-            case MessageType::CoopFurniture:
                 if (auto* m = Mut<CoopRefActivatedMsg>(item); m && m->ownerId == 0) tr(m->ownerRefFormId);   // a plugin reference
+                break;
+            case MessageType::CoopFurniture:
+                if (auto* m = Mut<CoopSeatMsg>(item); m && m->ownerId == 0) tr(m->ownerRefFormId);
+                break;
+            case MessageType::CoopNpcActivity:
+                if (auto* m = Mut<CoopNpcActivityMsg>(item)) {
+                    tr(m->npcFormId);
+                    if (m->seatOwnerId == 0) tr(m->seatRefFormId);
+                    tr(m->idleFormId);
+                }
+                break;
+            case MessageType::CoopPowerArmor:
+                if (auto* m = Mut<CoopPowerArmorMsg>(item))
+                    for (uint8_t i = 0; i < std::min<uint8_t>(m->count, static_cast<uint8_t>(std::size(m->pieces))); ++i) tr(m->pieces[i]);
                 break;
             case MessageType::CoopPropMoved:
                 if (auto* m = Mut<CoopPropMovedMsg>(item)) tr(m->refFormId);
@@ -1903,7 +1925,11 @@ namespace F4MP::Coop
             case MessageType::CoopEquipment:
                 if (auto* m = As<CoopEquipmentMsg>(item); m && g_settings.equipment) {
                     const uint8_t n = std::min<uint8_t>(m->count, static_cast<uint8_t>(std::size(m->forms)));
-                    g_wantEquip[m->senderId].assign(m->forms, m->forms + n);
+                    auto& want = g_wantEquip[m->senderId];
+                    want.assign(m->forms, m->forms + n);
+                    // Power armor pieces (and the frame item) worn as plain armor drew a broken body:
+                    // the body gets a frame of its own with them on it (sync/Activity, CoopPowerArmor).
+                    std::erase_if(want, [](uint32_t f) { return IsPowerArmorItem(LookupForm<RE::TESForm>(f)); });
                     auto& wm = g_wantMods[m->senderId];
                     wm.weapon = m->weaponFormId;
                     wm.count = std::min<uint8_t>(m->numWeaponMods, static_cast<uint8_t>(kMaxItemMods));
@@ -1926,7 +1952,13 @@ namespace F4MP::Coop
                 if (auto* m = As<CoopNpcAnimMsg>(item); m && g_settings.combatAnims) OnNpcAnim(*m);
                 break;
             case MessageType::CoopFurniture:
-                if (auto* m = As<CoopRefActivatedMsg>(item)) Workshop::OnFurniture(*m);
+                if (auto* m = As<CoopSeatMsg>(item)) Workshop::OnFurniture(*m);
+                break;
+            case MessageType::CoopNpcActivity:
+                if (auto* m = As<CoopNpcActivityMsg>(item); m && g_settings.combatAnims) Activity::OnNpcActivity(*m);
+                break;
+            case MessageType::CoopPowerArmor:
+                if (auto* m = As<CoopPowerArmorMsg>(item); m && g_settings.equipment) Activity::OnPowerArmor(*m);
                 break;
             case MessageType::CoopRefsHidden:
                 if (auto* m = As<CoopRefsHiddenMsg>(item); m && g_settings.building) Workshop::OnRefsHidden(*m);
@@ -2064,6 +2096,7 @@ namespace F4MP::Coop
             Explosions::Tick();
         }
         DynamicActors::ClientTick();
+        Activity::Tick();
 
         const auto now = Clock::now();
         if (g_settings.quests && now - g_lastQuestPoll >= std::chrono::milliseconds(500)) {
@@ -2111,6 +2144,7 @@ namespace F4MP::Coop
         GraphOverride::ClearMirrors();
         DynamicActors::Reset();
         Workshop::Reset();
+        Activity::Reset();
         Authority::Reset();
         g_npcAppliedHealth.clear();
         g_npcOwners.clear();

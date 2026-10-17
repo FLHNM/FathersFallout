@@ -1,0 +1,437 @@
+// FathersFallout - online co-op for Fallout 4
+// Copyright (C) 2026 FatherLamb. Licensed under the GNU GPL v3 with additional terms: see LICENSE
+// and NOTICE ("FathersFallout" and "FatherLamb" are reserved names; modified versions must be renamed).
+
+#include "pch.h"
+#include "sync/Activity.h"
+#include "sync/Appearance.h"
+#include "sync/Authority.h"
+#include "sync/CoopSync.h"
+#include "sync/DynamicActors.h"
+#include "sync/GraphOverride.h"
+#include "sync/Workshop.h"
+#include "network/NetworkClient.h"
+
+#include <algorithm>
+#include <chrono>
+#include <unordered_map>
+#include <vector>
+
+namespace F4MP::Activity
+{
+    using namespace Network;
+    using Clock = std::chrono::steady_clock;
+
+    namespace
+    {
+        constexpr uint32_t kRuntimeIdStart = 0xFF000000;
+        // The frame a body gets when its player wears power armor: the plain frame without a fusion core
+        // (PowerArmorFrameFurnitureNoCore), the player's own pieces go on it.
+        constexpr uint32_t kBodyFrameBase = 0x0002079E;
+
+        template <class T>
+        T* Lookup(uint32_t a_fid)
+        {
+            auto* f = a_fid ? RE::TESForm::GetFormByID(a_fid) : nullptr;
+            return f ? f->As<T>() : nullptr;
+        }
+
+        template <class T>
+        void Send(MessageType a_type, const T& a_msg)
+        {
+            NetworkClient::GetInstance().SendPacket(a_type, &a_msg, sizeof(T));
+        }
+
+        bool Usable(RE::Actor* a) { return a && a->Get3D() && !a->IsDisabled() && !a->IsDead(false); }
+
+        // ---- NPCs this game runs: what each was last said to be doing ----
+        struct Sent { uint32_t seatOwner = 0, seatRef = 0, marker = 0, idle = 0; Clock::time_point at{}; };
+        std::unordered_map<uint32_t, Sent> g_sent;   // our FormID -> last sent
+
+        // ---- NPCs mirrored here: what their owner's copy is doing, and what we did about it ----
+        struct Want
+        {
+            uint32_t owner = 0;
+            uint32_t seat = 0, marker = 0;   // local furniture FormID (0 = none)
+            uint32_t idle = 0;
+            Clock::time_point at{};          // last message
+            uint32_t seated = 0;             // furniture we put it on
+            int tries = 0;
+            Clock::time_point nextTry{};
+            uint32_t idlePlayed = 0;
+        };
+        std::unordered_map<uint32_t, Want> g_want;   // local FormID -> wanted
+
+        // ---- power armor: ours and the bodies' ----
+        struct Armor { bool in = false; std::vector<uint32_t> pieces; Clock::time_point at{}; };
+        Armor g_myArmor;
+        Clock::time_point g_myArmorSent{};
+        std::unordered_map<uint32_t, Armor> g_wantArmor;   // playerId -> its player's power armor
+        struct BodyFrame { uint32_t body = 0; uint32_t frame = 0; int tries = 0; Clock::time_point nextTry{}; bool in = false;
+                           Clock::time_point exitAt{}; };
+        std::unordered_map<uint32_t, BodyFrame> g_bodyFrame;   // playerId -> the frame we gave its body
+        // Frames left standing where a body got out (like the real one its player left): removed after a while.
+        std::vector<std::pair<uint32_t, Clock::time_point>> g_leftFrames;
+
+        RE::BGSKeyword* ArmorKeyword() { return RE::PowerArmor::GetArmorKeyword(); }
+
+        bool IsPowerArmorPiece(RE::TESForm* f)
+        {
+            auto* armo = f ? f->As<RE::TESObjectARMO>() : nullptr;
+            auto* kw = ArmorKeyword();
+            return armo && kw && static_cast<RE::BGSKeywordForm*>(armo)->HasKeyword(kw);
+        }
+
+        RE::Actor* BodyOf(uint32_t a_pid)
+        {
+            for (auto& [pid, fid] : GetBodies())
+                if (pid == a_pid) return Lookup<RE::Actor>(fid);
+            return nullptr;
+        }
+
+        void DeleteRef(uint32_t a_fid)
+        {
+            if (auto* r = Lookup<RE::TESObjectREFR>(a_fid)) {
+                r->Disable();
+                r->SetWantsDelete(true);
+                r->MarkAsDeleted();
+            }
+        }
+    }
+
+    // ================= seats =================
+
+    RE::TESObjectREFR* SeatOf(RE::Actor* a_actor, uint32_t* a_marker)
+    {
+        auto* proc = a_actor ? a_actor->currentProcess : nullptr;
+        if (!proc) return nullptr;
+        auto ref = proc->GetOccupiedFurniture().get();
+        if (a_marker) *a_marker = proc->middleHigh ? proc->middleHigh->occupiedFurnitureMarkerID : 0;
+        return ref.get();
+    }
+
+    bool Seat(RE::Actor* a_actor, RE::TESObjectREFR* a_furniture, uint32_t a_marker)
+    {
+        if (!a_actor || !a_furniture) return false;
+        auto* cur = SeatOf(a_actor);
+        if (cur == a_furniture) return true;
+        if (cur) a_actor->StopInteractingQuick(false, false, true);   // on another one: off it first
+        return a_actor->PutActorInChairBedQuick(a_furniture, a_marker);
+    }
+
+    void Unseat(RE::Actor* a_actor)
+    {
+        if (a_actor && SeatOf(a_actor)) a_actor->StopInteractingQuick(false, true, true);
+    }
+
+    bool PlayIdle(RE::Actor* a_actor, RE::TESIdleForm* a_idle)
+    {
+        auto* proc = a_actor ? a_actor->currentProcess : nullptr;
+        if (!proc || !a_idle) return false;
+        // A mirrored NPC drops the idles its own AI starts; this one is its owner's.
+        GraphOverride::AllowIdles(a_actor->GetFormID(), 2000);
+        GraphOverride::BeginOurs();
+        const bool ok = proc->PlayIdle(*a_actor, a_idle, nullptr);
+        GraphOverride::EndOurs();
+        return ok;
+    }
+
+    void Describe(RE::Actor* a)
+    {
+        if (!a) { REX::INFO("[Activity] no such actor"); return; }
+        uint32_t marker = 0;
+        auto* seat = SeatOf(a, &marker);
+        auto* mh = a->currentProcess ? a->currentProcess->middleHigh : nullptr;
+        auto cur = mh ? mh->currentFurniture.get() : RE::NiPointer<RE::TESObjectREFR>{};
+        REX::INFO("[Activity] {:#x}: seat {:#x} marker {} (current {:#x} marker {}) idle {:#x} last idle {:#x} furniture idle {:#x} "
+                  "anim played {} | power armor {} | pos {:.0f} {:.0f} {:.0f}",
+            a->GetFormID(), seat ? seat->GetFormID() : 0u, marker, cur ? cur->GetFormID() : 0u, mh ? mh->currentFurnitureMarkerID : 0u,
+            mh && mh->currentIdle ? mh->currentIdle->GetFormID() : 0u, mh && mh->lastIdlePlayed ? mh->lastIdlePlayed->GetFormID() : 0u,
+            mh && mh->furnitureIdle ? mh->furnitureIdle->GetFormID() : 0u, mh && mh->furnitureAnimationPlayed,
+            RE::PowerArmor::ActorInPowerArmor(*a), a->GetPosition().x, a->GetPosition().y, a->GetPosition().z);
+    }
+
+    // ================= NPCs: the owner sends =================
+
+    static void SendNpcActivity()
+    {
+        auto* lists = RE::ProcessLists::GetSingleton();
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        if (!lists || !pl) return;
+        const auto now = Clock::now();
+        auto visit = [&](RE::BSTArray<RE::ActorHandle>& handles) {
+            for (auto& h : handles) {
+                auto np = h.get();
+                RE::Actor* a = np.get();
+                if (!a || a == pl || !Usable(a)) continue;
+                const uint32_t fid = a->GetFormID();
+                if (GetPlayerIdForBody(fid) || !Authority::IOwn(a)) continue;
+                if (fid >= kRuntimeIdStart && DynamicActors::IsMirrorCopy(fid)) continue;
+                Sent s{};
+                uint32_t marker = 0;
+                if (auto* furn = SeatOf(a, &marker); furn && Workshop::SeatKey(furn, s.seatOwner, s.seatRef)) s.marker = marker;
+                // Idles outside furniture (a seat plays its own). Runtime idles don't exist elsewhere.
+                auto* mh = a->currentProcess ? a->currentProcess->middleHigh : nullptr;
+                if (!s.seatRef && mh && mh->currentIdle && mh->currentIdle->GetFormID() < kRuntimeIdStart) s.idle = mh->currentIdle->GetFormID();
+                auto& last = g_sent[fid];
+                const bool same = last.seatOwner == s.seatOwner && last.seatRef == s.seatRef && last.marker == s.marker && last.idle == s.idle;
+                const bool busy = s.seatRef || s.idle;
+                // On change; again every 3 s while busy (someone arriving later sees it too).
+                if (same && (!busy || now - last.at < std::chrono::seconds(3))) continue;
+                CoopNpcActivityMsg msg{};
+                msg.npcFormId = fid;
+                msg.seatOwnerId = s.seatOwner;
+                msg.seatRefFormId = s.seatRef;
+                msg.marker = s.marker;
+                msg.idleFormId = s.idle;
+                Send(MessageType::CoopNpcActivity, msg);
+                static int s_logged = 0;
+                if (!same && s_logged++ < 80)
+                    REX::INFO("[Activity] our NPC {:#x}: seat {:#x} marker {} idle {:#x} sent", fid, s.seatRef, s.marker, s.idle);
+                s.at = now;
+                last = s;
+            }
+        };
+        visit(lists->highActorHandles);
+        visit(lists->middleHighActorHandles);
+        if (g_sent.size() > 1024) g_sent.clear();
+    }
+
+    void OnNpcActivity(const CoopNpcActivityMsg& m)
+    {
+        if (m.senderId == Authority::MyId()) return;
+        RE::Actor* npc = m.npcFormId >= kRuntimeIdStart ? DynamicActors::Resolve(m.senderId, m.npcFormId) : Lookup<RE::Actor>(m.npcFormId);
+        if (!npc || Authority::IOwn(npc)) return;
+        auto& w = g_want[npc->GetFormID()];
+        const uint32_t seat = m.seatRefFormId ? Workshop::LocalSeat(m.seatOwnerId, m.seatRefFormId) : 0;
+        if (seat != w.seat || m.marker != w.marker) { w.tries = 0; w.nextTry = {}; }
+        static int s_logged = 0;
+        if ((seat != w.seat || m.idleFormId != w.idle) && s_logged++ < 80)
+            REX::INFO("[Activity] player {}'s NPC {:#x}: seat {:#x} (here {:#x}) marker {} idle {:#x}", m.senderId, npc->GetFormID(),
+                m.seatRefFormId, seat, m.marker, m.idleFormId);
+        w.owner = m.senderId;
+        w.seat = seat;
+        w.marker = m.marker;
+        w.idle = m.idleFormId;
+        w.at = Clock::now();
+    }
+
+    // ================= NPCs: the copies do it =================
+
+    static void ApplyNpcActivity()
+    {
+        const auto now = Clock::now();
+        for (auto it = g_want.begin(); it != g_want.end();) {
+            const uint32_t local = it->first;
+            Want& w = it->second;
+            auto* a = Lookup<RE::Actor>(local);
+            // Ours now (the area moved to us), or gone: its own AI decides again.
+            if (!a || Authority::IOwn(a) || a->IsDead(false)) { it = g_want.erase(it); continue; }
+            if (!a->Get3D()) { w.seated = 0; ++it; continue; }
+            // The owner stopped telling us (it went out of its range): nothing to show.
+            const bool stale = now - w.at > std::chrono::seconds(12);
+            const uint32_t wantSeat = stale ? 0 : w.seat;
+            auto* cur = SeatOf(a);
+            if (wantSeat) {
+                auto* furn = Lookup<RE::TESObjectREFR>(wantSeat);
+                if (furn && cur == furn) {
+                    if (!w.seated) REX::INFO("[Activity] NPC {:#x} is on {:#x} like its owner's copy", local, wantSeat);
+                    w.seated = wantSeat;
+                    w.tries = 0;
+                } else if (furn && furn->Get3D() && w.tries < 6 && now >= w.nextTry) {
+                    // A seat someone else holds here (our own NPC on that chair) can't be taken: tried a few times.
+                    const bool ok = Seat(a, furn, w.marker);
+                    ++w.tries;
+                    w.nextTry = now + std::chrono::milliseconds(1500);
+                    if (ok) w.seated = wantSeat;
+                    REX::INFO("[Activity] NPC {:#x}: onto {:#x} marker {} -> {} (try {})", local, wantSeat, w.marker, ok, w.tries);
+                } else if (w.seated && cur != furn) {
+                    w.seated = 0;   // got off again behind our back: retried
+                }
+            } else if (w.seated || (cur && w.at != Clock::time_point{})) {
+                // Its owner's copy got up.
+                if (cur) Unseat(a);
+                REX::INFO("[Activity] NPC {:#x}: off its seat like its owner's copy", local);
+                w.seated = 0;
+            }
+            // Idles outside furniture, as its owner's copy plays them.
+            const uint32_t wantIdle = (stale || w.seated) ? 0 : w.idle;
+            if (wantIdle != w.idlePlayed) {
+                if (wantIdle) {
+                    const bool ok = PlayIdle(a, Lookup<RE::TESIdleForm>(wantIdle));
+                    static int s_logged = 0;
+                    if (s_logged++ < 60) REX::INFO("[Activity] NPC {:#x}: idle {:#x} -> {}", local, wantIdle, ok);
+                } else if (w.idlePlayed) {
+                    GraphOverride::SendEvent(a, "IdleStop");
+                }
+                w.idlePlayed = wantIdle;
+            }
+            ++it;
+        }
+    }
+
+    bool MirrorSeated(uint32_t a_local)
+    {
+        auto it = g_want.find(a_local);
+        return it != g_want.end() && it->second.seated != 0;
+    }
+
+    // ================= power armor =================
+
+    bool EnterPowerArmor(RE::Actor* a_actor, uint32_t a_frameBase, const uint32_t* a_pieces, int a_count)
+    {
+        auto* base = Lookup<RE::TESBoundObject>(a_frameBase ? a_frameBase : kBodyFrameBase);
+        auto* dh = RE::TESDataHandler::GetSingleton();
+        auto* cell = a_actor ? a_actor->GetParentCell() : nullptr;
+        if (!a_actor || !base || !dh || !cell) return false;
+        RE::NEW_REFR_DATA data;
+        data.location = a_actor->GetPosition();
+        data.direction = { 0.0f, 0.0f, a_actor->GetHeading() };
+        data.object = base;
+        if (cell->IsInterior()) data.interior = cell;
+        else data.world = cell->worldSpace;
+        auto frame = dh->CreateReferenceAtLocation(data).get();
+        if (!frame) { REX::WARN("[Activity] power armor: no frame placed for {:#x}", a_actor->GetFormID()); return false; }
+        for (int i = 0; i < a_count; ++i)
+            if (auto* p = Lookup<RE::TESBoundObject>(a_pieces[i]))
+                frame->AddObjectToContainer(p, nullptr, 1, nullptr, RE::ITEM_REMOVE_REASON::kNone);
+        const bool ok = a_actor->PutActorInChairBedQuick(frame.get(), 0);
+        REX::INFO("[Activity] power armor: {:#x} into frame {:#x} ({} pieces) -> {} (in power armor now {})", a_actor->GetFormID(),
+            frame->GetFormID(), a_count, ok, RE::PowerArmor::ActorInPowerArmor(*a_actor));
+        for (auto& [pid, bf] : g_bodyFrame)
+            if (bf.body == a_actor->GetFormID()) bf.frame = frame->GetFormID();
+        return ok;
+    }
+
+    void ExitPowerArmor(RE::Actor* a_actor)
+    {
+        if (!a_actor) return;
+        a_actor->StopInteractingQuick(false, true, true);
+        REX::INFO("[Activity] power armor: {:#x} out (in power armor now {})", a_actor->GetFormID(), RE::PowerArmor::ActorInPowerArmor(*a_actor));
+    }
+
+    static void SendPowerArmor()
+    {
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        if (!pl) return;
+        Armor now{};
+        now.in = RE::PowerArmor::PlayerInPowerArmor();
+        if (now.in && pl->inventoryList) {
+            for (auto& item : pl->inventoryList->data) {
+                if (!item.object || !IsPowerArmorPiece(item.object) || item.object->GetFormID() >= kRuntimeIdStart) continue;
+                for (auto* s = item.stackData.get(); s; s = s->nextStack.get())
+                    if (s->IsEquipped()) { now.pieces.push_back(item.object->GetFormID()); break; }
+            }
+            std::sort(now.pieces.begin(), now.pieces.end());
+        }
+        const auto t = Clock::now();
+        const bool same = now.in == g_myArmor.in && now.pieces == g_myArmor.pieces;
+        if (same && (!now.in || t - g_myArmorSent < std::chrono::seconds(5))) return;
+        if (same && !now.in) return;
+        if (!same) REX::INFO("[Activity] we're {} power armor ({} pieces): sent", now.in ? "in" : "out of", now.pieces.size());
+        g_myArmor = now;
+        g_myArmorSent = t;
+        CoopPowerArmorMsg msg{};
+        msg.inArmor = now.in ? 1 : 0;
+        msg.count = static_cast<uint8_t>(std::min<size_t>(now.pieces.size(), std::size(msg.pieces)));
+        std::copy_n(now.pieces.begin(), msg.count, msg.pieces);
+        Send(MessageType::CoopPowerArmor, msg);
+    }
+
+    void OnPowerArmor(const CoopPowerArmorMsg& m)
+    {
+        if (m.senderId == Authority::MyId()) return;
+        auto& w = g_wantArmor[m.senderId];
+        std::vector<uint32_t> pieces(m.pieces, m.pieces + std::min<uint8_t>(m.count, static_cast<uint8_t>(std::size(m.pieces))));
+        std::erase(pieces, 0u);
+        if (w.in != (m.inArmor != 0) || w.pieces != pieces)
+            REX::INFO("[Activity] player {} is {} power armor ({} pieces)", m.senderId, m.inArmor ? "in" : "out of", pieces.size());
+        w.in = m.inArmor != 0;
+        w.pieces = std::move(pieces);
+        w.at = Clock::now();
+    }
+
+    static void ApplyPowerArmor()
+    {
+        const auto now = Clock::now();
+        for (auto& [pid, want] : g_wantArmor) {
+            auto* body = BodyOf(pid);
+            auto& bf = g_bodyFrame[pid];
+            if (!body || !body->Get3D()) continue;
+            if (bf.body != body->GetFormID()) {
+                // A new body (respawned, rebuilt): the old one's frame goes with it.
+                if (bf.frame) DeleteRef(bf.frame);
+                bf = BodyFrame{};
+                bf.body = body->GetFormID();
+            }
+            const bool in = RE::PowerArmor::ActorInPowerArmor(*body);
+            if (want.in && !in) {
+                if (bf.tries >= 4 || now < bf.nextTry) continue;
+                ++bf.tries;
+                bf.nextTry = now + std::chrono::seconds(2);
+                if (bf.frame) { DeleteRef(bf.frame); bf.frame = 0; }
+                EnterPowerArmor(body, kBodyFrameBase, want.pieces.data(), static_cast<int>(want.pieces.size()));
+            } else if (!want.in && in) {
+                // Getting out: the engine's quick exit doesn't leave power armor (testing: still in after 100
+                // tries), so the body is rebuilt fresh, out of it, and the frame stays where it stood.
+                if (bf.exitAt == Clock::time_point{}) {
+                    bf.exitAt = now;
+                    ExitPowerArmor(body);
+                } else if (now - bf.exitAt > std::chrono::milliseconds(500)) {
+                    if (bf.frame) g_leftFrames.emplace_back(bf.frame, now + std::chrono::minutes(2));
+                    bf.frame = 0;
+                    bf.exitAt = {};
+                    Appearance::RequestRespawn(pid);
+                    REX::INFO("[Activity] player {} got out of power armor: body rebuilt, frame left standing", pid);
+                }
+                bf.tries = 0;
+            } else if (want.in && in) {
+                bf.tries = 0;
+            }
+            bf.in = RE::PowerArmor::ActorInPowerArmor(*body);
+            if (!want.in && !bf.in) bf.exitAt = {};
+        }
+        std::erase_if(g_leftFrames, [&](auto& f) {
+            if (now < f.second) return false;
+            DeleteRef(f.first);
+            return true;
+        });
+    }
+
+    bool BodyInPowerArmor(uint32_t a_pid)
+    {
+        auto it = g_bodyFrame.find(a_pid);
+        return it != g_bodyFrame.end() && it->second.in;
+    }
+
+    // ================= tick =================
+
+    void Tick()
+    {
+        static uint32_t s_tick = 0;
+        ++s_tick;
+        auto& settings = Coop::GetSettings();
+        if (settings.combatAnims) {
+            if (s_tick % 3 == 0) SendNpcActivity();   // ~3/s
+            ApplyNpcActivity();
+        }
+        if (settings.equipment) {
+            SendPowerArmor();
+            ApplyPowerArmor();
+        }
+    }
+
+    void Reset()
+    {
+        g_sent.clear();
+        g_want.clear();
+        g_myArmor = {};
+        g_myArmorSent = {};
+        g_wantArmor.clear();
+        for (auto& [pid, bf] : g_bodyFrame)
+            if (bf.frame) DeleteRef(bf.frame);
+        g_bodyFrame.clear();
+        for (auto& [fid, at] : g_leftFrames) DeleteRef(fid);
+        g_leftFrames.clear();
+    }
+}

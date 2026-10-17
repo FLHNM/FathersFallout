@@ -80,6 +80,22 @@ namespace F4MP::GraphOverride
         std::unordered_map<std::uint32_t, bool> g_mirrorDrawn;   // whether its owner's copy has the weapon out
         std::atomic<unsigned long long> g_mirrorWeaponBlocked{ 0 };
         std::atomic<unsigned long long> g_idlesBlocked{ 0 };
+        std::unordered_map<std::uint32_t, long long> g_idlesAllowedUntil;   // mirror -> ms clock (an idle its owner plays)
+
+        bool IdlesAllowed(std::uint32_t a_fid)
+        {
+            std::lock_guard l(g_mirrorLock);
+            auto it = g_idlesAllowedUntil.find(a_fid);
+            return it != g_idlesAllowedUntil.end() && NowMs() < it->second;
+        }
+
+        // Footsteps of bodies and mirrored NPCs (graph events to the reference, any thread).
+        using GraphSink = RE::BSTEventSink<RE::BSAnimationGraphEvent>;
+        using GraphEvent_t = RE::BSEventNotifyControl (*)(GraphSink*, const RE::BSAnimationGraphEvent&, RE::BSTEventSource<RE::BSAnimationGraphEvent>*);
+        constexpr std::size_t kGraphEventSlot = 0x01;   // BSTEventSink<BSAnimationGraphEvent>::ProcessEvent
+        GraphEvent_t g_originalGraphEvent = nullptr;
+        std::mutex g_stepLock;
+        std::unordered_map<std::uint32_t, long long> g_steps;   // FormID -> last footstep (ms clock)
 
         bool IsMirror(std::uint32_t a_fid)
         {
@@ -154,11 +170,10 @@ namespace F4MP::GraphOverride
                 // The body's own AI keeps sending these (sneakStop ~30/s while its player sneaks).
                 if (ev && (_stricmp(ev, "moveStop") == 0 || _stricmp(ev, "SprintStop") == 0 ||
                            _stricmp(ev, "sneakStop") == 0 || _stricmp(ev, "sneakStart") == 0)) {
+                    // Its AI copies the LOCAL player's crouch like a follower would (dropped). These used to ask
+                    // the sync to resend the walk too, ~30 times a second: the walk restarted on every one. A walk
+                    // the graph refuses is checked against its real stance instead (main.cpp, iIsInSneak).
                     g_blocked.fetch_add(1, std::memory_order_relaxed);
-                    // Its AI copies the LOCAL player's crouch like a follower would; even dropped, that
-                    // left the graph refusing moveStart for ~2 s afterwards while the body was moved
-                    // along: it slid. Have the sync resend its own state.
-                    if (_strnicmp(ev, "sneak", 5) == 0) slot->resync.store(true, std::memory_order_release);
                     return true;
                 }
                 // The body's own AI drawing or holstering against its player (in and after fights: the
@@ -195,7 +210,8 @@ namespace F4MP::GraphOverride
                         return true;
                     }
                 }
-                if (ev && IsNpcIdleEvent(ev) && IsMirror(static_cast<RE::Actor*>(a_self)->GetFormID())) {
+                if (ev && IsNpcIdleEvent(ev) && IsMirror(static_cast<RE::Actor*>(a_self)->GetFormID()) &&
+                    !IdlesAllowed(static_cast<RE::Actor*>(a_self)->GetFormID())) {
                     const auto n = g_idlesBlocked.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (n <= 20 || n % 500 == 0)
                         REX::INFO("[GraphOverride] mirrored NPC {:#x}: own idle {} dropped (#{})",
@@ -213,6 +229,28 @@ namespace F4MP::GraphOverride
                 }
             }
             return ok;
+        }
+
+        RE::BSEventNotifyControl GraphEventHook(GraphSink* a_self, const RE::BSAnimationGraphEvent& a_event,
+            RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
+        {
+            const char* tag = a_event.tag.c_str();
+            if (tag && _strnicmp(tag, "Foot", 4) == 0) {
+                auto* actor = static_cast<RE::Actor*>(static_cast<RE::TESObjectREFR*>(a_self));
+                const auto fid = actor->GetFormID();
+                const bool body = IsBody(HolderOf(actor));
+                if (body || IsMirror(fid)) {
+                    {
+                        std::lock_guard l(g_stepLock);
+                        g_steps[fid] = NowMs();
+                        if (g_steps.size() > 512) g_steps.clear();
+                    }
+                    static std::atomic<int> s_logged{ 0 };
+                    if (s_logged.fetch_add(1, std::memory_order_relaxed) < 6)
+                        REX::INFO("[GraphOverride] footstep {} from {} {:#x}", tag, body ? "body" : "mirrored NPC", fid);
+                }
+            }
+            return g_originalGraphEvent(a_self, a_event, a_source);
         }
 
         void Patch(std::uintptr_t** a_vtbl, std::size_t a_slot, std::uintptr_t a_fn, std::uintptr_t& a_orig)
@@ -314,6 +352,11 @@ namespace F4MP::GraphOverride
         Patch(vtbl, kNotifySlot, reinterpret_cast<std::uintptr_t>(&NotifyHook), unused);
         REX::INFO("[GraphOverride] hooked Character graph pre-update + events (vtable {:#x})",
             reinterpret_cast<std::uintptr_t>(vtbl));
+        // The graph's own events to the reference (footsteps): a secondary vtable of the same Character.
+        auto** sinkVtbl = *reinterpret_cast<std::uintptr_t***>(static_cast<GraphSink*>(a_anyBody));
+        g_originalGraphEvent = reinterpret_cast<GraphEvent_t>(sinkVtbl[kGraphEventSlot]);
+        Patch(sinkVtbl, kGraphEventSlot, reinterpret_cast<std::uintptr_t>(&GraphEventHook), unused);
+        REX::INFO("[GraphOverride] hooked Character graph events to the reference (vtable {:#x})", reinterpret_cast<std::uintptr_t>(sinkVtbl));
     }
 
     bool Installed() { return g_original != nullptr; }
@@ -466,6 +509,25 @@ namespace F4MP::GraphOverride
         std::lock_guard l(g_mirrorLock);
         g_mirrors.clear();
         g_mirrorDrawn.clear();
+        g_idlesAllowedUntil.clear();
+    }
+
+    void AllowIdles(std::uint32_t a_formId, int a_ms)
+    {
+        std::lock_guard l(g_mirrorLock);
+        g_idlesAllowedUntil[a_formId] = NowMs() + a_ms;
+        if (g_idlesAllowedUntil.size() > 512) g_idlesAllowedUntil.clear();
+    }
+
+    void BeginOurs() { t_ours = true; }
+    void EndOurs() { t_ours = false; }
+
+    long long LastStepMs(RE::Actor* a_actor)
+    {
+        if (!a_actor) return 0;
+        std::lock_guard l(g_stepLock);
+        auto it = g_steps.find(a_actor->GetFormID());
+        return it != g_steps.end() ? it->second : 0;
     }
 
     unsigned long long CallCount() { return g_calls.load(); }

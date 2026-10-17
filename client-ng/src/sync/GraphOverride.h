@@ -59,6 +59,16 @@ namespace F4MP::GraphOverride
     // Whether a mirrored NPC's owner has its weapon out: its own AI's draw/holster against that is dropped.
     void SetMirrorDrawn(std::uint32_t a_formId, bool a_drawn);
     void ClearMirrors();
+    // Let a mirrored NPC's idle events through for a while (an idle its owner's copy plays: sync/Activity).
+    void AllowIdles(std::uint32_t a_formId, int a_ms);
+    // Events the engine sends while F4MP itself plays something (an idle) count as ours.
+    void BeginOurs();
+    void EndOurs();
+
+    // Footsteps: the graph's own Foot... events, seen for player bodies and mirrored NPCs. They tell whether
+    // a walk/run really plays (a body gliding with still feet, or walking in place, stayed that way until
+    // its player jumped or crouched). Milliseconds on the steady clock; 0 = none yet.
+    long long LastStepMs(RE::Actor* a_actor);
 
     unsigned long long CallCount();      // diagnostics: how often the hook ran / overrode
     unsigned long long OverrideCount();

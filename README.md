@@ -41,9 +41,10 @@ drag the file in. Logs from both players help the most.
 
 ## What's shared
 
-Movement and animations, weapons and armor (with their mods), shooting and melee - aimed where
-each player really aims - damage (including between players), enemies and NPCs, deaths,
-explosions, doors and switches, dropped items, containers, building / moving / scrapping in
+Movement and animations, weapons and armor (with their mods), power armor, sitting and lying on
+furniture (players and NPCs, including NPCs cooking or eating at a campfire), NPC idle animations,
+shooting and melee - aimed where each player really aims - damage (including between players),
+enemies and NPCs, deaths, explosions, doors and switches, dropped items, containers, building / moving / scrapping in
 workshops, quest progress, time of day and weather.
 
 ## Building from source

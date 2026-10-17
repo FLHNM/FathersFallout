@@ -76,7 +76,8 @@ about a minute.
 - **Guests:** while connected, the **host's world and story are the story**. Your quests are moved
   up to the host's progress and NPCs go where the host has them. **This changes your save** - use
   a separate save (a copy of your character) for co-op if you want your own playthrough untouched.
-- **Shared:** movement and animations, weapons and armor (with mods), shooting and melee, damage
+- **Shared:** movement and animations, weapons and armor (with mods), power armor, furniture (sitting,
+  lying, cooking - players and NPCs), NPC idles, shooting and melee, damage
   (including to each other), enemies and NPCs, deaths, explosions, doors and switches, items you
   drop for each other, containers, building / moving / scrapping in workshops, quest progress,
   time of day and weather.

@@ -15,6 +15,7 @@
 #include "sync/Authority.h"
 #include "sync/Paths.h"
 #include "sync/Workshop.h"
+#include "sync/Activity.h"
 #include "sync/GraphOverride.h"
 #include "sync/AimHook.h"
 #include "sync/PlayerEvents.h"
@@ -452,6 +453,89 @@ namespace F4MP
                     }
                     continue;
                 }
+                // Test helpers for sync/Activity: "f4mp:act <what> <actor> ..." where actor is a FormID in hex,
+                // "body" (the first player body) or "player". info | seat <furn> [marker] | unseat [i m u] |
+                // idle <idle> | pa [frameBase] [pieces...] | paout; "f4mp:act near" describes actors around us.
+                if (cmd.rfind("f4mp:act ", 0) == 0) {
+                    std::istringstream in(cmd.substr(9));
+                    std::string what, who;
+                    in >> what;
+                    auto* pl = RE::PlayerCharacter::GetSingleton();
+                    if (what == "near") {
+                        if (auto* tes = RE::TES::GetSingleton(); tes && pl)
+                            tes->ForEachReferenceInRange(pl->GetPosition(), 2500.0f, [&](RE::TESObjectREFR* ref) {
+                                if (auto* a = ref ? ref->As<RE::Actor>() : nullptr; a && a != pl && a->Get3D()) Activity::Describe(a);
+                                return RE::BSContainer::ForEachResult::kContinue;
+                            });
+                        continue;
+                    }
+                    in >> who;
+                    RE::Actor* a = nullptr;
+                    if (who == "player") a = pl;
+                    else if (who == "body") { auto b = GetBodies(); if (!b.empty()) if (auto* f = RE::TESForm::GetFormByID(b.front().second)) a = f->As<RE::Actor>(); }
+                    else if (auto* f = RE::TESForm::GetFormByID(std::strtoul(who.c_str(), nullptr, 16))) a = f->As<RE::Actor>();
+                    if (!a) { REX::INFO("[Bridge] act: no actor '{}'", who); continue; }
+                    std::vector<uint32_t> args;
+                    std::string h;
+                    while (in >> h) args.push_back(std::strtoul(h.c_str(), nullptr, 16));
+                    if (what == "seat" && !args.empty()) {
+                        auto* furn = RE::TESForm::GetFormByID(args[0]);
+                        auto* ref = furn ? furn->As<RE::TESObjectREFR>() : nullptr;
+                        const bool ok = Activity::Seat(a, ref, args.size() > 1 ? args[1] : 0);
+                        REX::INFO("[Bridge] act seat {:#x} on {:#x} -> {}", a->GetFormID(), args[0], ok);
+                    } else if (what == "unseat") {
+                        if (args.size() >= 3) a->StopInteractingQuick(args[0] != 0, args[1] != 0, args[2] != 0);
+                        else Activity::Unseat(a);
+                        REX::INFO("[Bridge] act unseat {:#x}", a->GetFormID());
+                    } else if (what == "idle" && !args.empty()) {
+                        auto* f = RE::TESForm::GetFormByID(args[0]);
+                        const bool ok = Activity::PlayIdle(a, f ? f->As<RE::TESIdleForm>() : nullptr);
+                        REX::INFO("[Bridge] act idle {:#x} {:#x} -> {}", a->GetFormID(), args[0], ok);
+                    } else if (what == "pa") {
+                        const uint32_t base = args.empty() ? 0 : args[0];
+                        Activity::EnterPowerArmor(a, base, args.size() > 1 ? args.data() + 1 : nullptr, args.size() > 1 ? static_cast<int>(args.size() - 1) : 0);
+                    } else if (what == "paout") {
+                        Activity::ExitPowerArmor(a);
+                    } else if (what == "seq") {
+                        // seq <steps...> in one go: name=0|1 sets a bool, name:=<float> a float, name#=<int> an int,
+                        // anything else is sent as an event; each result is logged.
+                        std::istringstream in2(cmd.substr(9));
+                        std::string skip, t;
+                        in2 >> skip >> skip;
+                        while (in2 >> t) {
+                            bool ok = false;
+                            if (auto p = t.find(":="); p != std::string::npos) ok = a->SetGraphVariableFloat(t.substr(0, p).c_str(), std::stof(t.substr(p + 2)));
+                            else if (auto q = t.find("#="); q != std::string::npos) ok = a->SetGraphVariableInt(t.substr(0, q).c_str(), std::stoi(t.substr(q + 2)));
+                            else if (auto e = t.find('='); e != std::string::npos) ok = a->SetGraphVariableBool(t.substr(0, e).c_str(), t.substr(e + 1) == "1");
+                            else ok = GraphOverride::SendEvent(a, t.c_str());
+                            REX::INFO("[Bridge] act seq {:#x} {} -> {}", a->GetFormID(), t, ok);
+                        }
+                        continue;
+                    } else if (what == "ev" || what == "var" || what == "setb") {
+                        // ev <events...>: send graph events (as F4MP) and log what the graph said; var <names...>: read
+                        // graph variables (float/int/bool); setb <name> <0|1>: set a bool variable.
+                        std::istringstream in2(cmd.substr(9));
+                        std::string skip, name;
+                        in2 >> skip >> skip;
+                        if (what == "setb") {
+                            int v = 0;
+                            in2 >> name >> v;
+                            REX::INFO("[Bridge] act setb {:#x} {} = {} -> {}", a->GetFormID(), name, v, a->SetGraphVariableBool(name.c_str(), v != 0));
+                        }
+                        while (what != "setb" && in2 >> name) {
+                            if (what == "ev") {
+                                REX::INFO("[Bridge] act ev {:#x} {} -> {}", a->GetFormID(), name, GraphOverride::SendEvent(a, name.c_str()));
+                                continue;
+                            }
+                            float f = 0.0f; std::int32_t i = 0; bool bv = false;
+                            const bool hf = a->GetGraphVariableImplFloat(name, f), hi = a->GetGraphVariableImplInt(name, i), hb = a->GetGraphVariableImplBool(name, bv);
+                            REX::INFO("[Bridge] act var {:#x} {}: float {} {:.2f} | int {} {} | bool {} {}", a->GetFormID(), name, hf, f, hi, i, hb, bv);
+                        }
+                        continue;
+                    }
+                    Activity::Describe(a);
+                    continue;
+                }
                 // Test helper: "f4mp:bodyfurn" logs the furniture each body occupies.
                 if (cmd == "f4mp:bodyfurn") {
                     for (auto& [pid, fid] : GetBodies()) {
@@ -838,7 +922,10 @@ namespace F4MP
                            float rxSmooth = 0.0f; float lastRxSpeed = 0.0f; std::chrono::steady_clock::time_point lastRxMoveAt{};
                            int gait = 0;   // gait event the graph took: 0 none yet, 1 Walk, 2 Run (jog)
                            int gaitTries = 0; int gaitWant = 0; int moveRefused = 0; std::chrono::steady_clock::time_point gaitWantSince{};
-                           RE::NiPoint3 lastPos{}; std::chrono::steady_clock::time_point lastPosAt{}; bool havePos = false; };
+                           RE::NiPoint3 lastPos{}; std::chrono::steady_clock::time_point lastPosAt{}; bool havePos = false;
+                           // Footstep watchdog (StepWatch): the walk/run must really play while the body moves.
+                           bool prevMoving = false; long long movingSinceMs = 0, stillSinceMs = 0, lastKickMs = 0;
+                           long long lastStep = 0, stillStepsFrom = 0, quickUntilMs = 0; int stillSteps = 0; };
     static std::unordered_map<uint32_t, BodyAnimState> g_animState;
     static bool g_lastOkSpeed = false, g_lastOkDir = false;       // retorno de SetGraphVariable (debug)
     static bool g_graphDumped = false;                            // ya volcamos las variables del grafo?
@@ -948,6 +1035,7 @@ namespace F4MP
         g_lastHeading.clear();
         g_animState.clear();
         g_spawnAt = std::chrono::steady_clock::now();
+        Activity::Reset();   // the frames we gave bodies (runtime references) mustn't go into the save either
     }
 
     // Area of interest for remote bodies: see sync/Range.h (follows uGridsToLoad).
@@ -1100,6 +1188,51 @@ namespace F4MP
 
     // Nothing has loaded (or stalled the main thread) for this long.
     static bool SettledFor(int a_seconds) { return NowMs() - g_lastLoadingMs.load() > a_seconds * 1000LL; }
+
+    // Start the walk/run. Crouched, the graph takes moveStartAnimated and refuses moveStart (testing: the
+    // engine sends the player's own graph moveStartAnimated when it moves while sneaking); standing, the other
+    // way round. Either name is tried.
+    static bool StartMoving(RE::Actor* actor, bool sneaking)
+    {
+        const char* first = sneaking ? "moveStartAnimated" : "moveStart";
+        const char* second = sneaking ? "moveStart" : "moveStartAnimated";
+        return GraphOverride::SendEvent(actor, first) || GraphOverride::SendEvent(actor, second);
+    }
+
+    // Footstep watchdog for bodies and mirrored NPCs. Locomotion events go out only when our idea of the
+    // state changes, so when the graph quietly dropped out of its walk (a reset, a refused event) the body
+    // glided along with still feet, or kept walking on the spot, until its player jumped, crouched or drew:
+    // the "press a button to resync" reports. The graph's own footsteps say what really plays.
+    // 1 = moving for 1.5 s without a footstep (send the walk/run again), 2 = steps keep coming while its
+    // player/owner stands (stop it), 0 = fine or nothing to judge by (no footsteps from this graph yet).
+    // standing: what the sender says (its speed), not our measurement: a body put back on its spot read as
+    // moving for a moment every time, and that kept resetting the count.
+    template <class S>
+    static int StepWatch(RE::Actor* actor, S& st, bool moving, float speed, bool skip, bool standing)
+    {
+        const long long now = NowMs();
+        if (moving != st.prevMoving) {
+            st.prevMoving = moving;
+            if (moving) st.movingSinceMs = now;
+        }
+        if (!standing) { st.stillSinceMs = now; st.stillSteps = 0; }
+        const long long step = GraphOverride::LastStepMs(actor);
+        const bool newStep = step && step != st.lastStep;
+        st.lastStep = step;
+        // Right after a draw/holster look sooner: 0.8 s, not 1.5 s.
+        const long long wait = now < st.quickUntilMs ? 800 : 1500;
+        if (!step || skip || now - st.lastKickMs < (now < st.quickUntilMs ? 1000 : 3000)) return 0;
+        if (moving && !standing) {
+            if (speed > 70.0f && now - st.movingSinceMs > wait && now - step > wait) { st.lastKickMs = now; return 1; }
+            return 0;
+        }
+        // Turning on the spot steps too: only a steady stream (4 in 2.5 s, a walk steps every ~0.6 s) is walking in place.
+        if (standing && newStep && now - st.stillSinceMs > 800) {
+            if (st.stillSteps == 0 || now - st.stillStepsFrom > 2500) { st.stillSteps = 0; st.stillStepsFrom = now; }
+            if (++st.stillSteps >= 4) { st.stillSteps = 0; st.lastKickMs = now; return 2; }
+        }
+        return 0;
+    }
 
     static void BodiesSync()
     {
@@ -1417,9 +1550,10 @@ namespace F4MP
                     const float lag = std::sqrt(delta.x * delta.x + delta.y * delta.y);
                     float eap = 0.0f, eah = 0.0f;
                     GraphOverride::EngineAim(eap, eah);
-                    REX::INFO("[Trace] p{} rx {:.0f} smooth {:.0f} graphSpeed {:.0f} | lag {:.0f} | moving {} sprint {} (rx {}) | "
+                    const long long stepAge = GraphOverride::LastStepMs(actor) ? NowMs() - GraphOverride::LastStepMs(actor) : -1;
+                    REX::INFO("[Trace] p{} step {} ms ago | rx {:.0f} smooth {:.0f} graphSpeed {:.0f} | lag {:.0f} | moving {} sprint {} (rx {}) | "
                               "dir rx {:.2f} graph {:.2f} | heading {:.2f} | pitch rx {:.2f} | engine aim p {:.2f} h {:.2f} | hook {} / {} | blocked {}",
-                        pid, rp.speed, st.smoothSpeed, gSpeed, lag, st.moving, st.sprinting, rp.isSprinting, rp.moveDir, gDir, rp.angleZ,
+                        pid, stepAge, rp.speed, st.smoothSpeed, gSpeed, lag, st.moving, st.sprinting, rp.isSprinting, rp.moveDir, gDir, rp.angleZ,
                         rp.pitch, eap, eah, GraphOverride::CallCount(), GraphOverride::OverrideCount(), GraphOverride::BlockedCount());
                 }
             }
@@ -1517,6 +1651,7 @@ namespace F4MP
                                 ws, rp.weaponDrawn ? "drawing" : "holstering");
                     }
                     actor->DrawWeaponMagicHands(rp.weaponDrawn);
+                    st.quickUntilMs = NowMs() + 3000;
                     st.weaponDrawn = rp.weaponDrawn;
                     st.lastDrawCheck = ahora;
                     st.drawReached = false;
@@ -1547,6 +1682,9 @@ namespace F4MP
                 REX::INFO("[F4MP] body {} ready: moving {}, sprint {}", pid, wantMoving, wantSprint);
                 st.moving = false;      // the transition code below sends moveStart/SprintStart
                 st.sprinting = false;
+                // Standing: say so. A body spawned while the engine had it walking (testing: right after an interior
+                // load, graph Speed 80 at spawn) kept walking on the spot, since "standing" was never sent.
+                if (!wantMoving) GraphOverride::SendEvent(actor, "moveStop");
                 st.init = true;
             }
             // The engine reset the graph's state (relaxed stance, weapon (un)equip...): resend ours.
@@ -1557,18 +1695,22 @@ namespace F4MP
             // A state counts as sent only once the graph accepts it; refused events are retried
             // next tick (the graph refuses e.g. moveStart while it's still in a start-up state).
             if (wantMoving != st.moving) {
-                bool ok = GraphOverride::SendEvent(actor, wantMoving ? "moveStart" : "moveStop");
-                // Refused for a quarter second while the body is being moved = it slides. Seen right after
-                // the local player crouched (the body's AI copies that): put its graph back in its own
-                // player's stance first, then start walking again.
+                bool ok = wantMoving ? StartMoving(actor, rp.isSneaking) : GraphOverride::SendEvent(actor, "moveStop");
+                // Refused for a quarter second while the body is being moved = it slides. Seen right after the
+                // local player crouched (the body's AI copies that): if the graph's stance isn't its player's,
+                // put it back first, then start walking again. Only then: resending sneakStart every quarter
+                // second restarted the crouch each time, and a crouching body glided along for good.
                 if (wantMoving && !ok && ++st.moveRefused >= 15) {
                     st.moveRefused = 0;
-                    GraphOverride::SendEvent(actor, rp.isSneaking ? "sneakStart" : "sneakStop");
-                    ok = GraphOverride::SendEvent(actor, "moveStart");
+                    std::int32_t inSneak = 0;
+                    const bool known = actor->GetGraphVariableImplInt("iIsInSneak", inSneak);
+                    const bool off = known && (inSneak != 0) != rp.isSneaking;
+                    if (off) GraphOverride::SendEvent(actor, rp.isSneaking ? "sneakStart" : "sneakStop");
+                    ok = StartMoving(actor, rp.isSneaking);
                     static int s_logged = 0;
                     if (s_logged++ < 30)
-                        REX::INFO("[F4MP] body of player {}: walk refused 0.25 s - stance {} resent, moveStart -> {}", pid,
-                            rp.isSneaking ? "sneaking" : "standing", ok);
+                        REX::INFO("[F4MP] body of player {}: walk refused 0.25 s - stance {}{}, start -> {}", pid,
+                            rp.isSneaking ? "sneaking" : "standing", off ? " resent" : " already right", ok);
                 }
                 if (ok) st.moveRefused = 0;
                 if (ok || !wantMoving) st.moving = wantMoving;
@@ -1623,12 +1765,12 @@ namespace F4MP
             actor->SetGraphVariableBool("IsJumping", rp.isJumping);
             if (st.jumping != rp.isJumping) {
                 if (rp.isJumping) {
-                    bool a = actor->NotifyAnimationGraphImpl("JumpUp");
-                    bool b = actor->NotifyAnimationGraphImpl("jumpStart");
-                    bool c = actor->NotifyAnimationGraphImpl("JumpStandingStart");
-                    bool d = actor->NotifyAnimationGraphImpl("JumpDirectionalStart");
-                    REX::INFO("[F4MP] jump events: JumpUp={} jumpStart={} JumpStandingStart={} JumpDirectionalStart={}",
-                        a, b, c, d);
+                    // jumpStart is the body graph's. As
+                    // F4MP: sent raw, the hook took it for the engine resetting the graph and the walk was restarted
+                    // all through the jump (refused every quarter second until the landing).
+                    const bool ok = GraphOverride::SendEvent(actor, "jumpStart") || GraphOverride::SendEvent(actor, "JumpUp");
+                    static int s_logged = 0;
+                    if (s_logged++ < 20) REX::INFO("[F4MP] body of player {} jumps: {}", pid, ok);
                 } else {
                     // Landed. Without this the body stayed in the jump's fall pose (arms up) for
                     // good and refused every later jump. Same events the player's own
@@ -1642,6 +1784,28 @@ namespace F4MP
                     st.sprinting = false;
                 }
                 st.jumping = rp.isJumping;
+            }
+
+            // Not while crouched: the sneak walk/run clips have no footstep events.
+            const bool senderStands = ahora - st.lastRxMoveAt > std::chrono::milliseconds(800);
+            switch (StepWatch(actor, st, st.moving, st.smoothSpeed, rp.isJumping || rp.isSneaking || Activity::BodyInPowerArmor(pid), senderStands)) {
+            case 1: {
+                static int s_logged = 0;
+                if (s_logged++ < 40) REX::INFO("[StepWatch] body of player {}: moving ({:.0f}) but no footsteps for 1.5 s - walk/run sent again", pid, st.smoothSpeed);
+                st.moving = false;      // resent below next tick, gait and sprint after it
+                st.sprinting = false;
+                st.gait = 0;
+                break;
+            }
+            case 2: {
+                const bool ok = GraphOverride::SendEvent(actor, "moveStop");
+                st.moving = false;
+                st.sprinting = false;
+                static int s_logged = 0;
+                if (s_logged++ < 40) REX::INFO("[StepWatch] body of player {}: walking on the spot while its player stands - moveStop -> {}", pid, ok);
+                break;
+            }
+            default: break;
             }
 
             // Log throttled (1/s): mide el DESFASE cuerpo vs objetivo (para diagnosticar
@@ -1769,6 +1933,8 @@ namespace F4MP
         bool init = false; float heading = 0.0f;
         bool sneaking = false; int gait = 0;   // 0 none, 1 walk, 2 run
         bool drawn = false; bool ownerDrawn = false; std::chrono::steady_clock::time_point drawAt{};
+        bool prevMoving = false; long long movingSinceMs = 0, stillSinceMs = 0, lastKickMs = 0;   // footstep watchdog
+        long long lastStep = 0, stillSteps = 0, stillStepsFrom = 0, quickUntilMs = 0;
     };
     static std::unordered_map<uint32_t, NpcAnimState> g_npcAnim;
     // Mirrored NPCs replay their owner's attacks (CoopNpcAnim) for show: the owner's game deals the
@@ -2053,6 +2219,7 @@ namespace F4MP
             }
             Coop::ApplyNpcVitals(actor, owner, fid, s.health, s.isDead);
             if (s.isDead || actor->IsDead(false)) continue;   // corpses ragdoll locally
+            if (Activity::MirrorSeated(local)) continue;      // on its owner's seat: the furniture places and animates it
 
             // Conducir posicion (interpolada suave) + heading, como los cuerpos de jugador.
             const RE::NiPoint3 objetivo{ s.x, s.y, s.z };
@@ -2084,9 +2251,26 @@ namespace F4MP
             actor->SetGraphVariableFloat("Speed", anim.smoothSpeed);
             const bool wantMoving = anim.moving ? (anim.smoothSpeed > 8.0f) : (anim.smoothSpeed > 30.0f);
             if (wantMoving != anim.moving) {
-                GraphOverride::SendEvent(actor, wantMoving ? "moveStart" : "moveStop");
+                if (wantMoving) StartMoving(actor, anim.sneaking);
+                else GraphOverride::SendEvent(actor, "moveStop");
                 anim.moving = wantMoving;
                 anim.gait = wantMoving ? 1 : 0;
+            }
+            switch (StepWatch(actor, anim, anim.moving, anim.smoothSpeed, anim.sneaking, s.speed < 10.0f && anim.smoothSpeed < 15.0f)) {
+            case 1: {
+                static int s_logged = 0;
+                if (s_logged++ < 40) REX::INFO("[StepWatch] mirrored NPC {:#x}: moving ({:.0f}) but no footsteps for 1.5 s - walk sent again", local, anim.smoothSpeed);
+                anim.moving = false;   // moveStart again next tick
+                anim.gait = 0;
+                break;
+            }
+            case 2: {
+                const bool ok = GraphOverride::SendEvent(actor, "moveStop");
+                static int s_logged = 0;
+                if (s_logged++ < 40) REX::INFO("[StepWatch] mirrored NPC {:#x}: walking on the spot - moveStop -> {}", local, ok);
+                break;
+            }
+            default: break;
             }
             // Crouched like its owner's copy (sent since the start, never applied).
             if (anim.sneaking != s.isSneaking) {
@@ -2124,6 +2308,7 @@ namespace F4MP
                 }
                 if (Coop::TakeNpcRedraw(local) && want) {
                     anim.drawAt = t;
+                    anim.quickUntilMs = NowMs() + 3000;
                     actor->DrawWeaponMagicHands(true);
                 } else if (!kept && (WeaponStateOf(actor) >= 3) != want && t - anim.drawAt > std::chrono::milliseconds(1500)) {
                     // Asked before and still not there: stuck half-way ("want to draw" that nothing picks up,
@@ -2139,6 +2324,7 @@ namespace F4MP
                                 ws, want ? "drawing" : "holstering");
                     }
                     anim.drawAt = t;
+                    anim.quickUntilMs = NowMs() + 3000;
                     actor->DrawWeaponMagicHands(want);
                     static int s_draws = 0;
                     if (s_draws++ < 30)
@@ -2602,6 +2788,9 @@ namespace F4MP
         auto* local = RE::PlayerCharacter::GetSingleton();
         if (!local) return;
         const RE::NiPoint3 myPos = local->GetPosition();
+
+        // Not over a loading screen.
+        if (auto* ui = RE::UI::GetSingleton(); ui && ui->GetMenuOpen("LoadingMenu")) return;
 
         auto* io = ImGuiMCP::GetIO();
         if (!io) return;

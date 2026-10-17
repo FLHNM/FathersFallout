@@ -32,8 +32,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.20.0.0")]
-[assembly: AssemblyFileVersion("0.20.0.0")]
+[assembly: AssemblyVersion("0.21.0.0")]
+[assembly: AssemblyFileVersion("0.21.0.0")]
 
 namespace F4MPLauncher
 {

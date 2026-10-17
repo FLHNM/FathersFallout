@@ -9,6 +9,7 @@
 #include "network/NetworkClient.h"
 #include "sync/Paths.h"
 #include "sync/Authority.h"
+#include "sync/Activity.h"
 
 #include <algorithm>
 #include <array>
@@ -602,18 +603,11 @@ namespace F4MP::Workshop
     // ---- furniture ----
     namespace
     {
-        std::unordered_map<uint32_t, uint32_t> g_bodySeat;   // playerId -> our furniture ref their body uses
-        std::pair<uint32_t, uint32_t> g_mySeat{};            // what we last sent (owner, ref)
+        struct BodySeat { uint32_t furn = 0; uint32_t marker = 0; bool onIt = false; int tries = 0;
+                          std::chrono::steady_clock::time_point nextTry{}; };
+        std::unordered_map<uint32_t, BodySeat> g_bodySeat;   // playerId -> our furniture their body uses
+        CoopSeatMsg g_mySeat{};                               // what we last sent
         std::chrono::steady_clock::time_point g_mySeatSent{};
-
-        // Seated: hold the body still where its player sits (it ran in place on the couch before).
-        // A real sit animation isn't there yet: ActivateRef needs the AI (bodies run a do-nothing
-        // package; releasing it made the body wander) and Papyrus SnapIntoInteraction crashed
-        // binding a script object to the runtime body.
-        void HoldSeated(RE::Actor* a_body)
-        {
-            GraphOverride::Set(a_body, 0.0f, 0.0f);   // the graph hook applies this every frame
-        }
 
         RE::Actor* BodyOf(uint32_t playerId)
         {
@@ -621,52 +615,90 @@ namespace F4MP::Workshop
                 if (pid == playerId) return Lookup<RE::Actor>(bodyId);
             return nullptr;
         }
+
+        // Put the body on its seat (the furniture places and animates it); until that works, hold it still
+        // where its player sits. Retried a few times: the
+        // furniture's 3D may still be loading.
+        void ApplyBodySeat(uint32_t pid, BodySeat& s)
+        {
+            auto* body = BodyOf(pid);
+            auto* furn = Lookup<RE::TESObjectREFR>(s.furn);
+            if (!body || !furn || Gone(furn) || !furn->Get3D()) return;
+            if (Activity::SeatOf(body) == furn) {
+                if (!s.onIt) REX::INFO("[Furniture] body of player {} is on {:#x} (marker {})", pid, s.furn, s.marker);
+                s.onIt = true;
+                return;
+            }
+            s.onIt = false;
+            GraphOverride::Set(body, 0.0f, 0.0f);   // still while not on it
+            const auto now = std::chrono::steady_clock::now();
+            if (s.tries >= 5 || now < s.nextTry) return;
+            ++s.tries;
+            s.nextTry = now + std::chrono::seconds(1);
+            const bool ok = Activity::Seat(body, furn, s.marker);
+            REX::INFO("[Furniture] body of player {}: onto {:#x} marker {} -> {} (try {})", pid, s.furn, s.marker, ok, s.tries);
+        }
     }
+
+    bool SeatKey(RE::TESObjectREFR* furn, uint32_t& owner, uint32_t& ref)
+    {
+        owner = ref = 0;
+        if (!furn) return false;
+        if (auto it = g_tracked.find(furn->GetFormID()); it != g_tracked.end() && it->second.shared) {
+            owner = it->second.key.owner;
+            ref = it->second.key.ref;
+            return true;
+        }
+        if (furn->GetFormID() < kDynamicFormIdStart) { ref = furn->GetFormID(); return true; }   // a plugin chair/bed/workbench
+        return false;
+    }
+
+    uint32_t LocalSeat(uint32_t owner, uint32_t ref) { return ref ? LocalFor(owner, ref) : 0; }
 
     void FurnitureTick()
     {
+        // Bodies first: keep them on their seats (a body respawned while its player sits is seated again).
+        for (auto& [pid, s] : g_bodySeat) ApplyBodySeat(pid, s);
+
         auto* pl = RE::PlayerCharacter::GetSingleton();
         if (!pl) return;
-        RE::TESObjectREFR* furn = nullptr;
-        if (pl->currentProcess) furn = pl->currentProcess->GetOccupiedFurniture().get().get();
-        std::pair<uint32_t, uint32_t> seat{};
-        if (furn) {
-            if (auto it = g_tracked.find(furn->GetFormID()); it != g_tracked.end() && it->second.shared)
-                seat = { it->second.key.owner, it->second.key.ref };
-            else if (furn->GetFormID() < kDynamicFormIdStart)
-                seat = { 0, furn->GetFormID() };   // a plugin chair/bed/workbench
-        }
+        uint32_t marker = 0;
+        // In power armor the frame is "furniture" too, but that has its own message (sync/Activity).
+        RE::TESObjectREFR* furn = RE::PowerArmor::PlayerInPowerArmor() ? nullptr : Activity::SeatOf(pl, &marker);
+        CoopSeatMsg seat{};
+        if (furn && SeatKey(furn, seat.ownerId, seat.ownerRefFormId)) seat.marker = marker;
         const auto now = std::chrono::steady_clock::now();
+        const bool same = seat.ownerId == g_mySeat.ownerId && seat.ownerRefFormId == g_mySeat.ownerRefFormId && seat.marker == g_mySeat.marker;
         // On change, and every 5 s while seated (someone who arrives later sees it too).
-        if (seat == g_mySeat && (seat.second == 0 || now - g_mySeatSent < std::chrono::seconds(5))) return;
-        if (seat != g_mySeat) REX::INFO("[Furniture] {} {:#x}: sent", seat.second ? "using" : "left", seat.second ? seat.second : g_mySeat.second);
+        if (same && (seat.ownerRefFormId == 0 || now - g_mySeatSent < std::chrono::seconds(5))) return;
+        if (!same) REX::INFO("[Furniture] {} {:#x} (marker {}): sent", seat.ownerRefFormId ? "using" : "left",
+            seat.ownerRefFormId ? seat.ownerRefFormId : g_mySeat.ownerRefFormId, seat.marker);
         g_mySeat = seat;
         g_mySeatSent = now;
-        CoopRefActivatedMsg msg{};
-        msg.ownerId = seat.first;
-        msg.ownerRefFormId = seat.second;
-        Send(MessageType::CoopFurniture, msg);
+        Send(MessageType::CoopFurniture, seat);
     }
 
-    void OnFurniture(const CoopRefActivatedMsg& m)
+    void OnFurniture(const CoopSeatMsg& m)
     {
-        auto* body = BodyOf(m.senderId);
-        if (!body) return;
         const uint32_t fid = m.ownerRefFormId ? LocalFor(m.ownerId, m.ownerRefFormId) : 0;
         auto it = g_bodySeat.find(m.senderId);
-        const uint32_t current = it != g_bodySeat.end() ? it->second : 0;
-        if (fid == current) return;
+        const uint32_t current = it != g_bodySeat.end() ? it->second.furn : 0;
+        if (fid == current && (!fid || it->second.marker == m.marker)) return;
         if (current) {
-            // Got up: the position sync takes over again.
+            // Got up (or moved to another seat): the position sync takes over again.
             g_bodySeat.erase(m.senderId);
+            if (auto* body = BodyOf(m.senderId)) Activity::Unseat(body);
             REX::INFO("[Furniture] player {} got up from {:#x}", m.senderId, current);
         }
         if (fid) {
             auto* furn = Lookup<RE::TESObjectREFR>(fid);
-            if (!furn || Gone(furn) || !furn->Get3D()) return;
-            g_bodySeat[m.senderId] = fid;
-            HoldSeated(body);
-            REX::INFO("[Furniture] player {} uses {:#x}: body held still", m.senderId, fid);
+            if (!furn || Gone(furn)) return;
+            BodySeat s{};
+            s.furn = fid;
+            s.marker = m.marker;
+            g_bodySeat[m.senderId] = s;
+            REX::INFO("[Furniture] player {} uses {:#x} marker {}", m.senderId, fid, m.marker);
+            ApplyBodySeat(m.senderId, g_bodySeat[m.senderId]);
         }
     }
 
@@ -678,6 +710,7 @@ namespace F4MP::Workshop
         UnhideAll("disconnected");
         g_bodySeat.clear();
         g_mySeat = {};
+        g_mySeatSent = {};
         g_toPlace.clear();
         g_worldReqSent = false;
         g_connectedAt = {};
