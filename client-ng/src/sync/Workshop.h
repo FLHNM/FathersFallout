@@ -48,6 +48,9 @@ namespace F4MP::Workshop
     // reference (0, FormID). False for furniture only this game has. LocalSeat: back to our FormID (0 = none).
     bool SeatKey(RE::TESObjectREFR* furniture, uint32_t& owner, uint32_t& ref);
     uint32_t LocalSeat(uint32_t owner, uint32_t ref);
+    // Any shared build (a chest built at a settlement, ...) by its network name, and back to our FormID (0 = none).
+    bool BuildKey(RE::TESObjectREFR* ref, uint32_t& owner, uint32_t& key);
+    uint32_t LocalBuild(uint32_t owner, uint32_t key);
     // Hide one of our references while connected (an NPC the host's world doesn't have here).
     void HideRef(RE::TESObjectREFR* ref);   // kPostLoadGame: show what a save made while connected had hidden
     void RegisterSerialization();   // once, at plugin load: build links in the co-save

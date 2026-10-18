@@ -2472,6 +2472,17 @@ namespace F4MP
                 g_travelPending = true;
                 return;
             }
+            // Only a short step: the space matched before a same-worldspace trip's load even began (a door
+            // taken while joining, testing), and a setpos across the map hangs the game on a black screen.
+            if (auto* pl = RE::PlayerCharacter::GetSingleton()) {
+                const auto me = pl->GetPosition();
+                const float dx = me.x - target.x, dy = me.y - target.y;
+                if (dx * dx + dy * dy > 12000.0f * 12000.0f) {
+                    std::lock_guard l(g_travelLock);
+                    g_travelPending = true;   // the trip's own load hasn't landed us yet (gives up after 90 s)
+                    return;
+                }
+            }
             const float x = target.x + std::sin(target.angleZ + 1.57f) * 120.0f;
             const float y = target.y + std::cos(target.angleZ + 1.57f) * 120.0f;
             const std::string cmds[] = {
@@ -2496,6 +2507,8 @@ namespace F4MP
         auto host = remotos.find(Authority::HostId());
         if (host == remotos.end() || host->second.cellId == 0) return;   // where the host is isn't known yet
         if (!SettledFor(5)) return;   // let the save finish loading before starting another load
+        // Mid-load (a door just taken) we're nowhere: a trip decided now picked the wrong kind.
+        if (Authority::LocalSpaceAtomic() == 0) return;
         g_travelDone = true;
         GoToHost(true);
     }
@@ -2741,6 +2754,7 @@ namespace F4MP
         ImGuiMCP::Checkbox("Send my own quest progress to the host (changes the host's save)", &cs.shareMyQuests);
         ImGuiMCP::Checkbox("Time of day + weather (follow the host)", &cs.worldTime);
         ImGuiMCP::Checkbox("Show other players' attacks, aiming and reloads", &cs.combatAnims);
+        ImGuiMCP::Checkbox("Friendly fire (other players' shots and swings can hurt me)", &cs.friendlyFire);
         if (Coop::IsLoadOrderMismatch())
             ImGuiMCP::TextColored(ImGuiMCP::ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
                 "LOAD ORDER DIFFERS FROM THE HOST - item/quest/NPC sync paused (see FathersFallout.log)");
@@ -2906,6 +2920,7 @@ namespace F4MP
             g_isHost = GetPrivateProfileIntA("Connect", "Host", 0, ini) != 0;
             g_steamHosting = GetPrivateProfileIntA("Connect", "Steam", 1, ini) != 0;
             g_travelOnJoin = GetPrivateProfileIntA("Connect", "TravelOnJoin", 1, ini) != 0;
+            Coop::GetSettings().friendlyFire = GetPrivateProfileIntA("Sync", "FriendlyFire", 1, ini) != 0;
         }
         if (!GetPrivateProfileIntA("Connect", "AutoConnect", 0, ini)) return;
         if (RefreshInIntro()) { NotifyIntro(); REX::INFO("[F4MP] auto-connect skipped: this save is in the pre-war intro"); return; }

@@ -117,6 +117,9 @@ namespace F4MP::Coop
             if (IsSyncableRef(localFid)) { owner = 0; ref = localFid; return true; }
             if (localFid < kDynamicFormIdStart || GetPlayerIdForBody(localFid)) return false;
             if (DynamicActors::OwnerOf(localFid, owner, ref)) return true;
+            // A chest built at a settlement: each game has its own copy, so it's named like the build
+            // (neither player saw what the other stored in settlement containers).
+            if (Workshop::BuildKey(LookupForm<RE::TESObjectREFR>(localFid), owner, ref)) return true;
             auto* a = LookupForm<RE::Actor>(localFid);   // one of OUR spawns (announced as ours)
             if (!a) return false;
             owner = NetworkClient::GetInstance().GetPlayerId();
@@ -126,7 +129,9 @@ namespace F4MP::Coop
 
         RE::TESObjectREFR* ResolveRef(uint32_t owner, uint32_t ref)
         {
-            if (owner == 0 || owner == NetworkClient::GetInstance().GetPlayerId()) return LookupForm<RE::TESObjectREFR>(ref);
+            if (owner == 0) return LookupForm<RE::TESObjectREFR>(ref);
+            if (const uint32_t built = Workshop::LocalBuild(owner, ref)) return LookupForm<RE::TESObjectREFR>(built);
+            if (owner == NetworkClient::GetInstance().GetPlayerId()) return LookupForm<RE::TESObjectREFR>(ref);
             return DynamicActors::Resolve(owner, ref);
         }
 
@@ -542,6 +547,11 @@ namespace F4MP::Coop
             auto* pl = RE::PlayerCharacter::GetSingleton();
             auto* hp = HealthAV();
             if (!pl || !hp || m.damage <= 0.0f || m.damage > 100000.0f) return;
+            if (!m.byNpc && !g_settings.friendlyFire) {
+                static int s_ff = 0;
+                if (s_ff++ < 20) REX::INFO("[Coop] player {}'s hit for {:.1f} ignored: friendly fire is off", m.senderId, m.damage);
+                return;
+            }
             // Hits that queued up while we lay dead and the save reloaded landed on the fresh character
             //.
             const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
@@ -809,7 +819,9 @@ namespace F4MP::Coop
 
         // ---------- items ----------
 
-        std::unordered_set<uint32_t> g_pendingSnapshot;  // containers we asked the host about
+        // Containers we asked the owner about, and when: asked again on the next open after 5 s with no
+        // answer (the owner may not have had it loaded; it used to stay unasked for the whole session).
+        std::unordered_map<uint32_t, Clock::time_point> g_pendingSnapshot;
 
         void OnContainerChange(const CoopContainerChangeMsg& m)
         {
@@ -1342,6 +1354,119 @@ namespace F4MP::Coop
             REX::INFO("[Coop] player {} {} {:#x} (locked here now: {})", m.senderId, want ? "locked" : "unlocked", m.refFormId, IsLockedNow(ref));
         }
 
+        // ---------- doors (everyone -> everyone, open only) ----------
+        // Quest scripts open gates only on the game that ran the quest: the host's Diamond City gate
+        // stood open while the joiner's stayed shut, and Covenant's opened only for whoever did the
+        // quiz. Every game asks about the doors around it; the host answers from its
+        // world, other players for doors they have loaded. Only opening and unlocking are copied: one
+        // player's progress opens the way for both, and nobody gets shut out by someone else's world.
+        struct DoorMismatch { int seen = 0; Clock::time_point at{}; };
+        std::unordered_map<uint32_t, DoorMismatch> g_doorMismatch;
+        std::unordered_map<uint32_t, Clock::time_point> g_doorsUsed;   // doors our player activated
+
+        bool IsDoorRef(RE::TESObjectREFR* ref)
+        {
+            auto* base = ref ? ref->GetObjectReference() : nullptr;
+            return base && base->GetFormType() == RE::ENUM_FORM_ID::kDOOR;
+        }
+
+        uint8_t DoorOpenOf(RE::TESObjectREFR* ref)
+        {
+            // Load doors don't swing open: only their lock matters.
+            if (ref->extraList && ref->extraList->HasType(RE::EXTRA_DATA_TYPE::kTeleport)) return 0;
+            using S = RE::BGSOpenCloseForm::OPEN_STATE;
+            switch (RE::BGSOpenCloseForm::GetOpenState(ref)) {
+            case S::kOpen: return 2;
+            case S::kClosed: return 1;
+            default: return 0;   // moving, or nothing known
+            }
+        }
+
+        uint8_t DoorLockedOf(RE::TESObjectREFR* ref) { return ref->GetLock() ? (IsLockedNow(ref) ? 2 : 1) : 0; }
+
+        void AskDoorStates()
+        {
+            static Clock::time_point s_last{};
+            const auto now = Clock::now();
+            if (now - s_last < std::chrono::seconds(3)) return;
+            s_last = now;
+            auto* pl = RE::PlayerCharacter::GetSingleton();
+            auto* tes = RE::TES::GetSingleton();
+            if (!pl || !tes || !pl->parentCell || NetworkClient::GetInstance().GetRemotePlayers().empty()) return;
+            const auto at = pl->GetPosition();
+            std::vector<std::pair<float, uint32_t>> near;
+            tes->ForEachReferenceInRange(at, 4096.0f, [&](RE::TESObjectREFR* ref) {
+                // Only doors that are shut or locked here: an open, unlocked door has nothing to learn.
+                if (ref && IsSyncableRef(ref->GetFormID()) && IsDoorRef(ref) && !ref->IsDisabled() &&
+                    (DoorOpenOf(ref) == 1 || DoorLockedOf(ref) == 2)) {
+                    const auto p = ref->GetPosition();
+                    const float dx = p.x - at.x, dy = p.y - at.y, dz = p.z - at.z;
+                    near.push_back({ dx * dx + dy * dy + dz * dz, ref->GetFormID() });
+                }
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+            if (near.empty()) return;
+            std::sort(near.begin(), near.end());
+            CoopDoorStateReqMsg msg{};
+            for (auto& [d, fid] : near) {
+                if (msg.count >= kMaxDoorsPerMsg) break;
+                msg.refs[msg.count++] = fid;
+            }
+            Send(MessageType::CoopDoorStateReq, msg);
+        }
+
+        void OnDoorStateReq(const CoopDoorStateReqMsg& m)
+        {
+            if (m.senderId == Authority::MyId()) return;
+            const bool host = IsHost();
+            CoopDoorStateMsg out{};
+            out.targetId = m.senderId;
+            for (uint32_t i = 0; i < std::min<uint32_t>(m.count, static_cast<uint32_t>(kMaxDoorsPerMsg)); ++i) {
+                auto* ref = LookupForm<RE::TESObjectREFR>(m.refs[i]);
+                if (!ref || !IsDoorRef(ref) || RE::BGSOpenCloseForm::IsAnimating(ref)) continue;
+                const bool loaded = ref->Get3D() != nullptr;
+                if (!host && !loaded) continue;   // a guest's save only counts where they are
+                CoopDoorEntry e{};
+                e.refFormId = m.refs[i];
+                e.open = DoorOpenOf(ref);
+                e.locked = DoorLockedOf(ref);
+                e.pad[0] = loaded ? 1 : 0;   // loaded here: a door the asker used was replayed on it
+                if (e.open == 2 || e.locked == 1) out.doors[out.count++] = e;   // only what can open theirs
+            }
+            if (out.count) Send(MessageType::CoopDoorState, out);
+        }
+
+        void OnDoorState(const CoopDoorStateMsg& m)
+        {
+            if (m.targetId != Authority::MyId()) return;
+            const auto now = Clock::now();
+            for (uint32_t i = 0; i < std::min<uint32_t>(m.count, static_cast<uint32_t>(kMaxDoorsPerMsg)); ++i) {
+                const auto& e = m.doors[i];
+                auto* ref = LookupForm<RE::TESObjectREFR>(e.refFormId);
+                if (!ref || !IsDoorRef(ref) || RE::BGSOpenCloseForm::IsAnimating(ref)) continue;
+                // A door our player used is theirs: opening it was only replayed if the other game has it loaded.
+                if (auto u = g_doorsUsed.find(e.refFormId); u != g_doorsUsed.end() &&
+                    (now - u->second < std::chrono::seconds(10) || !e.pad[0])) continue;
+                const bool open = e.open == 2 && DoorOpenOf(ref) == 1;
+                const bool unlock = e.locked == 1 && DoorLockedOf(ref) == 2;
+                if (!open && !unlock) continue;
+                // Twice in a row (3 s apart): not a door swinging on one side while the other catches up.
+                auto& mm = g_doorMismatch[e.refFormId];
+                if (now - mm.at > std::chrono::seconds(8)) mm.seen = 0;
+                mm.at = now;
+                if (++mm.seen < 2) continue;
+                g_doorMismatch.erase(e.refFormId);
+                if (unlock) {
+                    ref->GetLock()->SetLocked(false);
+                    if (auto it = g_lockWatch.find(e.refFormId); it != g_lockWatch.end()) it->second.locked = false;   // no echo
+                }
+                if (open) RE::BGSOpenCloseForm::SetOpenState(ref, true, false);
+                g_stats.applied++;
+                REX::INFO("[Coop] door {:#x}{}{} as in player {}'s world (loaded there: {})", e.refFormId,
+                    open ? " opened" : "", unlock ? " unlocked" : "", m.senderId, e.pad[0] != 0);
+            }
+        }
+
         // ---------- world time & weather (host -> all) ----------
 
         void SendWorldTime()
@@ -1549,6 +1674,7 @@ namespace F4MP::Coop
                 if (!target || !by || by->GetFormID() != kPlayerRefId) return RE::BSEventNotifyControl::kContinue;
                 if (g_settings.building && !g_hostMismatch) Workshop::OnLocalActivate(target);
                 if (g_settings.items && !g_hostMismatch) WatchLock(target);
+                if (IsDoorRef(target)) g_doorsUsed[target->GetFormID()] = Clock::now();
                 if (!g_settings.items) return RE::BSEventNotifyControl::kContinue;
                 const uint32_t fid = target->GetFormID();
                 // Picking up a dropped item: the container event that follows has no reference
@@ -1584,7 +1710,9 @@ namespace F4MP::Coop
                             for (auto* st = item.stackData.get(); st; st = st->nextStack.get())
                                 if (st->extra) g_reportedStacks[(static_cast<uint64_t>(fid) << 32) | item.object->GetFormID()].insert(st->extra.get());
 
-                if (g_pendingSnapshot.insert(fid).second) {
+                if (auto [it, fresh] = g_pendingSnapshot.try_emplace(fid, Clock::now());
+                    fresh || Clock::now() - it->second > std::chrono::seconds(5)) {
+                    it->second = Clock::now();
                     CoopContainerSnapshotReqMsg msg{};
                     msg.containerFormId = ref;
                     msg.ownerId = owner;
@@ -1811,6 +1939,14 @@ namespace F4MP::Coop
             case MessageType::CoopWorldReq:
                 if (auto* m = Mut<CoopWorldReqMsg>(item)) tr(m->space);
                 break;
+            case MessageType::CoopDoorStateReq:
+                if (auto* m = Mut<CoopDoorStateReqMsg>(item))
+                    for (uint32_t i = 0; i < std::min<uint32_t>(m->count, static_cast<uint32_t>(kMaxDoorsPerMsg)); ++i) tr(m->refs[i]);
+                break;
+            case MessageType::CoopDoorState:
+                if (auto* m = Mut<CoopDoorStateMsg>(item))
+                    for (uint32_t i = 0; i < std::min<uint32_t>(m->count, static_cast<uint32_t>(kMaxDoorsPerMsg)); ++i) tr(m->doors[i].refFormId);
+                break;
             case MessageType::CoopRefsHidden:
                 if (auto* m = Mut<CoopRefsHiddenMsg>(item))
                     for (uint32_t i = 0; i < std::min<uint32_t>(m->count, static_cast<uint32_t>(kMaxRefsPerMsg)); ++i) tr(m->refs[i]);
@@ -2020,6 +2156,12 @@ namespace F4MP::Coop
             case MessageType::CoopLockChanged:
                 if (auto* m = As<CoopLockChangedMsg>(item); m && g_settings.items) OnLockChanged(*m);
                 break;
+            case MessageType::CoopDoorStateReq:
+                if (auto* m = As<CoopDoorStateReqMsg>(item); m && g_settings.building) OnDoorStateReq(*m);
+                break;
+            case MessageType::CoopDoorState:
+                if (auto* m = As<CoopDoorStateMsg>(item); m && g_settings.building) OnDoorState(*m);
+                break;
             case MessageType::CoopWorldTime:
                 if (auto* m = As<CoopWorldTimeMsg>(item); m && g_settings.worldTime) OnWorldTime(*m);
                 break;
@@ -2109,6 +2251,7 @@ namespace F4MP::Coop
         }
 
         if (g_settings.items) PollLocks();
+        if (g_settings.building) AskDoorStates();
         SendCombatEvents();
         RetryAnimEvents();
         GraphOverride::CaptureNpcEvents(g_settings.combatAnims);
@@ -2152,6 +2295,8 @@ namespace F4MP::Coop
         g_pendingSnapshot.clear();
         g_questStages.clear();
         g_questBacklog.clear();
+        g_doorMismatch.clear();
+        g_doorsUsed.clear();
         g_lockWatch.clear();
         g_questBaseline = false;
         g_snapshotRequested = false;

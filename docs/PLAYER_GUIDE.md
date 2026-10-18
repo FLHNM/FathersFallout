@@ -78,9 +78,10 @@ about a minute.
   a separate save (a copy of your character) for co-op if you want your own playthrough untouched.
 - **Shared:** movement and animations, weapons and armor (with mods), power armor, furniture (sitting,
   lying, cooking - players and NPCs), NPC idles, shooting and melee, damage
-  (including to each other), enemies and NPCs, deaths, explosions, doors and switches, items you
-  drop for each other, containers, building / moving / scrapping in workshops, quest progress,
-  time of day and weather.
+  (including to each other - switch **Friendly fire** off in the menu if you don't want that),
+  enemies and NPCs, deaths, explosions, doors and switches (gates a quest opened for one player
+  open for everyone), items you drop for each other, containers (including the ones you build at
+  settlements), building / moving / scrapping in workshops, quest progress, time of day and weather.
 
 ## 6. Something went wrong?
 

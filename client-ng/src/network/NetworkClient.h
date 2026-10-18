@@ -71,6 +71,8 @@ enum class MessageType : uint16_t {
     CoopPluginList = 111,           // variable length: the sender's plugin names by load-order index (sync/LoadOrder.cpp)
     CoopNpcActivity = 112,          // NPC owner -> all: the furniture an NPC it runs uses and the idle it plays (sync/Activity)
     CoopPowerArmor = 113,           // player -> all: in power armor or not, and the frame's pieces (sync/Activity)
+    CoopDoorStateReq = 114,         // joiner -> host: doors around me, how are they in your world?
+    CoopDoorState = 115,            // host -> joiner: open/closed and locked for those doors (quest scripts open gates)
 };
 
 #pragma pack(push, 1)
@@ -157,6 +159,28 @@ struct CoopLockChangedMsg {
     uint32_t refFormId;      // plugin reference (same everywhere)
     uint8_t  locked;
     uint8_t  pad[3];
+};
+
+constexpr size_t kMaxDoorsPerMsg = 48;
+struct CoopDoorStateReqMsg {
+    uint32_t senderId;
+    uint32_t count;
+    uint32_t refs[kMaxDoorsPerMsg];   // plugin door references near the joiner
+};
+
+// open/locked: 0 = unknown (unloaded, animating, no lock), 1 = no, 2 = yes
+struct CoopDoorEntry {
+    uint32_t refFormId;
+    uint8_t  open;
+    uint8_t  locked;
+    uint8_t  pad[2];
+};
+
+struct CoopDoorStateMsg {
+    uint32_t senderId;
+    uint32_t targetId;        // the joiner who asked
+    uint32_t count;
+    CoopDoorEntry doors[kMaxDoorsPerMsg];
 };
 
 struct CoopPlayerDamageMsg {

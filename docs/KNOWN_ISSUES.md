@@ -1,6 +1,6 @@
 # Known issues & what's being worked on
 
-Update 21 (alpha). Already known - no need to report these unless you have new details.
+Update 22 (alpha). Already known - no need to report these unless you have new details.
 
 ## Known issues
 
@@ -15,6 +15,7 @@ Update 21 (alpha). Already known - no need to report these unless you have new d
 | Sliding | Since Update 21 a body whose walk stops playing restarts it by itself, usually within a second. A short slide can still happen now and then. |
 | Companions | Your companion stays with you when you join, but the host doesn't see them yet. |
 | Far-away NPCs | Guests with a lower view distance (`uGridsToLoad`) see fewer of the host's NPCs far away. Close by, everyone sees the same people. |
+| Quest catch-up | A guest's quests are moved up to the host's progress, but one-time things from steps the guest skipped (items handed out, NPCs moved) don't happen in the guest's game. Gates and doors those steps opened do open for everyone since Update 22. |
 | Random encounters | The small radiant quests that pop up on the road belong to the host's game; guests see the creatures and people, but not those quests in their log. |
 | Mods | Different plugin lists work since Update 20, but things from a mod only one player has don't show for the others (a message on connect names those mods). Overhaul mods can still make the games disagree. |
 | GOG | Not tested yet. IP join only. |

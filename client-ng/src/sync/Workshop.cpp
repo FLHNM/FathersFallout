@@ -640,15 +640,22 @@ namespace F4MP::Workshop
         }
     }
 
+    bool BuildKey(RE::TESObjectREFR* ref, uint32_t& owner, uint32_t& key)
+    {
+        auto it = ref ? g_tracked.find(ref->GetFormID()) : g_tracked.end();
+        if (it == g_tracked.end() || !it->second.shared) return false;
+        owner = it->second.key.owner;
+        key = it->second.key.ref;
+        return true;
+    }
+
+    uint32_t LocalBuild(uint32_t owner, uint32_t key) { return owner && key ? LocalFor(owner, key) : 0; }
+
     bool SeatKey(RE::TESObjectREFR* furn, uint32_t& owner, uint32_t& ref)
     {
         owner = ref = 0;
         if (!furn) return false;
-        if (auto it = g_tracked.find(furn->GetFormID()); it != g_tracked.end() && it->second.shared) {
-            owner = it->second.key.owner;
-            ref = it->second.key.ref;
-            return true;
-        }
+        if (BuildKey(furn, owner, ref)) return true;
         if (furn->GetFormID() < kDynamicFormIdStart) { ref = furn->GetFormID(); return true; }   // a plugin chair/bed/workbench
         return false;
     }
