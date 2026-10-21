@@ -40,8 +40,13 @@ Everything you need to install, host and join. The same guide ships in the downl
 ## 3. Hosting (the player whose world everyone joins)
 
 1. Choose **[ HOST ]**, type your name, pick your save, press **PLAY**.
+   - Optional: **PASSWORD FOR YOUR GAME** - friends then need the same password to join. Don't use
+     your Steam or email password.
+   - **[X] FRIENDS ONLY** (on by default): only people on your Steam friends list can join through
+     Steam. Turn it off only if you want someone who isn't your Steam friend - then set a password.
 2. The game starts, loads your save and starts the co-op server by itself.
-   If Windows Firewall asks about `F4MPServer`, click **Allow** (only needed for IP joins).
+   If Windows Firewall asks about `FathersFalloutServer`, click **Allow** (only needed for IP joins).
+   It asks once more after Update 23 because the server file was renamed.
 3. **Steam friends can join you now.** Your Steam **friend code** is shown under HOST - give it
    to friends if Steam can't find you automatically.
 4. **Friends without Steam (GOG)** join by IP: press **[ MY IP FOR FRIENDS ]** (copies your
@@ -57,16 +62,17 @@ Only **one** player hosts. Start the host's game first.
 2. **Friend code or name:** leave it **empty** to join whichever Steam friend is hosting, or type
    the host's friend code (shown in their launcher, or in Steam under *Friends → Add a Friend*)
    or part of their Steam name.
-3. Your name, **your** save, **PLAY**.
+3. Your name, the **host's password** if they set one, **your** save, **PLAY**.
 
-No IPs, no port forwarding. If it says *"no Steam friend is hosting"*: make sure the host is
+No IPs, no port forwarding. You must be on the host's Steam friends list (unless the host turned
+**FRIENDS ONLY** off). If it says *"no Steam friend is hosting"*: make sure the host is
 already in game, that you're Steam friends, or type the host's friend code. It keeps looking for
 about a minute.
 
 ### By IP (GOG, or if Steam join doesn't work)
 1. **[ JOIN A FRIEND ]** → **[ BY IP (GOG) ]**.
 2. The host's IP (from their **[ MY IP FOR FRIENDS ]**) and port `7779`.
-3. Your name, your save, **PLAY**. The host must have UDP 7779 forwarded.
+3. Your name (and the host's password, if any), your save, **PLAY**. The host must have UDP 7779 forwarded.
 
 ## 5. In game
 
@@ -92,4 +98,4 @@ See [Known issues](KNOWN_ISSUES.md) and the [FAQ](FAQ.md). Found a new bug? Pres
 
 ## 7. Uninstall
 
-Delete `F4MPClient.dll` and `F4MP.ini` from `Fallout 4\Data\F4SE\Plugins`. Your saves stay as they are.
+Delete `F4MPClient.dll` and `FathersFallout.ini` (`F4MP.ini` in versions before Update 23) from `Fallout 4\Data\F4SE\Plugins`. Your saves stay as they are.

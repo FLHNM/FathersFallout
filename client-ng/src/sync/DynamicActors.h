@@ -26,6 +26,16 @@ namespace F4MP::DynamicActors
 
     // Our local copy of an owner's runtime actor, or nullptr if not spawned (yet).
     RE::Actor* Resolve(uint32_t ownerId, uint32_t ownerRefId);
+    // Any NPC another player names: our copy of their runtime actor or companion, else (a placed NPC)
+    // the same reference in our world. nullptr while a copy isn't spawned yet.
+    RE::Actor* ResolveNpc(uint32_t ownerId, uint32_t ownerFormId);
+
+    // Companions (Piper, Dogmeat...) belong to their player wherever they go: each player announces its
+    // own (keyed by the companion's FormID in that game) and the others place a copy, like a runtime
+    // actor. The other world's own Piper stays where that world's story has her.
+    bool IsOurCompanion(const RE::Actor* actor);
+    void AnnounceCompanion(RE::Actor* actor);
+    bool IsCompanionKey(uint32_t ownerId, uint32_t ownerFormId);
 
     // Whether this local runtime actor is our copy of another player's (or one being spawned as one).
     bool IsMirrorCopy(uint32_t localFormId);

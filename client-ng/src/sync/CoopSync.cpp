@@ -563,8 +563,7 @@ namespace F4MP::Coop
             // An NPC we can't see hit us (it isn't in our world, isn't loaded, or its plugin isn't installed):
             // no hits from enemies we can't fight back.
             if (m.byNpc >= kNpcCauseMin) {
-                RE::Actor* npc = m.byNpc >= DynamicActors::kRuntimeIdStart ? DynamicActors::Resolve(m.senderId, m.byNpc)
-                                                                           : LookupForm<RE::Actor>(m.byNpc);
+                RE::Actor* npc = DynamicActors::ResolveNpc(m.senderId, m.byNpc);
                 const bool visible = npc && npc->Get3D() && !npc->IsDisabled() && !npc->IsDead(false) &&
                                      npc->GetPosition().GetDistance(pl->GetPosition()) < 12000.0f;
                 if (!visible) {
@@ -599,6 +598,15 @@ namespace F4MP::Coop
             auto* npc = LookupForm<RE::Actor>(m.npcFormId);
             auto* hp = HealthAV();
             if (!npc || !hp || npc->IsDead(false) || m.damage <= 0.0f || m.damage > 100000.0f) return;
+            // Our companion: another player's shot is friendly fire, and a forwarded hit never kills it (KillImpl
+            // would get past "essential" and kill Piper for good); the game's own hits still knock it down.
+            if (DynamicActors::IsOurCompanion(npc)) {
+                if (!g_settings.friendlyFire) return;
+                const float room = npc->GetActorValue(*hp) - 1.0f;
+                if (room > 0.0f) npc->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, -std::min(m.damage, room));
+                REX::INFO("[Coop] player {} hit our companion {:#x} for {:.1f}", m.senderId, m.npcFormId, m.damage);
+                return;
+            }
             npc->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, -m.damage);
             if (npc->GetActorValue(*hp) <= 0.0f && !npc->IsDead(false)) {
                 // Credit the attacking player's body so aggro/kill credit points at someone real.
@@ -748,7 +756,7 @@ namespace F4MP::Coop
             for (auto& [key, want] : g_npcWornWant) {
                 if (done >= 3) break;
                 const uint32_t owner = static_cast<uint32_t>(key >> 32), fid = static_cast<uint32_t>(key);
-                auto* a = fid >= kDynamicFormIdStart ? DynamicActors::Resolve(owner, fid) : LookupForm<RE::Actor>(fid);
+                auto* a = DynamicActors::ResolveNpc(owner, fid);
                 if (!a || !a->Get3D() || a->IsDead(false) || Authority::IOwn(a)) continue;
                 const uint32_t local = a->GetFormID();
                 auto o = g_npcOwners.find(local);   // only while mirrored (driven by NpcsSync)
@@ -1296,8 +1304,7 @@ namespace F4MP::Coop
         {
             char name[sizeof(m.name) + 1]{};
             std::memcpy(name, m.name, sizeof(m.name));
-            RE::Actor* npc = m.npcFormId >= DynamicActors::kRuntimeIdStart ? DynamicActors::Resolve(m.senderId, m.npcFormId)
-                                                                           : LookupForm<RE::Actor>(m.npcFormId);
+            RE::Actor* npc = DynamicActors::ResolveNpc(m.senderId, m.npcFormId);
             if (!npc || !npc->Get3D() || npc->IsDead(false) || Authority::IOwn(npc)) return;
             const bool ok = GraphOverride::SendEvent(npc, name);
             static int s_logged = 0, s_idles = 0;
@@ -1898,7 +1905,12 @@ namespace F4MP::Coop
             };
             switch (item.type) {
             case MessageType::CoopDynamicActor:
-                if (auto* m = Mut<CoopDynamicActorMsg>(item)) tr(m->spawnFormId);   // hostRefId: a runtime ID
+                if (auto* m = Mut<CoopDynamicActorMsg>(item)) {
+                    tr(m->spawnFormId);
+                    // hostRefId: a runtime ID (only a key), or the sender's companion, a placed reference that
+                    // their NPC states name in our numbering too.
+                    if (m->hostRefId < DynamicActors::kRuntimeIdStart) tr(m->hostRefId);
+                }
                 break;
             case MessageType::CoopAppearance: {
                 // sync/Appearance.cpp Header v1: race @8, head part count @13, hair/beard colour and face
@@ -2011,8 +2023,82 @@ namespace F4MP::Coop
 
         void DispatchOne(const CoopInboxItem& item);
 
-        void Dispatch(const CoopInboxItem& item)
+        // Messages come from another game, or from anyone who reached the server: numbers that would
+        // put a copy outside the world, NaN damage or health, absurd item counts and unterminated
+        // names are dropped (or fixed) here, before any of it reaches the game.
+        bool Sanitize(CoopInboxItem& item)
         {
+            auto fin = [](float v) { return std::isfinite(v); };
+            auto pos = [](float x, float y, float z) { return SanePosition(x, y, z); };
+            auto angles = [&](float a, float b, float c) { return fin(a) && fin(b) && fin(c); };
+            auto damage = [&](float d) { return fin(d) && d >= 0.0f && d < 1.0e6f; };
+            constexpr int32_t kMaxCount = 1000000;
+            switch (item.type) {
+            case MessageType::CoopPlayerDamage:
+                if (auto* m = Mut<CoopPlayerDamageMsg>(item)) return damage(m->damage);
+                break;
+            case MessageType::CoopNpcDamage:
+                if (auto* m = Mut<CoopNpcDamageMsg>(item)) return damage(m->damage);
+                break;
+            case MessageType::CoopContainerChange:
+                if (auto* m = Mut<CoopContainerChangeMsg>(item)) return m->count >= -kMaxCount && m->count <= kMaxCount;
+                break;
+            case MessageType::CoopItemDropped:
+                if (auto* m = Mut<CoopItemDroppedMsg>(item)) return m->count > 0 && m->count <= kMaxCount && pos(m->x, m->y, m->z);
+                break;
+            case MessageType::CoopExplosion:
+                if (auto* m = Mut<CoopExplosionMsg>(item)) return pos(m->x, m->y, m->z);
+                break;
+            case MessageType::CoopWorldReq:
+                if (auto* m = Mut<CoopWorldReqMsg>(item)) return pos(m->x, m->y, m->z);
+                break;
+            case MessageType::CoopWorldSnapshot:
+                if (auto* m = Mut<CoopWorldSnapshotMsg>(item)) return pos(m->x, m->y, m->z) && fin(m->radius);
+                break;
+            case MessageType::CoopBuildPlaced:
+                if (auto* m = Mut<CoopBuildPlacedMsg>(item)) return pos(m->x, m->y, m->z) && angles(m->ax, m->ay, m->az);
+                break;
+            case MessageType::CoopBuildMoved:
+                if (auto* m = Mut<CoopBuildMovedMsg>(item)) return pos(m->x, m->y, m->z) && angles(m->ax, m->ay, m->az);
+                break;
+            case MessageType::CoopPropMoved:
+                if (auto* m = Mut<CoopPropMovedMsg>(item)) return pos(m->x, m->y, m->z) && angles(m->ax, m->ay, m->az);
+                break;
+            case MessageType::CoopDynamicActor:
+                if (auto* m = Mut<CoopDynamicActorMsg>(item)) return pos(m->x, m->y, m->z) && fin(m->angleZ);
+                break;
+            case MessageType::CoopPlayerVitals:
+                if (auto* m = Mut<CoopPlayerVitalsMsg>(item)) return fin(m->health) && fin(m->maxHealth);
+                break;
+            case MessageType::CoopWorldTime:
+                if (auto* m = Mut<CoopWorldTimeMsg>(item))
+                    return fin(m->gameHour) && m->gameHour >= 0.0f && m->gameHour <= 24.0f && fin(m->gameDay) &&
+                           fin(m->gameMonth) && fin(m->gameYear) && fin(m->timeScale) && m->timeScale >= 0.0f && m->timeScale <= 10000.0f;
+                break;
+            case MessageType::CoopHello:
+                if (auto* m = Mut<CoopHelloMsg>(item)) return fin(m->loadedRadius);
+                break;
+            case MessageType::CoopAnimEvent:
+                if (auto* m = Mut<CoopAnimEventMsg>(item)) m->name[sizeof(m->name) - 1] = '\0';
+                break;
+            case MessageType::CoopNpcAnim:
+                if (auto* m = Mut<CoopNpcAnimMsg>(item)) m->name[sizeof(m->name) - 1] = '\0';
+                break;
+            default:
+                break;
+            }
+            return true;
+        }
+
+        void Dispatch(CoopInboxItem& item)
+        {
+            if (!Sanitize(item)) {
+                static uint32_t s_dropped = 0;
+                if (++s_dropped <= 20 || s_dropped % 1000 == 0)
+                    REX::WARN("[Coop] dropped a malformed message (type {}, {} bytes) - {} so far",
+                        static_cast<int>(item.type), item.payload.size(), s_dropped);
+                return;
+            }
             const uint32_t sender = item.payload.size() >= 4 ? *reinterpret_cast<const uint32_t*>(item.payload.data()) : 0;
             if (item.type == MessageType::CoopHello || item.type == MessageType::CoopPluginList ||
                 !LoadOrder::Known(sender) || LoadOrder::Identical(sender)) {
@@ -2052,7 +2138,7 @@ namespace F4MP::Coop
             }
             switch (item.type) {
             case MessageType::CoopDynamicActor:
-                if (auto* m = As<CoopDynamicActorMsg>(item); m && m->senderId != Authority::MyId())
+                if (auto* m = As<CoopDynamicActorMsg>(item); m && m->senderId != Authority::MyId() && m->hostRefId && m->spawnFormId)
                     DynamicActors::OnAnnounce(m->senderId, m->hostRefId, m->spawnFormId, m->x, m->y, m->z, m->angleZ);
                 break;
             case MessageType::CoopAppearance:

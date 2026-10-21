@@ -20,7 +20,7 @@ namespace F4MP::Range
             auto* s = RE::GetINISetting("uGridsToLoad:General");
             grids = s && s->GetType() == RE::Setting::SETTING_TYPE::kUInt ? s->GetUInt() : 5u;
             if (grids < 5) grids = 5;
-            REX::INFO("[F4MP] uGridsToLoad {} -> sync radius {:.0f} units (~{:.0f} m)", grids,
+            REX::INFO("[FathersFallout] uGridsToLoad {} -> sync radius {:.0f} units (~{:.0f} m)", grids,
                 (grids / 2) * kCellSize, (grids / 2) * kCellSize * 0.01428f);
         }
         return grids;

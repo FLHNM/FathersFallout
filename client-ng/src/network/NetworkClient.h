@@ -5,6 +5,7 @@
 #ifndef F4MPCLIENT_NETWORKCLIENT_H
 #define F4MPCLIENT_NETWORKCLIENT_H
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <functional>
@@ -33,7 +34,7 @@ enum class MessageType : uint16_t {
     DamageDealt = 30,
     EntitySpawn = 40,
     EntityState = 41,
-    NpcState = 50,      // el host difunde el estado de un NPC (por FormID)
+    NpcState = 50,      // the host's NPC state (by FormID)
 
     // Co-op sync (>= 60). The server relays these to everyone except the sender and
     // stamps the first uint32 (senderId) with the authoritative id.
@@ -86,7 +87,10 @@ struct MessageHeader {
 struct ConnectionRequestMsg {
     char playerName[64];
     uint32_t protocolVersion;
+    char password[32];       // Update 23: the host's join password ("" = none). Older games send the
+                             // first 68 bytes only; a server without a password still takes them.
 };
+constexpr size_t kConnectionRequestV1Size = 68;   // playerName + protocolVersion (Update 22 and older)
 
 struct ConnectionAcceptedMsg {
     uint32_t playerId;
@@ -94,8 +98,8 @@ struct ConnectionAcceptedMsg {
     uint32_t maxPlayers;
 };
 
-// (tipo Disconnect) el servidor la envia cuando un jugador se va o es expulsado,
-// para eliminar su cuerpo AL INSTANTE sin esperar al timeout de 5 s.
+// (type Disconnect) sent by the server when a player leaves or is kicked, so their body goes AT ONCE
+// instead of after the 5 s timeout.
 struct PlayerLeftMsg {
     uint32_t playerId;
 };
@@ -105,25 +109,25 @@ struct PlayerPositionMsg {
     float x, y, z;
     float pitch;         // look up/down (rad, + = down, as the game's angle.x); was the unused velocityX
     float velocityY, velocityZ;
-    float angleZ;        // heading de vista (rad): hacia donde mira el jugador
-    float speed;         // velocidad de movimiento (unidades/seg)
-    float moveDir;       // direccion del movimiento relativa al facing (rad, 0 = adelante)
+    float angleZ;        // view heading (rad): where the player looks
+    float speed;         // movement speed (units/s)
+    float moveDir;       // movement direction relative to facing (rad, 0 = forward)
     uint32_t cellId;
     bool isMoving;
     bool isRunning;
     bool isSprinting;
     bool isSneaking;
     bool isJumping;
-    bool weaponDrawn;   // arma/magia en mano (postura de combate)
+    bool weaponDrawn;   // weapon out (combat stance)
 };
 
-// Apariencia del jugador (Fase 2A): se envia una vez al conectar y se reparte.
+// Player appearance (old format, still relayed): sent once on connect.
 struct PlayerAppearanceMsg {
     uint32_t playerId;
     uint32_t raceFormID;
     uint32_t hairColor;      // RGBA empaquetado (BGSColorForm::color)
     int32_t  sex;            // 0 male, 1 female, -1 none
-    uint8_t  skinR, skinG, skinB, skinA;  // bodyTintColor del NPC
+    uint8_t  skinR, skinG, skinB, skinA;  // the NPC's bodyTintColor
     uint8_t  numHeadParts;
     uint8_t  _pad[3];
     uint32_t headParts[16];  // formIDs de head parts (pelo, ojos, barba, cejas...)
@@ -135,18 +139,17 @@ struct ChatMessageMsg {
     uint8_t channel;
 };
 
-// Estado de un NPC que difunde el HOST. El FormID identifica al mismo NPC en las dos
-// maquinas (para NPCs "fijos" del mundo, el FormID coincide). El cliente busca su NPC
-// local por ese FormID y lo conduce a este estado.
-constexpr uint8_t kNpcWeaponDrawn = 1, kNpcRunning = 2;
+// An NPC's state as the HOST broadcasts it. Placed NPCs have the same FormID on every machine
+// (translated for other mod lists); the guest finds its own NPC by it and drives it to this state.
+constexpr uint8_t kNpcWeaponDrawn = 1, kNpcRunning = 2, kNpcCompanion = 4;   // companion: its player's, wherever it is
 struct NpcStateMsg {
-    uint32_t formId;     // FormID del NPC (identidad comun entre maquinas)
+    uint32_t formId;     // the NPC's FormID (same NPC on every machine)
     float x, y, z;
     float angleZ;        // heading
-    float speed;         // para animacion (mas adelante)
+    float speed;         // for the animation
     bool isMoving;
     bool isSneaking;
-    bool isDead;         // para muerte (mas adelante)
+    bool isDead;         // dead on the owner's side
     uint8_t flags;       // kNpcWeaponDrawn | kNpcRunning (was padding: same size as before)
     float health;        // current Health actor value on the owner
     uint32_t ownerId;    // player whose game runs this NPC (sync/Authority)
@@ -459,7 +462,17 @@ inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosi
 constexpr int kSendStream = 1;     // k_nSteamNetworkingSend_UnreliableNoNagle
 constexpr int kSendEvent = 8;      // k_nSteamNetworkingSend_Reliable
 
-constexpr uint32_t PROTOCOL_VERSION = 15;   // 15: NPC furniture/idles, seat markers, power armor (Update 21); 14: player hits say whether an NPC did it (Update 19); 13: NPC equipment, item mods in containers (Update 18); 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
+constexpr uint32_t PROTOCOL_VERSION = 16;   // 16: companions shown to the others, join password (Update 23); 15: NPC furniture/idles, seat markers, power armor (Update 21); 14: player hits say whether an NPC did it (Update 19); 13: NPC equipment, item mods in containers (Update 18); 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
+
+// Incoming data comes from another game (or anyone who reached the port): positions must be real
+// numbers inside the world, or a body/copy placed there can break the game.
+inline bool SanePosition(float x, float y, float z)
+{
+    constexpr float kWorldLimit = 1.0e7f;   // the Commonwealth spans about +-250000 units
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+           std::fabs(x) < kWorldLimit && std::fabs(y) < kWorldLimit && std::fabs(z) < kWorldLimit;
+}
+constexpr size_t kMaxCoopPayload = 16384;   // the server relays nothing bigger (appearance ~8 KB)
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 
 class NetworkClient {
@@ -482,20 +495,21 @@ public:
     bool LastCloseWasAttempt() const { return m_lastCloseWasAttempt; }
 
     void SetPlayerName(const std::string& name) { m_playerName = name; }
+    void SetPassword(const std::string& pw) { m_password = pw; }   // sent in the handshake
     bool IsSteam() const { return m_steam; }
     ISteamNetworkingSockets* Sockets() const { return m_sockets; }
 
     void SendPacket(MessageType type, const void* data, uint32_t size);
 
-    // Llamar periodicamente: procesa callbacks de GNS y mensajes entrantes.
+    // Call regularly: runs GNS callbacks and handles incoming messages.
     void PumpMessages();
 
     uint32_t GetPlayerId() const { return m_playerId; }
 
-    // Copia del estado de los jugadores remotos (id -> ultima posicion).
+    // Copy of the remote players' state (id -> last position).
     std::unordered_map<uint32_t, PlayerPositionMsg> GetRemotePlayers();
 
-    // Apariencia recibida de un jugador remoto. Devuelve false si aun no llego.
+    // A remote player's appearance; false if it hasn't arrived yet.
     bool GetAppearance(uint32_t playerId, PlayerAppearanceMsg& out);
 
     // NPCs broadcast by their owners, keyed by (ownerId << 32 | formId): runtime FormIDs from
@@ -528,16 +542,17 @@ private:
     bool m_initialized = false;
     uint32_t m_playerId = 0;
     std::string m_playerName = "Wastelander";
+    std::string m_password;
 
     std::mutex m_mutex;
 
-    // Jugadores remotos (actualizado desde PumpMessages).
+    // Remote players (updated by PumpMessages).
     std::mutex m_remoteMutex;
     std::unordered_map<uint32_t, PlayerPositionMsg> m_remotePlayers;
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> m_remoteLastSeen;
     std::unordered_map<uint32_t, PlayerAppearanceMsg> m_remoteAppearance;
 
-    // NPCs difundidos por el host (formId -> estado) + cuando se vio cada uno.
+    // NPCs the host broadcasts (formId -> state) + when each was last seen.
     std::unordered_map<uint64_t, NpcStateMsg> m_remoteNpcs;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_npcLastSeen;
     std::unordered_map<uint32_t, uint64_t> m_remoteStamp;   // newest position stamp per player (unreliable: drop older)

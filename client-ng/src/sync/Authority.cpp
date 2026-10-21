@@ -104,6 +104,8 @@ namespace F4MP::Authority
             if (DynamicActors::IsMirrorCopy(fid)) return false;
             if (DynamicActors::IsOurAnnounced(fid)) return true;
         }
+        // Our companion follows us into areas another game runs: still ours (the others show a copy).
+        if (DynamicActors::IsOurCompanion(ref->As<RE::Actor>())) return true;
         return IOwnArea(ref);
     }
 

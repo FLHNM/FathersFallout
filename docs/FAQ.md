@@ -5,7 +5,7 @@
 - **All the code is public** in this repository: the game plugin (`client-ng/`), the co-op server
   (`server/`) and the launcher (`tools/launcher/Launcher.cs`). Anyone can read it or build it.
 - **What the launcher does:** checks your Fallout 4 install, copies the co-op plugin
-  (`F4MPClient.dll` + `F4MP.ini`) into `Data\F4SE\Plugins`, writes its own settings file next to
+  (`F4MPClient.dll` + `FathersFallout.ini`) into `Data\F4SE\Plugins`, writes its own settings file next to
   itself, and starts the game through F4SE. When hosting it copies the co-op server to
   `%LOCALAPPDATA%\FathersFallout\server` (so Windows Firewall only asks once) and runs it from there.
 - **Internet:** the game connects to the host (directly by IP, or through Steam). The launcher only
@@ -48,7 +48,10 @@ the same mods, or base game + DLC only. Texture or mesh mods without plugins are
 ## Steam join can't find my friend
 
 - The host must be **in game** (hosting starts when their save has loaded).
-- You must be **Steam friends**, or type the host's **friend code** in the launcher.
+- You must be **Steam friends**: since Update 23 hosts only let in their Steam friends unless they
+  turn **FRIENDS ONLY** off. Typing the host's **friend code** helps when Steam doesn't find them.
+- *"Wrong password"*: ask the host for their game password and type it in **HOST'S PASSWORD**.
+- *"Different FathersFallout version"*: everyone needs the same update.
 - Both copies of Fallout 4 must be the Steam version with Steam running.
 - Still nothing? Use **BY IP** as a backup and [report it](https://github.com/FLHNM/FathersFallout/issues/new?template=bug_report.yml).
 

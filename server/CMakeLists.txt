@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(F4MPServer CXX)
+project(FathersFalloutServer CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,7 +17,7 @@ add_definitions(-DBUILD_TIME="${BUILD_TIME}")
 
 # --- Fuentes reales del servidor ---
 # (Se excluye a proposito el codigo legacy: Server.cpp/.hpp y Logger.cpp/.hpp)
-add_executable(F4MPServer
+add_executable(FathersFalloutServer
     src/main.cpp
     src/Network/GameServer.cpp
     src/Heartbeat.cpp
@@ -25,7 +25,7 @@ add_executable(F4MPServer
 
 if (WIN32)
     # ====================== Windows ======================
-    target_compile_definitions(F4MPServer PRIVATE _WINDOWS)
+    target_compile_definitions(FathersFalloutServer PRIVATE _WINDOWS)
 
     # Dependencias vendidas en el repo (third_party) para no necesitar vcpkg.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/win-x64/share")
@@ -36,7 +36,7 @@ if (WIN32)
     find_package(GameNetworkingSockets CONFIG REQUIRED)
     find_package(spdlog CONFIG REQUIRED)
 
-    target_link_libraries(F4MPServer
+    target_link_libraries(FathersFalloutServer
         GameNetworkingSockets::GameNetworkingSockets
         spdlog::spdlog
         ws2_32
@@ -65,7 +65,7 @@ else()
         set(F4MP_GNS PkgConfig::GNS)
     endif()
 
-    target_link_libraries(F4MPServer
+    target_link_libraries(FathersFalloutServer
         ${F4MP_GNS}
         spdlog::spdlog
         CURL::libcurl          # heartbeat (HTTP/HTTPS) en Linux

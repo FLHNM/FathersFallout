@@ -1,6 +1,6 @@
 # Known issues & what's being worked on
 
-Update 22 (alpha). Already known - no need to report these unless you have new details.
+Update 23 (alpha). Already known - no need to report these unless you have new details.
 
 ## Known issues
 
@@ -13,7 +13,7 @@ Update 22 (alpha). Already known - no need to report these unless you have new d
 | Aiming up/down | Shown by the other player bending at the waist - shots go where they aim, but it doesn't use the game's full aim animation, so it can look stiff. |
 | First shot | The first shot right after drawing a weapon can show about half a second late on the other screen. |
 | Sliding | Since Update 21 a body whose walk stops playing restarts it by itself, usually within a second. A short slide can still happen now and then. |
-| Companions | Your companion stays with you when you join, but the host doesn't see them yet. |
+| Companions | Shared since Update 23: the other players see a copy of your companion. If the other player's world has that same NPC standing nearby (their Piper in Diamond City while your Piper follows you), you only see your own Piper there. |
 | Far-away NPCs | Guests with a lower view distance (`uGridsToLoad`) see fewer of the host's NPCs far away. Close by, everyone sees the same people. |
 | Quest catch-up | A guest's quests are moved up to the host's progress, but one-time things from steps the guest skipped (items handed out, NPCs moved) don't happen in the guest's game. Gates and doors those steps opened do open for everyone since Update 22. |
 | Random encounters | The small radiant quests that pop up on the road belong to the host's game; guests see the creatures and people, but not those quests in their log. |
@@ -27,7 +27,6 @@ Update 22 (alpha). Already known - no need to report these unless you have new d
 - Exact faces for other players (not just a close match).
 - Smoother aiming animation (full aim pose instead of bending at the waist).
 - Power wires and settler jobs in shared settlements.
-- Companions shared with the host.
 - More than 2 players tested.
 - GOG tested.
 

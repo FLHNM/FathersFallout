@@ -7,6 +7,7 @@
 #include "sync/LoadOrder.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -24,7 +25,7 @@ bool NetworkClient::Initialize() {
 
     SteamNetworkingErrMsg errMsg;
     if (!GameNetworkingSockets_Init(nullptr, errMsg)) {
-        REX::ERROR("[Network] Fallo al iniciar GNS: {}", errMsg);
+        REX::ERROR("[Network] could not start GameNetworkingSockets: {}", errMsg);
         return false;
     }
 
@@ -130,7 +131,7 @@ void NetworkClient::Disconnect() {
     m_playerId = 0;
     {
         std::lock_guard<std::mutex> rlock(m_remoteMutex);
-        m_remotePlayers.clear();   // olvidar a los remotos: si no, quedan fantasmas
+        m_remotePlayers.clear();   // forget remote players, or ghosts stay
         m_remoteLastSeen.clear();
         m_remoteAppearance.clear();
         m_remoteNpcs.clear();
@@ -165,6 +166,7 @@ void NetworkClient::SendConnectionRequest() {
     ConnectionRequestMsg req{};
     strncpy(req.playerName, m_playerName.c_str(), sizeof(req.playerName) - 1);
     req.protocolVersion = PROTOCOL_VERSION;
+    strncpy(req.password, m_password.c_str(), sizeof(req.password) - 1);
     SendPacket(MessageType::ConnectionRequest, &req, sizeof(req));
     REX::INFO("[Network] handshake sent as '{}'", m_playerName);
 }
@@ -202,7 +204,7 @@ void NetworkClient::OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_
             m_playerId = 0;
             {
                 std::lock_guard<std::mutex> rlock(m_remoteMutex);
-                m_remotePlayers.clear();   // olvidar a los remotos al cerrarse la conexion
+                m_remotePlayers.clear();   // forget remote players when the connection closes
                 m_remoteLastSeen.clear();
                 m_remoteAppearance.clear();
         m_remoteNpcs.clear();
@@ -259,6 +261,7 @@ void NetworkClient::PumpMessages() {
             const void* payload = reinterpret_cast<const uint8_t*>(msg->m_pData) + sizeof(MessageHeader);
 
             if (header->type == MessageType::ConnectionAccepted) {
+                if ((size_t)msg->m_cbSize < sizeof(MessageHeader) + sizeof(ConnectionAcceptedMsg)) { msg->Release(); continue; }
                 const auto* accept = reinterpret_cast<const ConnectionAcceptedMsg*>(payload);
                 m_playerId = accept->playerId;
                 m_connected = true;
@@ -269,9 +272,8 @@ void NetworkClient::PumpMessages() {
                 std::lock_guard<std::mutex> l(m_statusMutex);
                 m_lastError = "rejected by the server";
             } else if (header->type == MessageType::PlayerPosition) {
-                // Blindaje: solo procesar si el paquete trae el struct COMPLETO.
-                // Un cliente en version vieja manda menos bytes -> lo ignoramos
-                // (mejor que leer basura desalineada).
+                // Only a COMPLETE struct is used: an older version sends fewer bytes, which are ignored
+                // (better than reading misaligned garbage).
                 const size_t payloadSize = (size_t)msg->m_cbSize - sizeof(MessageHeader);
                 if (payloadSize < sizeof(PlayerPositionMsg)) {
                     static bool warned = false;
@@ -282,18 +284,20 @@ void NetworkClient::PumpMessages() {
                     continue;
                 }
                 const auto* pos = reinterpret_cast<const PlayerPositionMsg*>(payload);
+                if (!SanePosition(pos->x, pos->y, pos->z) || !std::isfinite(pos->angleZ) || !std::isfinite(pos->pitch) ||
+                    !std::isfinite(pos->speed) || !std::isfinite(pos->moveDir)) { msg->Release(); continue; }
                 if (pos->playerId != m_playerId) {  // ignorar la nuestra
                     std::lock_guard<std::mutex> lock(m_remoteMutex);
                     // Unreliable: an older packet can arrive after a newer one. The server stamps each.
                     auto& last = m_remoteStamp[pos->playerId];
                     if (header->timestamp && header->timestamp < last) { msg->Release(); continue; }
                     last = header->timestamp;
-                    bool nuevo = m_remotePlayers.find(pos->playerId) == m_remotePlayers.end();
+                    bool isNew = m_remotePlayers.find(pos->playerId) == m_remotePlayers.end();
                     auto& stored = m_remotePlayers[pos->playerId];
                     stored = *pos;
                     stored.cellId = F4MP::LoadOrder::ToLocal(pos->playerId, pos->cellId);   // their cell/worldspace in our numbering
                     m_remoteLastSeen[pos->playerId] = std::chrono::steady_clock::now();
-                    if (nuevo) {
+                    if (isNew) {
                         REX::INFO("[Network] new player {} at x={:.0f} y={:.0f} z={:.0f}",
                             pos->playerId, pos->x, pos->y, pos->z);
                     }
@@ -310,8 +314,7 @@ void NetworkClient::PumpMessages() {
                     }
                 }
             } else if (header->type == MessageType::Disconnect) {
-                // El servidor avisa de que un jugador se fue: lo eliminamos ya, para que
-                // su cuerpo se despawnee al instante (sin esperar al timeout de 5 s).
+                // The server says a player left: forget them now so their body goes at once (no 5 s timeout).
                 const size_t payloadSize = (size_t)msg->m_cbSize - sizeof(MessageHeader);
                 if (payloadSize >= sizeof(PlayerLeftMsg)) {
                     const auto* left = reinterpret_cast<const PlayerLeftMsg*>(payload);
@@ -323,11 +326,13 @@ void NetworkClient::PumpMessages() {
                     REX::INFO("[Network] player {} disconnected: body removed", left->playerId);
                 }
             } else if (header->type == MessageType::NpcState) {
-                // El host difunde el estado de un NPC: lo guardamos por FormID.
+                // The host's NPC state: kept by FormID.
                 const size_t payloadSize = (size_t)msg->m_cbSize - sizeof(MessageHeader);
                 if (payloadSize >= sizeof(NpcStateMsg)) {
                     NpcStateMsg translated = *reinterpret_cast<const NpcStateMsg*>(payload);
                     const auto* npc = &translated;
+                    if (!SanePosition(npc->x, npc->y, npc->z) || !std::isfinite(npc->angleZ) || !std::isfinite(npc->speed) ||
+                        !std::isfinite(npc->health)) { msg->Release(); continue; }
                     // The owner's FormID in our numbering (other mods/Creation Club content): 0 = not in our game.
                     translated.formId = F4MP::LoadOrder::ToLocal(npc->ownerId, npc->formId);
                     if (!translated.formId) { msg->Release(); continue; }
@@ -342,6 +347,7 @@ void NetworkClient::PumpMessages() {
             } else if (static_cast<uint16_t>(header->type) >= static_cast<uint16_t>(MessageType::CoopFirst)) {
                 // Co-op sync: queue the raw payload; CoopSync applies it on the main thread.
                 const size_t payloadSize = (size_t)msg->m_cbSize - sizeof(MessageHeader);
+                if (payloadSize > kMaxCoopPayload) { msg->Release(); continue; }
                 CoopInboxItem item{ header->type, {}, std::chrono::steady_clock::now() };
                 item.payload.assign(static_cast<const uint8_t*>(payload), static_cast<const uint8_t*>(payload) + payloadSize);
                 std::lock_guard<std::mutex> lock(m_coopMutex);
@@ -364,12 +370,12 @@ bool NetworkClient::GetAppearance(uint32_t playerId, PlayerAppearanceMsg& out) {
 
 std::unordered_map<uint32_t, PlayerPositionMsg> NetworkClient::GetRemotePlayers() {
     std::lock_guard<std::mutex> lock(m_remoteMutex);
-    // Olvidar remotos que llevan >5 s sin mandar nada (se cayeron sin avisar).
-    const auto ahora = std::chrono::steady_clock::now();
+    // Forget players silent for >5 s (dropped without a goodbye).
+    const auto clockNow = std::chrono::steady_clock::now();
     for (auto it = m_remotePlayers.begin(); it != m_remotePlayers.end();) {
         auto seen = m_remoteLastSeen.find(it->first);
         if (seen != m_remoteLastSeen.end() &&
-            std::chrono::duration<float>(ahora - seen->second).count() > 5.0f) {
+            std::chrono::duration<float>(clockNow - seen->second).count() > 5.0f) {
             m_remoteLastSeen.erase(seen);
             it = m_remotePlayers.erase(it);
         } else {
@@ -381,12 +387,12 @@ std::unordered_map<uint32_t, PlayerPositionMsg> NetworkClient::GetRemotePlayers(
 
 std::unordered_map<uint64_t, NpcStateMsg> NetworkClient::GetRemoteNpcs() {
     std::lock_guard<std::mutex> lock(m_remoteMutex);
-    // Olvidar NPCs que el host lleva >3 s sin difundir (se alejaron o murio el host).
-    const auto ahora = std::chrono::steady_clock::now();
+    // Forget NPCs the host hasn't sent for >3 s (out of range, or the host is gone).
+    const auto clockNow = std::chrono::steady_clock::now();
     for (auto it = m_remoteNpcs.begin(); it != m_remoteNpcs.end();) {
         auto seen = m_npcLastSeen.find(it->first);
         if (seen != m_npcLastSeen.end() &&
-            std::chrono::duration<float>(ahora - seen->second).count() > 3.0f) {
+            std::chrono::duration<float>(clockNow - seen->second).count() > 3.0f) {
             m_npcLastSeen.erase(seen);
             it = m_remoteNpcs.erase(it);
         } else {

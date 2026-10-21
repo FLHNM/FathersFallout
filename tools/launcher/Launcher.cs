@@ -3,7 +3,7 @@
 // and NOTICE ("FathersFallout" and "FatherLamb" are reserved names; modified versions must be renamed).
 
 // FathersFallout launcher: checks the setup, installs/updates the mod, picks Host/Join and a save,
-// then starts the game through F4SE. The mod reads F4MP.ini [Launch] LoadSave= and loads that save at
+// then starts the game through F4SE. The mod reads FathersFallout.ini [Launch] LoadSave= and loads that save at
 // the main menu, then connects (AutoConnect). Looks like a Pip-Boy terminal (green CRT, scanlines)
 // with the FathersFallout logo. Built with the .NET Framework 4 compiler that ships with Windows
 // (build.bat), so friends don't need to install anything to run it.
@@ -32,8 +32,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.22.0.0")]
-[assembly: AssemblyFileVersion("0.22.0.0")]
+[assembly: AssemblyVersion("0.23.0.0")]
+[assembly: AssemblyFileVersion("0.23.0.0")]
 
 namespace F4MPLauncher
 {
@@ -214,7 +214,10 @@ namespace F4MPLauncher
         readonly List<Control> checkRows = new List<Control>();
         readonly TermButton joinOpt = new TermButton("[ ] JOIN A FRIEND"), hostOpt = new TermButton("[ ] HOST");
         readonly TermButton steamOpt = new TermButton("[ ] THROUGH STEAM"), ipOpt = new TermButton("[ ] BY IP (GOG)");
-        readonly TermField ip = new TermField(), port = new TermField(), name = new TermField(), steamWho = new TermField();
+        readonly TermField ip = new TermField(), port = new TermField(), name = new TermField(), steamWho = new TermField(), password = new TermField();
+        readonly TermButton friendsOpt = new TermButton("[X] FRIENDS ONLY");
+        readonly Label passwordLabel = new Label();
+        bool friendsOnly = true;
         readonly Label steamLabel = new Label();
         readonly TermButton saveButton = new TermButton(""), play = new TermButton("[  PLAY  ]");
         readonly TermButton install = new TermButton("[ INSTALL / UPDATE FATHERSFALLOUT ]"), ipButton = new TermButton("[ MY IP FOR FRIENDS ]");
@@ -323,7 +326,7 @@ namespace F4MPLauncher
                 var sf = new StringFormat { Alignment = StringAlignment.Center };
                 using (var b = new SolidBrush(Pip.Mid)) g.DrawString("by FatherLamb", f, b, new RectangleF(0, H - 118, LeftW, 20), sf);
                 using (var b = new SolidBrush(Pip.Dim)) {
-                    g.DrawString("UPDATE 20  (ALPHA)", f, b, new RectangleF(0, H - 98, LeftW, 20), sf);
+                    g.DrawString("UPDATE " + Assembly.GetExecutingAssembly().GetName().Version.Minor + "  (ALPHA)", f, b, new RectangleF(0, H - 98, LeftW, 20), sf);
                     g.DrawString("Copyright (C) 2026 FatherLamb\nGNU GPL v3 + NOTICE terms\nNot affiliated with Bethesda", f, b, new RectangleF(0, H - 70, LeftW, 60), sf);
                 }
             }
@@ -401,6 +404,17 @@ namespace F4MPLauncher
             Controls.Add(hostInfo);
 
             Place(name, x, 410, 260, 30);
+            // Join password: the host sets one, friends type the same. Empty = anyone who finds the game.
+            passwordLabel.AutoSize = true; passwordLabel.BackColor = Color.Transparent; passwordLabel.ForeColor = Pip.Mid;
+            passwordLabel.Font = Pip.Font(9.5f, FontStyle.Regular); passwordLabel.Location = new Point(x + 280, 392);
+            Controls.Add(passwordLabel);
+            Place(password, x + 280, 410, right - x - 280, 30);
+            password.Box.UseSystemPasswordChar = true;
+            Place(friendsOpt, right - 158, 410, 158, 30);
+            friendsOpt.Click += delegate {
+                SetFriendsOnly(!friendsOnly);
+                Say(friendsOnly ? "ONLY YOUR STEAM FRIENDS CAN JOIN THROUGH STEAM." : "ANYONE WITH YOUR FRIEND CODE CAN JOIN THROUGH STEAM - SET A PASSWORD.");
+            };
 
             Place(saveButton, x, 472, right - x, 34);
             saveButton.Font = Pip.Font(10.5f, FontStyle.Regular);
@@ -434,6 +448,10 @@ namespace F4MPLauncher
             joinOpt.Text = host ? "[ ] JOIN A FRIEND" : "[X] JOIN A FRIEND";
             ipButton.Visible = hostInfo.Visible = host;
             steamOpt.Visible = ipOpt.Visible = !host;
+            // Host: password + Steam friends-only side by side; guest: the host's password, full width.
+            friendsOpt.Visible = host;
+            password.Width = (host ? W - 30 - 158 - 12 : W - 30) - password.Left;
+            passwordLabel.Text = host ? "PASSWORD FOR YOUR GAME (OPTIONAL)" : "HOST'S PASSWORD (IF THEY SET ONE)";
             if (host) {
                 string code = MyFriendCode();
                 hostInfo.Text = code != "" ? "STEAM FRIENDS JOIN YOU WITH NO IP.  YOUR FRIEND CODE: " + code + "   (GOG FRIENDS: MY IP)"
@@ -453,6 +471,14 @@ namespace F4MPLauncher
             ip.Visible = port.Visible = ipLabel.Visible = portLabel.Visible = join && !steam;
             steamWho.Visible = steamLabel.Visible = join && steam;
             steamOpt.Invalidate(); ipOpt.Invalidate();
+        }
+
+        void SetFriendsOnly(bool on)
+        {
+            friendsOnly = on;
+            friendsOpt.Selected = on;
+            friendsOpt.Text = on ? "[X] FRIENDS ONLY" : "[ ] FRIENDS ONLY";
+            friendsOpt.Invalidate();
         }
 
         // This PC's Steam friend code (the number under Steam > Friends > Add a Friend), "" without Steam.
@@ -496,6 +522,8 @@ namespace F4MPLauncher
             port.Box.Text = Ini.Get(settings, "Launcher", "Port", "7779");
             name.Box.Text = Ini.Get(settings, "Launcher", "Name", Environment.UserName);
             steamWho.Box.Text = Ini.Get(settings, "Launcher", "SteamHost", "");
+            password.Box.Text = Ini.Get(settings, "Launcher", "Password", "");
+            SetFriendsOnly(Ini.Get(settings, "Launcher", "FriendsOnly", "1") != "0");
             viaSteam = Ini.Get(settings, "Launcher", "JoinVia", SteamGame() ? "Steam" : "IP") == "Steam";
             SetMode(Ini.Get(settings, "Launcher", "Mode", "Join") == "Host");
         }
@@ -509,6 +537,8 @@ namespace F4MPLauncher
             Ini.Set(settings, "Launcher", "Mode", hostOpt.Selected ? "Host" : "Join");
             Ini.Set(settings, "Launcher", "JoinVia", viaSteam ? "Steam" : "IP");
             Ini.Set(settings, "Launcher", "SteamHost", steamWho.Box.Text.Trim());
+            Ini.Set(settings, "Launcher", "Password", password.Box.Text);
+            Ini.Set(settings, "Launcher", "FriendsOnly", friendsOnly ? "1" : "0");
         }
 
         // Where the mod lives. Default: the game's own Data\F4SE\Plugins. A Mod Organizer setup can
@@ -761,7 +791,7 @@ namespace F4MPLauncher
         string ServerExe()
         {
             string over = Ini.Get(settings, "Launcher", "ServerExe", "");
-            return over != "" ? over : Path.Combine(baseDir, "server", "F4MPServer.exe");
+            return over != "" ? over : Path.Combine(baseDir, "server", "FathersFalloutServer.exe");
         }
 
         // Windows Firewall approves a program by its path. Every update came in a new folder, so the
@@ -826,6 +856,7 @@ namespace F4MPLauncher
             bool host = hostOpt.Selected;
             if (!host && viaSteam && !SteamGame()) { Say("THIS COPY OF FALLOUT 4 ISN'T ON STEAM (GOG?): CHOOSE BY IP."); return; }
             if (!host && !viaSteam && ip.Box.Text.Trim() == "") { Say("TYPE THE HOST'S IP ADDRESS."); return; }
+            if (password.Box.Text.Length > 31) { Say("THE PASSWORD CAN BE 31 CHARACTERS AT MOST."); return; }
             var failed = RunChecks().Where(c => !c.Ok && c.Label != "MOD LIST" && c.Label != "FATHERSFALLOUT").ToList();
             if (failed.Count > 0) {
                 Say("MISSING: " + string.Join(", ", failed.Select(c => c.Label)) + ". USE THE DOWNLOAD LINKS ABOVE.");
@@ -834,7 +865,10 @@ namespace F4MPLauncher
             if (!InstallMod(false)) return;   // always play with the launcher's version
             SaveSettings();
 
-            string ini = Path.Combine(PluginsDir(), "F4MP.ini");
+            // The mod's settings: FathersFallout.ini since Update 23 (an older F4MP.ini moves over once).
+            string ini = Path.Combine(PluginsDir(), "FathersFallout.ini");
+            string legacyIni = Path.Combine(PluginsDir(), "F4MP.ini");
+            try { if (!File.Exists(ini) && File.Exists(legacyIni)) File.Move(legacyIni, ini); } catch { }
             Ini.Set(ini, "Connect", "AutoConnect", "1");
             Ini.Set(ini, "Connect", "Host", host ? "1" : "0");
             string who = steamWho.Box.Text.Trim();
@@ -842,6 +876,8 @@ namespace F4MPLauncher
             Ini.Set(ini, "Connect", "Steam", "1");   // a host also takes Steam friends
             Ini.Set(ini, "Connect", "Port", port.Box.Text.Trim());
             Ini.Set(ini, "Connect", "Name", name.Box.Text.Trim());
+            Ini.Set(ini, "Connect", "Password", password.Box.Text);
+            Ini.Set(ini, "Connect", "SteamFriendsOnly", friendsOnly ? "1" : "0");
             if (host && File.Exists(ServerExe())) Ini.Set(ini, "Connect", "ServerExe", StableServerExe());
             Ini.Set(ini, "Launch", "LoadSave", save.Name);
 

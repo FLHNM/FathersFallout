@@ -2,9 +2,12 @@
 #define F4MPSERVER_CONFIG_H_
 
 #include "./ThirdParty/nlohmann/json.hpp"
+#include <cstdlib>
+#include <filesystem>
+#include <string>
 
 
-// READ ME : If you don't have a JSON Row the library tends to crash
+// Missing JSON keys read with [] throw: newer keys use .value(key, default).
 class Config
 {
 public:
@@ -22,15 +25,18 @@ public:
 
     inline void Setup()
     {
-        // .value(clave, defecto) no revienta si la clave no esta en el config.
+        // .value(key, default) doesn't throw when the key is missing from the config.
         Name = JSON.value("server-name", std::string("FathersFallout Server"));
         Master = JSON.value("master-server", std::string(""));  // URL, vacio = desactivado
-        TickRate = JSON.value("tick-rate", 60);                 // ticks/s del servidor
+        TickRate = JSON.value("tick-rate", 60);                 // server ticks/s
         Ip = JSON["ip"];
         Port = static_cast<uint16_t>(JSON["port"]);
         PlayerLimit = static_cast<uint16_t>(JSON["player-limit"]);
         RunAsService = static_cast<bool>(JSON["run-as-service"]);
         LogLocation = JSON["log-location"];
+        Password = JSON.value("password", std::string(""));    // "" = anyone can join
+        // The host's game starts the server with the password typed in the launcher/F1 menu.
+        if (const char* env = std::getenv("FF_SERVER_PASSWORD")) Password = env;
     }
 
     inline bool Validate()
@@ -56,6 +62,7 @@ public:
     bool RunAsService;
 
     std::string LogLocation;
+    std::string Password;
 
     nlohmann::json JSON;
 

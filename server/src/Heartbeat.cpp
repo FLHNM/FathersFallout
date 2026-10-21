@@ -32,13 +32,13 @@ void Send(const std::string& url, const std::string& name,
 {
     if (url.empty()) return;
 
-    // Cuerpo JSON (comun a las dos plataformas).
+    // JSON body (same on both platforms).
     const std::string body =
         "{\"name\":\"" + JsonEscape(name) + "\",\"port\":" + std::to_string(port) +
         ",\"players\":" + std::to_string(players) +
         ",\"maxPlayers\":" + std::to_string(maxPlayers) + "}";
 
-    // URL sin barras finales.
+    // URL without trailing slashes.
     std::string clean = url;
     while (!clean.empty() && clean.back() == '/') clean.pop_back();
 
@@ -83,8 +83,8 @@ void Send(const std::string& url, const std::string& name,
     WinHttpCloseHandle(hSession);
 
 #else
-    // ---------- Linux/otros: libcurl ----------
-    // Si no hay esquema, asumir http://
+    // ---------- Linux/others: libcurl ----------
+    // No scheme: assume http://
     if (clean.rfind("http://", 0) != 0 && clean.rfind("https://", 0) != 0) {
         clean = "http://" + clean;
     }
@@ -105,7 +105,7 @@ void Send(const std::string& url, const std::string& name,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);  // seguro en multihilo
 
-    curl_easy_perform(curl);  // ignoramos el resultado: es best-effort
+    curl_easy_perform(curl);  // result ignored: best effort
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);

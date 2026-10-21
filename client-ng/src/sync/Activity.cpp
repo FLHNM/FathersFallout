@@ -200,7 +200,7 @@ namespace F4MP::Activity
     void OnNpcActivity(const CoopNpcActivityMsg& m)
     {
         if (m.senderId == Authority::MyId()) return;
-        RE::Actor* npc = m.npcFormId >= kRuntimeIdStart ? DynamicActors::Resolve(m.senderId, m.npcFormId) : Lookup<RE::Actor>(m.npcFormId);
+        RE::Actor* npc = DynamicActors::ResolveNpc(m.senderId, m.npcFormId);
         if (!npc || Authority::IOwn(npc)) return;
         auto& w = g_want[npc->GetFormID()];
         const uint32_t seat = m.seatRefFormId ? Workshop::LocalSeat(m.seatOwnerId, m.seatRefFormId) : 0;

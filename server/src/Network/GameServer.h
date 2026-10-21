@@ -27,7 +27,7 @@ enum class MessageType : uint16_t {
     DamageDealt = 30,
     EntitySpawn = 40,
     EntityState = 41,
-    NpcState = 50,      // el host difunde el estado de un NPC; el servidor lo reenvia
+    NpcState = 50,      // an NPC's state from its owner; the server relays it
     CoopFirst = 60,     // >= 60: co-op sync messages, relayed generically (see RelayCoop)
 };
 
@@ -42,7 +42,9 @@ struct MessageHeader {
 struct ConnectionRequestMsg {
     char playerName[64];
     uint32_t protocolVersion;
+    char password[32];   // Update 23 (must match the client); older games send only the first 68 bytes
 };
+constexpr size_t kConnectionRequestV1Size = 68;
 
 struct ConnectionAcceptedMsg {
     uint32_t playerId;
@@ -50,8 +52,8 @@ struct ConnectionAcceptedMsg {
     uint32_t maxPlayers;
 };
 
-// Se envia (tipo Disconnect) cuando un jugador se va o es expulsado, para que
-// los demas clientes eliminen su cuerpo AL INSTANTE (sin esperar al timeout).
+// Sent (type Disconnect) when a player leaves or is kicked, so the others remove their body AT ONCE
+// (no waiting for the timeout).
 struct PlayerLeftMsg {
     uint32_t playerId;
 };
@@ -61,16 +63,16 @@ struct PlayerPositionMsg {
     float x, y, z;
     float pitch;         // look up/down (client's velocityX slot, relayed as is)
     float velocityY, velocityZ;
-    float angleZ;        // heading de vista
-    float speed;         // velocidad de movimiento
-    float moveDir;       // direccion del movimiento relativa al facing
+    float angleZ;        // view heading
+    float speed;         // movement speed
+    float moveDir;       // movement direction relative to facing
     uint32_t cellId;
     bool isMoving;
     bool isRunning;
     bool isSprinting;
     bool isSneaking;
     bool isJumping;
-    bool weaponDrawn;   // arma/magia en mano (debe coincidir con la del cliente)
+    bool weaponDrawn;   // weapon out (must match the client)
 };
 
 struct PlayerAppearanceMsg {
@@ -90,9 +92,8 @@ struct ChatMessageMsg {
     uint8_t channel;
 };
 
-// Estado de un NPC difundido por el host (debe coincidir con la del cliente). El
-// servidor solo la REENVIA a los demas; no interpreta su contenido.
-constexpr uint8_t kNpcWeaponDrawn = 1, kNpcRunning = 2;
+// An NPC's state from the host (must match the client byte for byte). The server only RELAYS it.
+constexpr uint8_t kNpcWeaponDrawn = 1, kNpcRunning = 2, kNpcCompanion = 4;   // companion: its player's, wherever it is
 struct NpcStateMsg {
     uint32_t formId;
     float x, y, z;
@@ -117,7 +118,7 @@ struct DamageDealtMsg {
 
 #pragma pack(pop)
 
-constexpr uint32_t PROTOCOL_VERSION = 15;   // must match client-ng/src/network/NetworkClient.h
+constexpr uint32_t PROTOCOL_VERSION = 16;   // must match client-ng/src/network/NetworkClient.h
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 constexpr uint32_t MAX_PLAYERS = 64;
 
@@ -151,15 +152,16 @@ public:
     void SetName(const std::string& name) { m_name = name; }
     void SetMaster(const std::string& url) { m_master = url; }
     void SetTickRate(int r) { if (r >= 1 && r <= 256) m_tickRate = r; }
+    void SetPassword(const std::string& pw) { m_password = pw.substr(0, 31); }   // "" = anyone can join
     void Stop() { m_running = false; }
 
-    // Encola un comando de consola para procesarlo en el hilo principal.
+    // Queues a console command for the main thread.
     void QueueCommand(const std::string& cmd);
 
 private:
     GameServer() = default;
 
-    // --- Consola de administracion ---
+    // --- Admin console ---
     void ProcessConsoleCommands();
     void HandleCommand(const std::string& line);
     void CmdList();
@@ -168,7 +170,10 @@ private:
     void PrintStatus();
     double UptimeSeconds() const;
 
-    void HandleConnectionRequest(HSteamNetConnection conn, const ConnectionRequestMsg* msg);
+    void HandleConnectionRequest(HSteamNetConnection conn, const ConnectionRequestMsg& msg, bool hasPassword);
+    void Refuse(HSteamNetConnection conn, int reason, const char* why);
+    bool OverRateLimit(HSteamNetConnection conn);
+    void DropStaleHandshakes();
     void HandlePlayerPosition(HSteamNetConnection conn, const PlayerPositionMsg* msg);
     void HandleNpcState(HSteamNetConnection conn, const NpcStateMsg* msg);
     void HandlePlayerAppearance(HSteamNetConnection conn, const PlayerAppearanceMsg* msg);
@@ -180,7 +185,7 @@ private:
 
     void ProcessMessages();
 
-    // Callback global de GNS -> instancia singleton.
+    // GNS's global callback -> the singleton.
     static void OnConnStatusChangedStatic(SteamNetConnectionStatusChangedCallback_t* info);
     void OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_t* info);
 
@@ -189,14 +194,23 @@ private:
     HSteamNetPollGroup m_pollGroup = k_HSteamNetPollGroup_Invalid;
 
     std::unordered_map<HSteamNetConnection, ClientInfo> m_clients;
+    // Connections that haven't sent their handshake yet (closed after kHandshakeSeconds).
+    std::unordered_map<HSteamNetConnection, std::chrono::steady_clock::time_point> m_pending;
+    // Wrong passwords per remote address: after kMaxBadPasswords in a minute, that address waits a minute.
+    struct BadTries { int count = 0; std::chrono::steady_clock::time_point first, lockedUntil; };
+    std::unordered_map<std::string, BadTries> m_badTries;
+    // Messages per connection in the current second (a flood is dropped, not relayed to everyone).
+    struct Rate { std::chrono::steady_clock::time_point windowStart; uint32_t count = 0; uint32_t dropped = 0; };
+    std::unordered_map<HSteamNetConnection, Rate> m_rates;
     std::mutex m_clientsMutex;
 
     uint32_t m_nextClientId = 1;
     uint32_t m_maxPlayers = MAX_PLAYERS;
     uint16_t m_port = DEFAULT_SERVER_PORT;
-    int m_tickRate = 60;   // ticks/s (configurable con "tick-rate")
+    int m_tickRate = 60;   // ticks/s (config "tick-rate")
     std::string m_name = "FathersFallout Server";
-    std::string m_master;  // URL del master server (vacio = desactivado)
+    std::string m_master;  // master server URL (empty = off)
+    std::string m_password;   // join password ("" = none)
 
     std::chrono::steady_clock::time_point m_startTime;
     std::chrono::steady_clock::time_point m_lastStatus;

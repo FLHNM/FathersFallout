@@ -28,6 +28,9 @@ namespace Network::SteamLink
     void StartHosting(ISteamNetworkingSockets* a_gns, uint16_t a_serverPort, const std::string& a_hostName);
     void StopHosting();
     bool IsHosting();
+    // Only accounts on the host's Steam friends list may connect (default on; [Connect] SteamFriendsOnly=0 opens it).
+    void SetFriendsOnly(bool a_on);
+    bool FriendsOnly();
     int  RelayedPlayers();
     // GameNetworkingSockets status callback for a relay connection: true = handled here.
     bool OnGnsStatus(SteamNetConnectionStatusChangedCallback_t* a_info);

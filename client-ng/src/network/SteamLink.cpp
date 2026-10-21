@@ -15,6 +15,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Network::SteamLink
@@ -50,6 +51,7 @@ namespace Network::SteamLink
         using SetPresence_t = bool (*)(void*, const char*, const char*);
         using ClearPresence_t = void (*)(void*);
         using ReqPresence_t = void (*)(void*, uint64_t);
+        using HasFriend_t = bool (*)(void*, uint64_t, int);
 
         struct Api
         {
@@ -77,6 +79,7 @@ namespace Network::SteamLink
             SetPresence_t setPresence = nullptr;
             ClearPresence_t clearPresence = nullptr;
             ReqPresence_t reqPresence = nullptr;
+            HasFriend_t hasFriend = nullptr;
         };
         Api g_api;
         bool g_ready = false;
@@ -107,6 +110,12 @@ namespace Network::SteamLink
         uint16_t g_serverPort = 0;
         std::atomic<bool> g_hosting{ false };
         std::atomic<bool> g_relayThread{ false };
+        std::atomic<bool> g_friendsOnly{ true };   // [Connect] SteamFriendsOnly (default on)
+        constexpr size_t kMaxRelayed = 16;
+        // Wrong passwords per Steam account (the server sees every Steam guest as 127.0.0.1, so it
+        // can't tell them apart): 5 in a minute and that account waits a minute.
+        struct BadTries { int count = 0; std::chrono::steady_clock::time_point first, lockedUntil; };
+        std::unordered_map<uint64_t, BadTries> g_badTries;
 
         std::string NameOf(uint64_t a_id)
         {
@@ -131,6 +140,22 @@ namespace Network::SteamLink
             auto it = std::find_if(g_pairs.begin(), g_pairs.end(), [&](const Pair& p) { return p.steam == a_info->m_hConn; });
             if (st == k_ESteamNetworkingConnectionState_Connecting && it == g_pairs.end() &&
                 a_info->m_info.m_hListenSocket == g_listen && g_listen != k_HSteamListenSocket_Invalid) {
+                // Friends only: anyone who knows the host's Steam ID could otherwise connect.
+                const bool self = who == MySteamId();   // [Debug] SteamSelfTest
+                if (g_friendsOnly.load() && !self && !(g_api.hasFriend && g_api.hasFriend(g_api.friends, who, kFriendFlagImmediate))) {
+                    REX::WARN("[Steam] refused {}: not on the host's Steam friends list (friends only)", NameOf(who));
+                    g_api.closeConn(g_api.sockets, a_info->m_hConn, 1007, "This host only lets Steam friends join", false);
+                    return;
+                }
+                if (auto b = g_badTries.find(who); b != g_badTries.end() && std::chrono::steady_clock::now() < b->second.lockedUntil) {
+                    REX::WARN("[Steam] refused {}: too many wrong passwords", NameOf(who));
+                    g_api.closeConn(g_api.sockets, a_info->m_hConn, 1004, "Too many wrong passwords - wait a minute and try again", false);
+                    return;
+                }
+                if (g_pairs.size() >= kMaxRelayed) {
+                    g_api.closeConn(g_api.sockets, a_info->m_hConn, 1002, "Server full", false);
+                    return;
+                }
                 if (g_api.accept(g_api.sockets, a_info->m_hConn) != 1) {   // k_EResultOK
                     REX::WARN("[Steam] could not accept {}", NameOf(who));
                     g_api.closeConn(g_api.sockets, a_info->m_hConn, 0, "accept failed", false);
@@ -250,7 +275,8 @@ namespace Network::SteamLink
                       Load(dll, "SteamAPI_ISteamFriends_GetPersonaName", g_api.myName) &&
                       Load(dll, "SteamAPI_ISteamFriends_SetRichPresence", g_api.setPresence) &&
                       Load(dll, "SteamAPI_ISteamFriends_ClearRichPresence", g_api.clearPresence) &&
-                      Load(dll, "SteamAPI_ISteamFriends_RequestFriendRichPresence", g_api.reqPresence);
+                      Load(dll, "SteamAPI_ISteamFriends_RequestFriendRichPresence", g_api.reqPresence) &&
+                      Load(dll, "SteamAPI_ISteamFriends_HasFriend", g_api.hasFriend);
             if (!ok) return;
             g_api.sockets = sockets();
             g_api.utils = utils();
@@ -312,6 +338,9 @@ namespace Network::SteamLink
 
     bool IsHosting() { return g_hosting.load(); }
 
+    void SetFriendsOnly(bool a_on) { g_friendsOnly.store(a_on); }
+    bool FriendsOnly() { return g_friendsOnly.load(); }
+
     int RelayedPlayers()
     {
         std::lock_guard l(g_lock);
@@ -326,6 +355,12 @@ namespace Network::SteamLink
         const auto st = a_info->m_info.m_eState;
         if (st == k_ESteamNetworkingConnectionState_ClosedByPeer || st == k_ESteamNetworkingConnectionState_ProblemDetectedLocally) {
             REX::INFO("[Steam] server closed {}'s relay: {}", it->name, a_info->m_info.m_szEndDebug);
+            if (a_info->m_info.m_eEndReason == 1003) {   // wrong password (server's kEndPassword)
+                auto& b = g_badTries[it->steamId];
+                const auto now = std::chrono::steady_clock::now();
+                if (now - b.first > std::chrono::minutes(1)) { b.first = now; b.count = 0; }
+                if (++b.count >= 5) b.lockedUntil = now + std::chrono::minutes(1);
+            }
             ClosePair(*it, a_info->m_info.m_szEndDebug[0] ? a_info->m_info.m_szEndDebug : "server closed");
             g_pairs.erase(it);
         }

@@ -47,6 +47,7 @@ namespace F4MP::DynamicActors
         std::unordered_set<uint32_t> g_suppressed;
         // Copies we removed: never "ours" afterwards, even if the game keeps the reference around for a while.
         std::unordered_set<uint32_t> g_retired;
+        std::unordered_set<uint64_t> g_companionKeys;   // (owner, owner's FormID) announced as a companion
         bool g_suppress = true;
 
         struct InFlight
@@ -73,14 +74,20 @@ namespace F4MP::DynamicActors
             return dx * dx + dy * dy + dz * dz;
         }
 
-        // Player bodies and test dummies are runtime actors too, but they belong to the co-op layer.
-        bool IsCoopOwned(RE::TESObjectREFR* ref)
+        // Player bodies, test dummies and our copies of others' actors: the co-op layer's, not the game's.
+        bool IsCoopActor(RE::TESObjectREFR* ref)
         {
             const uint32_t fid = ref->GetFormID();
             if (GetPlayerIdForBody(fid) != 0 || g_mappedLocal.contains(fid) || g_retired.contains(fid)) return true;
             auto* base = ref->GetObjectReference();
             const uint32_t b = base ? base->GetFormID() : 0;
-            if (b == 0x00000007 || b == 0x0003C62E || b == 0x0018E8F2 || b >= 0xFFF00000) return true;
+            return b == 0x00000007 || b == 0x0003C62E || b == 0x0018E8F2 || b >= 0xFFF00000;
+        }
+
+        // Player bodies and test dummies are runtime actors too, but they belong to the co-op layer.
+        bool IsCoopOwned(RE::TESObjectREFR* ref)
+        {
+            if (IsCoopActor(ref)) return true;
             // Built settlement objects that are actors (turrets): the workshop sync shares them already. As
             // "spawns" they got a second, unlinked copy on the other screen, or the copy was disabled.
             static auto* s_workshopItem = Lookup<RE::BGSKeyword>(0x00054BA6);
@@ -134,6 +141,24 @@ namespace F4MP::DynamicActors
             return g_inFlight && fid >= kRuntimeIdStart && !g_flight.before.contains(fid);
         }
 
+        RE::TESFaction* CompanionFaction()
+        {
+            static auto* s_faction = Lookup<RE::TESFaction>(0x00023C01);   // CurrentCompanionFaction
+            return s_faction;
+        }
+
+        // A copy of someone's companion has their companion's dialogue: talking to it could start that
+        // companion's scenes and quests in our game. ObjectReference.BlockActivation(true, true).
+        void BlockActivation(RE::TESObjectREFR* ref)
+        {
+            auto* game = RE::GameVM::GetSingleton();
+            auto vm = game ? game->GetVM() : nullptr;
+            if (!vm || !ref) return;
+            const auto handle = vm->GetObjectHandlePolicy().GetHandleForObject(static_cast<std::uint32_t>(ref->GetFormType()), ref);
+            if (handle == vm->GetObjectHandlePolicy().EmptyHandle()) return;
+            vm->DispatchMethodCall(handle, "ObjectReference", "BlockActivation", nullptr, true, true);
+        }
+
         void RemoveLocal(uint32_t fid)
         {
             // The copy stays in the world until the disable takes effect: in that moment it looked like a spawn
@@ -174,8 +199,52 @@ namespace F4MP::DynamicActors
         Network::NetworkClient::GetInstance().SendPacket(Network::MessageType::CoopDynamicActor, &msg, sizeof(msg));
     }
 
+    bool IsOurCompanion(const RE::Actor* actor)
+    {
+        auto* ref = const_cast<RE::Actor*>(actor);   // the engine's getters aren't const
+        if (!ref || ref == Player() || ref->IsDisabled()) return false;
+        // Bodies and copies of others' companions. Not the workshop rule: a companion sent to a settlement
+        // keeps its workbench link and is still a companion when it comes along.
+        if (IsCoopActor(ref) || IsPendingCopy(actor->GetFormID())) return false;
+        auto* faction = CompanionFaction();
+        return faction && ref->IsInFaction(faction);
+    }
+
+    void AnnounceCompanion(RE::Actor* actor)
+    {
+        if (!actor) return;
+        const uint32_t fid = actor->GetFormID();
+        const auto now = Clock::now();
+        if (auto it = g_lastAnnounced.find(fid); it != g_lastAnnounced.end() && now - it->second < kAnnounceEvery) return;
+        // A unique companion's own record (Piper, Dogmeat): placeatme makes a second one of them.
+        const uint32_t spawnForm = SpawnFormFor(actor);
+        if (!spawnForm) return;
+        if (!g_lastAnnounced.contains(fid))
+            REX::INFO("[Dynamic] our companion {:#x} is shown to the others (copies from {:#x})", fid, spawnForm);
+        g_lastAnnounced[fid] = now;
+        Network::CoopDynamicActorMsg msg{};
+        msg.hostRefId = fid;   // a placed reference here (not a runtime ID): the others take it as a companion
+        msg.spawnFormId = spawnForm;
+        const auto p = actor->GetPosition();
+        msg.x = p.x; msg.y = p.y; msg.z = p.z;
+        msg.angleZ = actor->GetHeading();
+        Network::NetworkClient::GetInstance().SendPacket(Network::MessageType::CoopDynamicActor, &msg, sizeof(msg));
+    }
+
+    bool IsCompanionKey(uint32_t ownerId, uint32_t ownerFormId) { return g_companionKeys.contains(Key(ownerId, ownerFormId)); }
+
+    RE::Actor* ResolveNpc(uint32_t ownerId, uint32_t ownerFormId)
+    {
+        if (auto* copy = Resolve(ownerId, ownerFormId)) return copy;
+        if (ownerFormId >= kRuntimeIdStart || IsCompanionKey(ownerId, ownerFormId)) return nullptr;
+        return Lookup<RE::Actor>(ownerFormId);
+    }
+
     void OnAnnounce(uint32_t ownerId, uint32_t ownerRefId, uint32_t spawnFormId, float x, float y, float z, float angleZ)
     {
+        // Runtime actors are announced by their runtime ID; a placed reference is the owner's companion.
+        if (ownerRefId < kRuntimeIdStart && g_companionKeys.insert(Key(ownerId, ownerRefId)).second)
+            REX::INFO("[Dynamic] player {} has a companion ({:#x} there): placing a copy from {:#x}", ownerId, ownerRefId, spawnFormId);
         auto& a = g_announced[Key(ownerId, ownerRefId)];
         a.spawnFormId = spawnFormId;
         a.pos = { x, y, z };
@@ -229,6 +298,7 @@ namespace F4MP::DynamicActors
                 found->SetHeading(ann->second.angleZ);
                 g_map[g_flight.key] = found->GetFormID();
                 g_mappedLocal.insert(found->GetFormID());
+                if (g_companionKeys.contains(g_flight.key)) BlockActivation(found);
                 REX::INFO("[Dynamic] player {} actor {:#x} -> local {:#x} (from {:#x})", g_flight.key >> 32,
                     static_cast<uint32_t>(g_flight.key), found->GetFormID(), ann->second.spawnFormId);
             } else if (ann != g_announced.end()) {
@@ -246,6 +316,9 @@ namespace F4MP::DynamicActors
                     g_mappedLocal.erase(m->second);
                     g_map.erase(m);
                 }
+                if (g_companionKeys.erase(it->first))   // dismissed, or its player left
+                    REX::INFO("[Dynamic] player {}'s companion {:#x} no longer announced: copy removed", it->first >> 32,
+                        static_cast<uint32_t>(it->first));
                 it = g_announced.erase(it);
             } else {
                 ++it;
@@ -312,6 +385,7 @@ namespace F4MP::DynamicActors
         g_map.clear();
         g_mappedLocal.clear();
         g_announced.clear();
+        g_companionKeys.clear();
         g_lastAnnounced.clear();
         g_ourHostile.clear();
         // Our own spawns we hid while another player ran the area: back in our world.

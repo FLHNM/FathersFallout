@@ -39,14 +39,14 @@ int UMain() {
 
     uint16_t port = static_cast<uint16_t>(Config::getInstance().Port);
 
-    // Logger con salida a consola Y (opcionalmente) a archivo a la vez.
+    // Logs to the console AND (optionally) a file.
     std::vector<spdlog::sink_ptr> sinks;
     sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
     const std::string& logLoc = Config::getInstance().LogLocation;
     if (!logLoc.empty() && logLoc != "NONE") {
         sinks.push_back(std::make_shared<spdlog::sinks::basic_file_sink_mt>(logLoc, true));
     }
-    auto logger = std::make_shared<spdlog::logger>("f4mp", sinks.begin(), sinks.end());
+    auto logger = std::make_shared<spdlog::logger>("server", sinks.begin(), sinks.end());
     logger->set_level(spdlog::level::info);
     spdlog::set_default_logger(logger);
 
@@ -54,13 +54,14 @@ int UMain() {
     GameServer::GetInstance().SetMaxPlayers(Config::getInstance().PlayerLimit);
     GameServer::GetInstance().SetMaster(Config::getInstance().Master);
     GameServer::GetInstance().SetTickRate(Config::getInstance().TickRate);
+    GameServer::GetInstance().SetPassword(Config::getInstance().Password);
 
     if (!GameServer::GetInstance().Initialize(port)) {
         spdlog::error("[Server] Failed to initialize server on port {}", port);
         return 1;
     }
 
-    // Hilo que lee comandos del teclado y los encola para el bucle principal.
+    // Reads console commands and queues them for the main loop.
     std::thread([]() {
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -92,12 +93,13 @@ int main(int argc, char** argv) {
     if (!std::filesystem::exists(ConfigLocation)) {
         nlohmann::json Config;
         Config["server-name"] = "FathersFallout Server";
-        Config["master-server"] = "";  // ej: "https://F4MP.joustech.space" para listarse
+        Config["master-server"] = "";  // a master server URL to be listed there (empty = not listed)
         Config["ip"] = "127.0.0.1";
         Config["port"] = 7779;
         Config["run-as-service"] = false;
         Config["player-limit"] = 100;
-        Config["tick-rate"] = 60;  // ticks/s del servidor (mas alto = mas fluido)
+        Config["tick-rate"] = 60;  // server ticks/s (higher = smoother)
+        Config["password"] = "";   // join password; empty = anyone who can reach the port
         Config["log-location"] = "./logs.log";
         std::ofstream o{ConfigLocation};
         o << std::setw(4) << Config << std::endl;
@@ -109,7 +111,7 @@ int main(int argc, char** argv) {
     InConfig >> Config::getInstance().JSON;
     Config::getInstance().Setup();
 
-    // Modo servicio de Windows: pendiente. Por ahora se ejecuta en modo consola.
+    // Windows service mode isn't implemented: runs as a console program.
     if (Config::getInstance().RunAsService == true) {
         spdlog::get("console")->warn("run-as-service is not implemented yet; running in console mode");
     }

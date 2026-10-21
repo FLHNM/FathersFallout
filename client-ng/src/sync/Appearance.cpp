@@ -344,6 +344,15 @@ namespace F4MP::Appearance
             for (char c : a_name)
                 if (std::isalnum(static_cast<unsigned char>(c)) || c == ' ' || c == '-' || c == '_') out += c;
             if (out.empty()) out = "Character";
+            if (out.size() > 48) out.resize(48);
+            // Windows device names (a player called "CON" or "NUL") can't be file names.
+            std::string up = out;
+            for (auto& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            while (!up.empty() && up.back() == ' ') up.pop_back();
+            static const char* kReserved[] = { "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+                "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9" };
+            for (const char* r : kReserved)
+                if (up == r) { out = "_" + out; break; }
             return out + ".bin";
         }
 

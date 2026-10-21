@@ -43,7 +43,7 @@ namespace F4MP::FrameLimiter
             QueryPerformanceFrequency(&g_freq);
             QueryPerformanceCounter(&g_last);
             g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-            REX::INFO("[F4MP] frame limiter active: {} FPS (hi-res timer: {})", kTargetFps, g_timer != nullptr);
+            REX::INFO("[FathersFallout] frame limiter active: {} FPS (hi-res timer: {})", kTargetFps, g_timer != nullptr);
             return;
         }
 
@@ -63,7 +63,7 @@ namespace F4MP::FrameLimiter
             return;
         }
         if (s_loadFrames) {
-            REX::INFO("[F4MP] loading screen: {:.1f} s, {} frames uncapped", static_cast<double>(now.QuadPart - s_loadStart) / g_freq.QuadPart, s_loadFrames);
+            REX::INFO("[FathersFallout] loading screen: {:.1f} s, {} frames uncapped", static_cast<double>(now.QuadPart - s_loadStart) / g_freq.QuadPart, s_loadFrames);
             s_loadFrames = 0;
         }
         if (now.QuadPart < deadline) {
@@ -79,7 +79,7 @@ namespace F4MP::FrameLimiter
         static LONGLONG s_lastReport = now.QuadPart;
         if (now.QuadPart - s_lastReport > g_freq.QuadPart * 30) {
             s_lastReport = now.QuadPart;
-            REX::INFO("[F4MP] fps {:.1f} (cap {})", g_fps, kTargetFps);
+            REX::INFO("[FathersFallout] fps {:.1f} (cap {})", g_fps, kTargetFps);
         }
         g_last.QuadPart = deadline > now.QuadPart - period ? deadline : now.QuadPart;
     }

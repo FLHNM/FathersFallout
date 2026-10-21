@@ -37,7 +37,7 @@
 #include <vector>
 
 // HITO 2 + 3: menu in-game (F4SE Menu Framework) + red real.
-// El menu conecta/desconecta y un hilo de red envia tu posicion al servidor.
+// The menu connects/disconnects and a network thread sends your position to the server.
 
 namespace F4MP
 {
@@ -61,13 +61,13 @@ namespace F4MP
     static char g_playerName[64] = "Wastelander";
     static std::atomic<bool> g_netThreadStarted{ false };
 
-    // Si soy HOST, difundo el estado de los NPCs cercanos. Si no, los recibo y conduzco
-    // los NPCs locales (por FormID) al estado que manda el host. (Toggle desde el menu.)
+    // HOST: broadcasts the state of nearby NPCs. Others receive it and drive their local
+    // NPCs (by FormID) to the host's state.
     static bool g_isHost = false;
 
-    // Host dedicado INVISIBLE: si esta activo, NO envio mi propia posicion, asi que a los
-    // demas no se les spawnea un cuerpo para mi (mi Fallout solo hace de "mundo" que
-    // difunde NPCs). Mi personaje sigue existiendo en mi juego para cargar la zona.
+    // INVISIBLE dedicated host (test): our own position isn't sent, so nobody gets a body for us
+    // (this game only serves the world and its NPCs). Our character still exists here to keep the
+    // area loaded.
     static bool g_hideSelf = false;
 
     // The local player's own animation inputs, sampled on the main thread every sync tick. The
@@ -108,13 +108,13 @@ namespace F4MP
     };
     static TaskGate g_gateBodies, g_gateCoop, g_gateNpcSend, g_gateNpcSync, g_gateProbe;
 
-    static void BodiesSync();       // declaracion adelantada (se define mas abajo)
+    static void BodiesSync();       // defined further down
     static void MaybeTravelOnJoin();
     static void BroadcastNpcs();    // host: difundir NPCs cercanos
-    static void NpcsSync();         // cliente: conducir NPCs locales por FormID
+    static void NpcsSync();         // guest: drive local NPCs by FormID
     static bool TravelBusy();       // a guest's trip to the host isn't over (or a load just happened)
 
-    // Captura la apariencia del jugador local (Fase 2A) para enviarla al servidor.
+    // Reads the local player's appearance to send it to the server.
     static Network::PlayerAppearanceMsg CaptureAppearance(uint32_t myId)
     {
         Network::PlayerAppearanceMsg a{};
@@ -143,7 +143,7 @@ namespace F4MP
         return a;
     }
 
-    // F4MP.ini next to this DLL. (A relative path would make the profile API look in C:\Windows.)
+    // FathersFallout.ini next to this DLL. (A relative path would make the profile API look in C:\Windows.)
     static std::string IniPath()
     {
         char path[MAX_PATH]{};
@@ -151,8 +151,15 @@ namespace F4MP
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             reinterpret_cast<LPCSTR>(&IniPath), &self);
         GetModuleFileNameA(self, path, MAX_PATH);
-        std::string p(path);
-        return p.substr(0, p.find_last_of("\\/") + 1) + "F4MP.ini";
+        const std::string dir = std::string(path).substr(0, std::string(path).find_last_of("\\/") + 1);
+        // FathersFallout.ini since Update 23; an F4MP.ini from older versions is renamed once.
+        const std::string ini = dir + "FathersFallout.ini", legacy = dir + "F4MP.ini";
+        static std::once_flag s_migrate;
+        std::call_once(s_migrate, [&]() {
+            if (GetFileAttributesA(ini.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
+                MoveFileA(legacy.c_str(), ini.c_str());
+        });
+        return ini;
     }
 
     // ---- Connecting: on-screen feedback, optional local server launch, retries ----
@@ -160,7 +167,7 @@ namespace F4MP
     // Top-left game notification. Safe from any thread (runs on the main thread).
     static void Notify(std::string a_text)
     {
-        REX::INFO("[F4MP] notice: {}", a_text);
+        REX::INFO("[FathersFallout] notice: {}", a_text);
         if (auto* tasks = F4SE::GetTaskInterface()) {
             tasks->AddTask([t = std::move(a_text)]() {
                 RE::SendHUDMessage::ShowHUDMessage(t.c_str(), nullptr, false, false);
@@ -201,7 +208,9 @@ namespace F4MP
         Notify("FathersFallout: finish the intro first - leave Vault 111 and save, then load that save to play co-op");
     }
 
-    static std::string g_serverExe;            // F4MP.ini [Connect] ServerExe=
+    static std::string g_serverExe;            // FathersFallout.ini [Connect] ServerExe=
+    static char g_password[32] = "";           // [Connect] Password= : host's join password / the one we join with
+    static bool g_serverRestarted = false;     // host: restarted our own server once for a new password
     static std::atomic<int> g_retriesLeft{ 0 };  // automatic reconnect attempts left
 
     static bool IsLocalAddress(const char* a)
@@ -232,7 +241,7 @@ namespace F4MP
     // writes config.json and exits, so a quick exit gets one more launch.
     static bool LaunchServer()
     {
-        if (g_serverExe.empty() || IsProcessRunning(L"F4MPServer.exe")) return false;
+        if (g_serverExe.empty() || IsProcessRunning(L"FathersFalloutServer.exe") || IsProcessRunning(L"F4MPServer.exe")) return false;
         if (GetFileAttributesA(g_serverExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
             Notify("FathersFallout: ServerExe not found: " + g_serverExe);
             return false;
@@ -242,8 +251,12 @@ namespace F4MP
             STARTUPINFOA si{ sizeof(si) };
             PROCESS_INFORMATION pi{};
             std::string cmd = "\"" + g_serverExe + "\"";
-            if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
-                    dir.c_str(), &si, &pi)) {
+            // The password goes in the server's environment (not its command line, which other programs can read).
+            SetEnvironmentVariableA("FF_SERVER_PASSWORD", g_password);
+            const BOOL started = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
+                dir.c_str(), &si, &pi);
+            SetEnvironmentVariableA("FF_SERVER_PASSWORD", nullptr);
+            if (!started) {
                 Notify("FathersFallout: could not start the server (error " + std::to_string(GetLastError()) + ")");
                 return false;
             }
@@ -251,11 +264,39 @@ namespace F4MP
             const DWORD wait = WaitForSingleObject(pi.hProcess, 2000);
             CloseHandle(pi.hProcess);
             if (wait == WAIT_TIMEOUT) {
-                REX::INFO("[F4MP] started server {}", g_serverExe);
+                REX::INFO("[FathersFallout] started server {}", g_serverExe);
                 return true;
             }
         }
-        Notify("FathersFallout: the server closed right after starting - run F4MPServer.exe yourself to see why");
+        Notify("FathersFallout: the server closed right after starting - run FathersFalloutServer.exe yourself to see why");
+        return false;
+    }
+
+    // Host whose own server still runs with an older password (it outlives the game): close it so the
+    // next connect starts it again with the password set now.
+    static bool StopLocalServer()
+    {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return false;
+        PROCESSENTRY32W pe{ sizeof(pe) };
+        bool stopped = false;
+        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+            if (_wcsicmp(pe.szExeFile, L"FathersFalloutServer.exe") != 0 && _wcsicmp(pe.szExeFile, L"F4MPServer.exe") != 0) continue;
+            if (HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID)) {
+                stopped = TerminateProcess(h, 0) != 0 || stopped;
+                WaitForSingleObject(h, 3000);
+                CloseHandle(h);
+            }
+        }
+        CloseHandle(snap);
+        return stopped;
+    }
+
+    // The host turned us away for a reason another try won't fix (end reasons from the server / Steam relay).
+    static bool IsRefusal(const std::string& a_err)
+    {
+        for (const char* r : { "password", "Server full", "Protocol version", "FathersFallout version", "only lets Steam friends", "Too many connections" })
+            if (a_err.find(r) != std::string::npos) return true;
         return false;
     }
 
@@ -272,6 +313,7 @@ namespace F4MP
             }
             g_retriesLeft = a_retries;
             net.SetPlayerName(g_playerName);
+            net.SetPassword(g_password);
             if (IsSteamAddress(g_serverAddr)) {
                 // The host's Steam presence can take a moment to reach us: look again for ~1 min.
                 for (int attempt = 0; attempt < 12; ++attempt) {
@@ -299,8 +341,8 @@ namespace F4MP
         if (IsSteamAddress(g_serverAddr))
             return "Through Steam: the host must be in game with co-op hosting on. Both of you need Steam running.";
         if (IsLocalAddress(g_serverAddr))
-            return "No server is running on this PC. Start F4MPServer.exe (or set ServerExe= in F4MP.ini), then press Connect.";
-        return "Check the host's IP, that the host's F4MPServer.exe is running, and that UDP 7779 is forwarded to the host.";
+            return "No server is running on this PC. Start FathersFalloutServer.exe (or set ServerExe= in FathersFallout.ini), then press Connect.";
+        return "Check the host's IP, that the host's FathersFalloutServer.exe is running, and that UDP 7779 is forwarded to the host.";
     }
 
     // Called from the network thread: announce state changes, retry failed attempts.
@@ -315,6 +357,10 @@ namespace F4MP
         const S now = net.IsConnected() ? S::Connected : net.IsConnecting() ? S::Connecting : S::Idle;
 
         if (now != s_prev) {
+            // The host left its own game: Steam friends must not keep landing in a server without a host
+            // (and the F1 page said "Hosting through Steam" after Disconnect). Reconnecting hosts again.
+            if (s_prev == S::Connected && now != S::Connected && Network::SteamLink::IsHosting())
+                Network::SteamLink::StopHosting();
             if (now == S::Connected) {
                 g_retriesLeft = 0;
                 Notify("FathersFallout: connected to " + net.GetTarget() + " as " + g_playerName);
@@ -328,7 +374,23 @@ namespace F4MP
                     }
                 }
             } else if (now == S::Idle && !net.GetLastError().empty()) {
-                if (s_prev == S::Connecting || net.LastCloseWasAttempt()) {
+                const std::string err = net.GetLastError();
+                if ((s_prev == S::Connecting || net.LastCloseWasAttempt()) && IsRefusal(err)) {
+                    g_retriesLeft = 0;
+                    if (g_isHost && IsLocalAddress(g_serverAddr) && err.find("password") != std::string::npos &&
+                        !g_serverRestarted && !g_serverExe.empty()) {
+                        // Our own server from an earlier session, started with another password.
+                        g_serverRestarted = true;
+                        Notify("FathersFallout: restarting the co-op server with your new password...");
+                        std::thread([]() { StopLocalServer(); std::this_thread::sleep_for(std::chrono::seconds(1)); ConnectNow(2); }).detach();
+                    } else if (err.find("Wrong password") != std::string::npos) {
+                        Notify("FathersFallout: wrong password for " + net.GetTarget() + " - ask the host for it and type it in the launcher (or F1 > Play together)");
+                    } else if (err.find("uses a password") != std::string::npos) {
+                        Notify("FathersFallout: " + err);
+                    } else {
+                        Notify("FathersFallout: " + net.GetTarget() + " turned us away: " + err);
+                    }
+                } else if (s_prev == S::Connecting || net.LastCloseWasAttempt()) {
                     if (g_retriesLeft > 0) {
                         Notify("FathersFallout: no answer from " + net.GetTarget() + ", retrying...");
                         s_retryAt = steady_clock::now() + seconds(3);
@@ -350,7 +412,7 @@ namespace F4MP
         }
     }
 
-    // Test bridge (F4MP.ini [Debug] ConsoleBridge=1, off by default): console commands written to
+    // Test bridge (FathersFallout.ini [Debug] ConsoleBridge=1, off by default): console commands written to
     // Documents\My Games\Fallout4\F4SE\F4MP_console.txt run on the main thread, one per line, and
     // are echoed to FathersFallout.log. Lets test automation drive the game without window focus or keys.
     static bool g_consoleBridge = false;
@@ -389,6 +451,16 @@ namespace F4MP
                 if (cmd.rfind("f4mp:freezebody ", 0) == 0) {
                     g_freezeUntil = std::chrono::steady_clock::now() +
                                     std::chrono::milliseconds(static_cast<int>(std::atof(cmd.c_str() + 16) * 1000));
+                    continue;
+                }
+                // Test helper: "f4mp:companion <ref hex>" logs whether that NPC counts as our companion.
+                if (cmd.rfind("f4mp:companion ", 0) == 0) {
+                    const uint32_t fid = std::strtoul(cmd.c_str() + 15, nullptr, 16);
+                    auto* f = RE::TESForm::GetFormByID(fid);
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    auto* cur = RE::TESForm::GetFormByID(0x00023C01);
+                    REX::INFO("[Bridge] {:#x}: actor {} in CurrentCompanionFaction {} our companion {} 3D {}", fid, a != nullptr,
+                        a && cur && a->IsInFaction(cur->As<RE::TESFaction>()), a && DynamicActors::IsOurCompanion(a), a && a->Get3D());
                     continue;
                 }
                 // Test helper: "f4mp:spine <mode> <scale>" for the bodies' bent-spine aim (AimHook).
@@ -643,7 +715,7 @@ namespace F4MP
         });
     }
 
-    // The co-op launcher's PLAY: F4MP.ini [Launch] LoadSave=<save name> loads that save as soon as
+    // The co-op launcher's PLAY: FathersFallout.ini [Launch] LoadSave=<save name> loads that save as soon as
     // the main menu is up, once (the key is cleared first, so a normal launch isn't affected).
     static void LoadSaveFromLauncher()
     {
@@ -652,7 +724,7 @@ namespace F4MP
         if (!save[0]) return;
         WritePrivateProfileStringA("Launch", "LoadSave", nullptr, IniPath().c_str());
         std::string name = save;
-        REX::INFO("[F4MP] launcher: will load '{}' at the main menu", name);
+        REX::INFO("[FathersFallout] launcher: will load '{}' at the main menu", name);
         std::thread([name]() {
             using namespace std::chrono;
             const auto until = steady_clock::now() + minutes(3);
@@ -663,13 +735,13 @@ namespace F4MP
             }
             std::this_thread::sleep_for(milliseconds(1500));   // let the menu finish opening
             F4SE::GetTaskInterface()->AddTask([name]() {
-                REX::INFO("[F4MP] launcher: loading '{}'", name);
+                REX::INFO("[FathersFallout] launcher: loading '{}'", name);
                 RE::Console::ExecuteCommand(("load \"" + name + "\"").c_str());
             });
         }).detach();
     }
 
-    // ---- Hilo de red: procesa mensajes, envia la posicion y sincroniza cuerpos ----
+    // ---- Network thread: handles messages, sends our position, syncs bodies ----
     static void NetThread()
     {
         using namespace std::chrono;
@@ -692,20 +764,20 @@ namespace F4MP
             if (net.IsConnected()) {
                 auto now = steady_clock::now();
 
-                // Enviar nuestra apariencia UNA vez al conectar (Fase 2A).
+                // Send our appearance ONCE after connecting.
                 if (!s_sentAppearance) {
                     F4SE::GetTaskInterface()->AddTask([]() {
                         auto& net2 = Network::NetworkClient::GetInstance();
                         if (!net2.IsConnected()) return;
                         auto ap = CaptureAppearance(net2.GetPlayerId());
                         net2.SendPacket(Network::MessageType::PlayerAppearance, &ap, sizeof(ap));
-                        REX::INFO("[F4MP] appearance sent (sex={} race={:#x} headparts={})",
+                        REX::INFO("[FathersFallout] appearance sent (sex={} race={:#x} headparts={})",
                             ap.sex, ap.raceFormID, ap.numHeadParts);
                     });
                     s_sentAppearance = true;
                 }
 
-                // Si soy host dedicado invisible, no envio mi jugador (no aparezco).
+                // Invisible dedicated host: our player isn't sent (we don't appear).
                 if (!g_hideSelf && duration_cast<milliseconds>(now - lastSend).count() >= 16) {  // 60/s
                     static RE::NiPoint3 s_lastPos{};
                     static bool s_havePos = false;
@@ -727,7 +799,7 @@ namespace F4MP
                         const auto pos = ls.pos;
                         const float facing = ls.heading;
 
-                        // Velocidad y direccion a partir del desplazamiento real.
+                        // Speed and direction from how far we actually moved.
                         float speed = 0.0f, moveDir = 0.0f;
                         if (s_havePos && sendDt > 0.0001f && sendDt < 1.0f) {
                             float dx = pos.x - s_lastPos.x, dy = pos.y - s_lastPos.y;
@@ -743,7 +815,7 @@ namespace F4MP
                         msg.x = pos.x;
                         msg.y = pos.y;
                         msg.z = pos.z;
-                        msg.angleZ = facing;  // hacia donde miras (cursor/camara)
+                        msg.angleZ = facing;  // where you look (camera)
                         // Movement over the last ~150 ms: a single send step reads 0 or double whenever
                         // sends and game frames aren't in step.
                         static std::deque<std::pair<std::chrono::steady_clock::time_point, RE::NiPoint3>> s_track;
@@ -777,8 +849,8 @@ namespace F4MP
                         msg.isSprinting = mm != 0xFFFFFFFF ? (mm & kMoveModeSprinting) != 0 : speed > 450.0f;
                         msg.isRunning = speed > 150.0f && !msg.isSprinting;
                         msg.isSneaking = ls.sneaking;
-                        msg.isJumping = ls.jumping;              // en el aire / saltando
-                        msg.weaponDrawn = ls.weaponDrawn;  // arma en mano?
+                        msg.isJumping = ls.jumping;              // in the air / jumping
+                        msg.weaponDrawn = ls.weaponDrawn;  // weapon out?
                         msg.cellId = Authority::LocalSpaceAtomic();   // interior cell / worldspace
                         lastSend = now;
                         net.SendPacket(Network::MessageType::PlayerPosition, &msg, sizeof(msg));
@@ -793,7 +865,7 @@ namespace F4MP
                         net.SendPacket(Network::MessageType::PlayerPosition, &s_lastMsg, sizeof(s_lastMsg));
                     }
                 }
-                // Sincronizar cuerpos en el hilo PRINCIPAL ~60/s (para interpolar suave).
+                // Bodies are synced on the MAIN thread ~60/s (smooth interpolation).
                 if (duration_cast<milliseconds>(now - lastSync).count() >= 16) {
                     lastSync = now;
                     g_gateBodies.Queue([]() { BodiesSync(); });
@@ -809,7 +881,7 @@ namespace F4MP
                             std::chrono::steady_clock::now() - queued).count();
                         if (waited > 500) {
                             auto* ui = RE::UI::GetSingleton();
-                            REX::WARN("[F4MP] main-thread task waited {} ms (menuMode {}, LoadingMenu {}, Console {})",
+                            REX::WARN("[FathersFallout] main-thread task waited {} ms (menuMode {}, LoadingMenu {}, Console {})",
                                 waited, ui ? ui->menuMode : 0u,
                                 ui && ui->GetMenuOpen("LoadingMenu"), ui && ui->GetMenuOpen("Console"));
                         }
@@ -837,17 +909,16 @@ namespace F4MP
             } else {
                 if (s_sentAppearance)  // just dropped: forget co-op session state
                     F4SE::GetTaskInterface()->AddTask([]() { Coop::OnDisconnected(); });
-                s_sentAppearance = false;  // al reconectar, reenviar la apariencia
+                s_sentAppearance = false;  // send the appearance again after reconnecting
             }
 
             std::this_thread::sleep_for(milliseconds(8));
         }
     }
 
-    // ---- PRUEBA de spawn: coloca un Protectron en tu posicion via Papyrus ----
-    // Llama a ObjectReference.PlaceAtMe por la VM (independiente de version, sin
-    // direcciones fijas). Es solo para comprobar que spawnear funciona.
-    // 0x00000007 = base del jugador (lleva tu apariencia). placeatme 7 => copia de tu personaje.
+    // ---- Spawn TEST: places a Protectron at your position through Papyrus ----
+    // Calls ObjectReference.PlaceAtMe through the script VM (no game-version addresses). Test only:
+    // checks that spawning works. 0x00000007 = the player's base (your look): a copy of your character.
     // (Antes 0x00106B09 = Protectron de prueba.)
     static const uint32_t kDummyBase = 0x00000007;
 
@@ -859,7 +930,7 @@ namespace F4MP
     static const uint32_t kBodyBaseFemale = 0x0018E8F2;
     static uint32_t g_spawnBase = kBodyBaseMale;
 
-    // Busca un actor de la base indicada cerca del jugador que NO este ya reclamado.
+    // Finds an actor of the given base near the player that isn't claimed yet.
     static RE::Actor* FindNearbyActor(uint32_t baseFormId, const std::unordered_set<uint32_t>& exclude)
     {
         auto* pl = RE::PlayerCharacter::GetSingleton();
@@ -885,9 +956,9 @@ namespace F4MP
         return found;
     }
 
-    // ================= Cuerpos de jugadores remotos (Fase A) =================
-    static std::unordered_map<uint32_t, uint32_t> g_bodies;      // playerId -> formID del actor
-    static std::unordered_map<uint32_t, float> g_lastHeading;    // playerId -> ultimo heading aplicado
+    // ================= Remote players' bodies =================
+    static std::unordered_map<uint32_t, uint32_t> g_bodies;      // playerId -> the body actor's FormID
+    static std::unordered_map<uint32_t, float> g_lastHeading;    // playerId -> last heading applied
     // Where each body is drawn, for the name tags (the HUD runs on the render thread).
     static std::mutex g_tagLock;
     static std::unordered_map<uint32_t, RE::NiPoint3> g_tagBodyPos;
@@ -902,9 +973,8 @@ namespace F4MP
         return 0;
     }
 
-    // Ultimo estado de movimiento aplicado a cada cuerpo. Sirve para disparar los
-    // eventos del grafo (moveStart/moveStop, SprintStart/SprintStop) SOLO cuando el
-    // estado cambia, en vez de cada tick (si no, el grafo no avanzaria nunca).
+    // Last movement state applied to each body: graph events (moveStart/moveStop, SprintStart/
+    // SprintStop) are sent ONLY when it changes, not every tick (or the graph never moves on).
     struct BodyAnimState { bool moving = false; bool sprinting = false; bool init = false;
                            bool weaponDrawn = false; bool jumping = false; bool sneaking = false;
                            float smoothSpeed = 0.0f; float aimX = 0.0f; float aimY = 0.0f; float pitch = 0.0f;
@@ -928,10 +998,10 @@ namespace F4MP
                            long long lastStep = 0, stillStepsFrom = 0, quickUntilMs = 0; int stillSteps = 0; };
     static std::unordered_map<uint32_t, BodyAnimState> g_animState;
     static bool g_lastOkSpeed = false, g_lastOkDir = false;       // retorno de SetGraphVariable (debug)
-    static bool g_graphDumped = false;                            // ya volcamos las variables del grafo?
+    static bool g_graphDumped = false;                            // graph variables dumped already?
 
-    // Diagnostico: lista que variables del grafo de animacion EXISTEN en el cuerpo.
-    // Asi dejamos de adivinar nombres y usamos los reales.
+    // Diagnostics: lists which animation graph variables EXIST on the body, so the real names are
+    // used instead of guesses.
     static void DumpGraphVars(RE::Actor* actor)
     {
         static const char* kFloats[] = {
@@ -943,22 +1013,22 @@ namespace F4MP
             "IsMoving", "bMoving", "IsSprinting", "bSprinting", "bIsSprinting", "IsSneaking",
             "IsRunning", "bIsMovementDriven", "bAnimationDriven", "IsNPC", "bWantToSprint",
             "IsSynced", "bIsSynced", "GraphControlsMovement", "IsFirstPerson", "bAllowRotation",
-            // candidatos de SALTO / AIRE / AGACHARSE (para descubrir el nombre real):
+            // JUMP / AIR / SNEAK candidates (to find the real names):
             "bInJumpState", "IsJumping", "bIsJumping", "IsInAir", "bInAir", "IsFalling",
             "bIsSneaking", "IsSneaky", "IsCrouching", "bSneaking"
         };
-        REX::INFO("[F4MP] ===== animation graph variables (existing) =====");
+        REX::INFO("[FathersFallout] ===== animation graph variables (existing) =====");
         for (auto* n : kFloats) {
             float o = 0.0f;
             if (actor->GetGraphVariableImplFloat(n, o))
-                REX::INFO("[F4MP]   FLOAT {} = {:.3f}", n, o);
+                REX::INFO("[FathersFallout]   FLOAT {} = {:.3f}", n, o);
         }
         for (auto* n : kBools) {
             bool o = false;
             if (actor->GetGraphVariableImplBool(n, o))
-                REX::INFO("[F4MP]   BOOL  {} = {}", n, o);
+                REX::INFO("[FathersFallout]   BOOL  {} = {}", n, o);
         }
-        REX::INFO("[F4MP] ===== end of graph variables =====");
+        REX::INFO("[FathersFallout] ===== end of graph variables =====");
     }
     static std::unordered_set<uint32_t> g_dummies;   // "Spawn dummy" test actors: never a player body
     static std::unordered_map<uint32_t, uint32_t> g_bodyBase;  // playerId -> base the body was spawned from
@@ -977,10 +1047,9 @@ namespace F4MP
         return s;
     }
 
-    // Borra un cuerpo por API (mas fiable que comandos de consola). Disable lo oculta
-    // al instante; SetWantsDelete + MarkAsDeleted hacen que el juego lo elimine y NO lo
-    // guarde en la partida (los actores de placeatme son persistentes; asi evitamos que
-    // se acumulen "muñecos fantasma" en el save).
+    // Removes a body through the API (more reliable than console commands). Disable hides it at once;
+    // SetWantsDelete + MarkAsDeleted make the game delete it and NOT keep it in the save (placeatme
+    // actors are persistent: otherwise "ghost dummies" pile up in the save).
     static void DespawnBody(uint32_t fid)
     {
         auto* form = RE::TESForm::GetFormByID(fid);
@@ -1019,7 +1088,7 @@ namespace F4MP
         });
         for (uint32_t fid : orphans) {
             DespawnBody(fid);
-            REX::INFO("[F4MP] removed leftover body actor {:#x} (from a save or an old session)", fid);
+            REX::INFO("[FathersFallout] removed leftover body actor {:#x} (from a save or an old session)", fid);
         }
     }
 
@@ -1029,7 +1098,7 @@ namespace F4MP
     {
         for (auto& [pid, fid] : g_bodies) DespawnBody(fid);
         if (!g_bodies.empty())
-            REX::INFO("[F4MP] saving: removed {} body(ies) so they are not stored in the save", g_bodies.size());
+            REX::INFO("[FathersFallout] saving: removed {} body(ies) so they are not stored in the save", g_bodies.size());
         g_spawnCount -= std::min<uint32_t>(g_spawnCount, static_cast<uint32_t>(g_bodies.size()));
         g_bodies.clear();
         g_lastHeading.clear();
@@ -1052,7 +1121,7 @@ namespace F4MP
         return dx * dx + dy * dy + dz * dz <= range * range;
     }
 
-    // Se ejecuta en el hilo PRINCIPAL: crea/mueve un cuerpo por cada jugador remoto.
+    // Runs on the MAIN thread: creates/moves one body per remote player.
     static void SampleLocalMovement()
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1244,7 +1313,7 @@ namespace F4MP
                 s_next = now + std::chrono::seconds(1);
                 auto& n = Network::NetworkClient::GetInstance();
                 if (RefreshInIntro() && (n.IsConnected() || n.IsConnecting())) {
-                    REX::WARN("[F4MP] in the pre-war intro while connected: leaving the session");
+                    REX::WARN("[FathersFallout] in the pre-war intro while connected: leaving the session");
                     n.Disconnect();
                     g_retriesLeft = 0;
                     NotifyIntro();
@@ -1269,35 +1338,35 @@ namespace F4MP
 
         auto& net = Network::NetworkClient::GetInstance();
         if (!net.IsConnected()) {
-            // Desconectado: despawnear cualquier cuerpo que haya quedado.
+            // Disconnected: remove any body left over.
             for (auto& [pid, fid] : g_bodies) {
                 DespawnBody(fid);
             }
             if (!g_bodies.empty()) {
-                REX::INFO("[F4MP] disconnected: {} body/bodies removed", g_bodies.size());
+                REX::INFO("[FathersFallout] disconnected: {} body/bodies removed", g_bodies.size());
                 g_bodies.clear();
             }
             g_lastHeading.clear();
             g_animState.clear();
             return;
         }
-        auto remotos = net.GetRemotePlayers();
+        auto remotes = net.GetRemotePlayers();
 
-        auto ahora = std::chrono::steady_clock::now();  // para el throttle del log
+        auto clockNow = std::chrono::steady_clock::now();  // for the log throttle
 
 
-        // 0. Limpiar cuerpos de jugadores que ya no estan conectados.
-        std::vector<uint32_t> muertos;
+        // 0. Remove the bodies of players who are no longer connected.
+        std::vector<uint32_t> leftPlayers;
         for (auto& [pid, fid] : g_bodies) {
-            if (remotos.find(pid) == remotos.end()) muertos.push_back(pid);
+            if (remotes.find(pid) == remotes.end()) leftPlayers.push_back(pid);
         }
-        for (uint32_t pid : muertos) {
+        for (uint32_t pid : leftPlayers) {
             uint32_t fid = g_bodies[pid];
-            DespawnBody(fid);   // borrado fiable por API (Disable + MarkAsDeleted)
+            DespawnBody(fid);   // reliable removal through the API (Disable + MarkAsDeleted)
             g_bodies.erase(pid);
             g_lastHeading.erase(pid);
             g_animState.erase(pid);
-            REX::INFO("[F4MP] body removed (player {} disconnected, actor {:#x})", pid, fid);
+            REX::INFO("[FathersFallout] body removed (player {} disconnected, actor {:#x})", pid, fid);
         }
 
         // 0a. Area of interest: a body only exists while its player is near us. Teleporting a
@@ -1306,8 +1375,8 @@ namespace F4MP
         //     flicker at the edge; range-based despawns don't count against the spawn cap.
         std::vector<uint32_t> outOfRange;
         for (auto& [pid, fid] : g_bodies) {
-            auto it = remotos.find(pid);
-            if (it != remotos.end() && !IsNearLocalPlayer(it->second, Range::BodyDespawn())) outOfRange.push_back(pid);
+            auto it = remotes.find(pid);
+            if (it != remotes.end() && !IsNearLocalPlayer(it->second, Range::BodyDespawn())) outOfRange.push_back(pid);
         }
         for (uint32_t pid : outOfRange) {
             DespawnBody(g_bodies[pid]);
@@ -1315,7 +1384,7 @@ namespace F4MP
             g_lastHeading.erase(pid);
             g_animState.erase(pid);
             if (g_spawnCount > 0) g_spawnCount--;
-            REX::INFO("[F4MP] player {} is out of range: body removed until they come back", pid);
+            REX::INFO("[FathersFallout] player {} is out of range: body removed until they come back", pid);
         }
 
         // 0c. Appearance arrived (or changed) after this body was spawned, or the body died here
@@ -1335,8 +1404,8 @@ namespace F4MP
             g_lastHeading.erase(pid);
             g_animState.erase(pid);
             if (g_spawnCount > 0) g_spawnCount--;
-            if (died) REX::WARN("[F4MP] player {}'s body died on this screen: replaced by a fresh one", pid);
-            else REX::INFO("[F4MP] player {} appearance updated: rebuilding their body", pid);
+            if (died) REX::WARN("[FathersFallout] player {}'s body died on this screen: replaced by a fresh one", pid);
+            else REX::INFO("[FathersFallout] player {} appearance updated: rebuilding their body", pid);
         }
 
         // 0b. Bodies the game removed (cell unload, cleanup) get respawned: without this
@@ -1348,17 +1417,17 @@ namespace F4MP
             if (!actor || actor->IsDeleted() || actor->IsDisabled()) lost.push_back(pid);
         }
         for (uint32_t pid : lost) {
-            REX::WARN("[F4MP] body for player {} ({:#x}) is gone, respawning", pid, g_bodies[pid]);
+            REX::WARN("[FathersFallout] body for player {} ({:#x}) is gone, respawning", pid, g_bodies[pid]);
             g_bodies.erase(pid);
             g_lastHeading.erase(pid);
             g_animState.erase(pid);
         }
 
-        // 1. Mover suavemente los cuerpos hacia la posicion de su jugador.
+        // 1. Move each body smoothly toward its player's position.
         std::vector<RE::Actor*> liveBodies;
         for (auto& [pid, fid] : g_bodies) {
-            auto it = remotos.find(pid);
-            if (it == remotos.end()) continue;
+            auto it = remotes.find(pid);
+            if (it == remotes.end()) continue;
             auto* form = RE::TESForm::GetFormByID(fid);
             auto* actor = form ? form->As<RE::Actor>() : nullptr;
             if (!actor) continue;
@@ -1368,7 +1437,7 @@ namespace F4MP
             GraphOverride::InstallNoTalk(actor);
             GraphOverride::DetachMovementChannels(actor);
 
-            // Una sola vez, cuando el grafo ya esta cargado, volcar sus variables.
+            // Once, when the graph has loaded, dump its variables.
             if (!g_graphDumped) {
                 float probe = 0.0f;
                 if (actor->GetGraphVariableImplFloat("Speed", probe)) {  // grafo listo
@@ -1380,9 +1449,9 @@ namespace F4MP
             // Sitting/lying on furniture: the furniture places and animates the body.
             if (Workshop::BodySeated(pid)) continue;
 
-            const RE::NiPoint3 objetivo{ it->second.x, it->second.y, it->second.z };
-            const RE::NiPoint3 actual = actor->GetPosition();
-            const RE::NiPoint3 delta = objetivo - actual;
+            const RE::NiPoint3 goal{ it->second.x, it->second.y, it->second.z };
+            const RE::NiPoint3 bodyPos = actor->GetPosition();
+            const RE::NiPoint3 delta = goal - bodyPos;
             const float dist = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
 
             const auto& rp = it->second;
@@ -1392,21 +1461,20 @@ namespace F4MP
             // walk/run animation follows how fast the body really moves on this screen (further down).
             const float rawSpeed = (rp.speed > 0.0f && rp.speed < 1000.0f) ? rp.speed : 0.0f;
 
-            // ---- MOVIMIENTO: seguimiento SUAVE por posicion (fluido, como te gustaba) ----
-            // Volvemos a SetPosition porque la velocidad del controlador no movia bien el
-            // cuerpo (se veia a teletransportes). La animacion la resolvemos aparte, abajo,
-            // diciendole al grafo que esta "sincronizado" (bIsSynced) para que respete la
-            // velocidad que le fijamos aunque el cuerpo no se mueva por fisica.
+            // ---- MOVEMENT: SMOOTH position following ----
+            // SetPosition, because the character controller's velocity moved the body in jumps.
+            // The animation is handled below: the graph is told the body is "synced" (bIsSynced) so
+            // it keeps the speed we set even though physics doesn't move the body.
             // Test aid (bridge f4mp:freezebody <s>): stop placing bodies and log how far the
             // animation alone moves them - its natural speed for the current Speed value.
             if (std::chrono::steady_clock::now() < g_freezeUntil) {
                 static RE::NiPoint3 s_start{};
                 static std::chrono::steady_clock::time_point s_t0{};
                 static bool s_on = false;
-                if (!s_on) { s_on = true; s_start = actual; s_t0 = std::chrono::steady_clock::now(); }
+                if (!s_on) { s_on = true; s_start = bodyPos; s_t0 = std::chrono::steady_clock::now(); }
                 const float secs = std::chrono::duration<float>(std::chrono::steady_clock::now() - s_t0).count();
                 if (secs > 0.5f) {
-                    const float moved = std::sqrt((actual.x - s_start.x) * (actual.x - s_start.x) + (actual.y - s_start.y) * (actual.y - s_start.y));
+                    const float moved = std::sqrt((bodyPos.x - s_start.x) * (bodyPos.x - s_start.x) + (bodyPos.y - s_start.y) * (bodyPos.y - s_start.y));
                     static float s_lastLog = 0.0f;
                     if (secs - s_lastLog >= 0.5f) {
                         s_lastLog = secs;
@@ -1417,7 +1485,7 @@ namespace F4MP
                 if (std::chrono::steady_clock::now() + std::chrono::milliseconds(50) >= g_freezeUntil) s_on = false;
                 st.smoothSpeed = st.smoothSpeed * 0.85f + rawSpeed * 0.15f;
             } else if (dist > 1500.0f) {
-                actor->SetPosition(objetivo, true);   // teletransporte (spawn / viaje rapido)
+                actor->SetPosition(goal, true);   // teletransporte (spawn / viaje rapido)
                 st.havePos = false;
             } else {
                 // Its player stands still and the body is nearly there: leave it. Something solid
@@ -1430,24 +1498,24 @@ namespace F4MP
                 // speed until 0 has lasted 100 ms.
                 float rxv = it->second.speed;
                 if (rxv > 10.0f) st.lastRxSpeed = rxv;
-                else if (ahora - st.lastRxMoveAt < std::chrono::milliseconds(100)) rxv = st.lastRxSpeed;
+                else if (clockNow - st.lastRxMoveAt < std::chrono::milliseconds(100)) rxv = st.lastRxSpeed;
                 st.rxSmooth = st.rxSmooth * 0.9f + rxv * 0.1f;
-                if (it->second.speed > 10.0f) st.lastRxMoveAt = ahora;
-                const bool idle = ahora - st.lastRxMoveAt > std::chrono::milliseconds(250);
+                if (it->second.speed > 10.0f) st.lastRxMoveAt = clockNow;
+                const bool idle = clockNow - st.lastRxMoveAt > std::chrono::milliseconds(250);
                 if (idle) st.rxSmooth = 0.0f;
                 if (!idle) {
                     st.blocked = false;
                     st.parked = false;
                     st.idleCheckAt = {};
                 } else if (st.idleCheckAt == std::chrono::steady_clock::time_point{}) {
-                    st.idleCheckAt = ahora;
+                    st.idleCheckAt = clockNow;
                     st.idleCheckLag = lagXY;
-                    st.idleCheckTarget = objetivo;
-                } else if (ahora - st.idleCheckAt > std::chrono::milliseconds(300)) {
+                    st.idleCheckTarget = goal;
+                } else if (clockNow - st.idleCheckAt > std::chrono::milliseconds(300)) {
                     // Close by and < 4 units closer in 0.3 s. Not further off: a body left alone with a
                     // walk still playing walks off on the animation's own motion, and must be brought back.
                     // Only while its spot really stays put (a sender's speed of 0 alone isn't proof).
-                    const RE::NiPoint3 tm = objetivo - st.idleCheckTarget;
+                    const RE::NiPoint3 tm = goal - st.idleCheckTarget;
                     const bool spotStill = tm.x * tm.x + tm.y * tm.y + tm.z * tm.z < 8.0f * 8.0f;
                     const bool noProgress = lagXY > st.idleCheckLag - 4.0f;
                     st.blocked = lagXY < 64.0f && noProgress;
@@ -1455,25 +1523,25 @@ namespace F4MP
                     // was pushed every tick for good, that push read as walking, and the body walked in place
                     // after every interior load. Put it on the spot once and leave it.
                     if (spotStill && noProgress && !st.parked && !(st.blocked && std::fabs(delta.z) < 48.0f) && (lagXY >= 24.0f || std::fabs(delta.z) >= 48.0f)) {
-                        actor->SetPosition(objetivo, true);
+                        actor->SetPosition(goal, true);
                         st.parked = true;
                         st.havePos = false;
                         static int s_logged = 0;
                         if (s_logged++ < 20)
-                            REX::INFO("[F4MP] body of player {} stuck {:.0f} units off (height {:.0f}) while its player stands: placed", pid, lagXY, delta.z);
+                            REX::INFO("[FathersFallout] body of player {} stuck {:.0f} units off (height {:.0f}) while its player stands: placed", pid, lagXY, delta.z);
                     }
                     if (st.parked && (lagXY > 200.0f || !spotStill)) st.parked = false;   // drifted off / its spot moved
-                    st.idleCheckAt = ahora;
+                    st.idleCheckAt = clockNow;
                     st.idleCheckLag = lagXY;
-                    st.idleCheckTarget = objetivo;
+                    st.idleCheckTarget = goal;
                 }
                 const bool settled = idle && (st.parked || (std::fabs(delta.z) < 48.0f && (lagXY < 24.0f || st.blocked)));
                 if (!settled) {
-                    const float alpha = 0.35f;            // suavizado por tick (~60/s)
-                    RE::NiPoint3 nueva{ actual.x + delta.x * alpha,
-                                        actual.y + delta.y * alpha,
-                                        actual.z + delta.z * alpha };
-                    actor->SetPosition(nueva, true);
+                    const float alpha = 0.35f;            // smoothing per tick (~60/s)
+                    RE::NiPoint3 stepPos{ bodyPos.x + delta.x * alpha,
+                                        bodyPos.y + delta.y * alpha,
+                                        bodyPos.z + delta.z * alpha };
+                    actor->SetPosition(stepPos, true);
                 }
                 // Animation speed = how fast the body really moves here: its position as the game
                 // left it, tick to tick (not the step we asked for, which a blocked body never makes).
@@ -1482,8 +1550,8 @@ namespace F4MP
                 if (settled) {
                     st.smoothSpeed *= 0.7f;   // standing: no walk (its own motion would feed itself)
                 } else if (st.havePos) {
-                    const float secs = std::chrono::duration<float>(ahora - st.lastPosAt).count();
-                    const float mx = actual.x - st.lastPos.x, my = actual.y - st.lastPos.y;
+                    const float secs = std::chrono::duration<float>(clockNow - st.lastPosAt).count();
+                    const float mx = bodyPos.x - st.lastPos.x, my = bodyPos.y - st.lastPos.y;
                     if (secs > 0.004f) {
                         float measured = std::sqrt(mx * mx + my * my) / secs;
                         // Under way: the player's own speed picks the gait. Ground and collision eat part of
@@ -1497,12 +1565,12 @@ namespace F4MP
                         if (measured < 1200.0f) st.smoothSpeed = st.smoothSpeed * 0.7f + measured * 0.3f;
                     }
                 }
-                st.lastPos = actual;
-                st.lastPosAt = ahora;
+                st.lastPos = bodyPos;
+                st.lastPosAt = clockNow;
                 st.havePos = true;
             }
 
-            // Rotacion: mirar hacia donde MIRA el jugador (SetHeading no reinicia la anim).
+            // Rotation: face where the player LOOKS (SetHeading doesn't restart the animation).
             // Turn smoothly toward the player's facing (an instant snap makes the feet slide while
             // the body spins). Fast enough to keep up with a mouse flick: closes 30% of the gap per
             // tick, at least 0.6 rad/s, and snaps the last 0.02 rad.
@@ -1535,15 +1603,15 @@ namespace F4MP
             }
 
             // ---- ANIMACION ----
-            // Decir al grafo que el cuerpo esta SINCRONIZADO / controlado desde fuera, para
-            // que USE la velocidad que le fijamos y no la recalcule a 0 (que es lo que hacia
-            // que la animacion se congelara al no moverse el cuerpo por fisica).
+            // Tell the graph the body is SYNCED / driven from outside, so it USES the speed we set
+            // instead of recomputing it as 0 (which froze the animation, since physics doesn't move
+            // the body).
             // [Debug] BodyTrace=1: 4 lines/s per body. The graph's Speed is read BEFORE we set it
             // again, i.e. what the engine left there since last frame (did it keep ours?).
             if (g_bodyTrace) {
                 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_lastTrace;
-                if (std::chrono::duration<float>(ahora - s_lastTrace[pid]).count() >= 0.25f) {
-                    s_lastTrace[pid] = ahora;
+                if (std::chrono::duration<float>(clockNow - s_lastTrace[pid]).count() >= 0.25f) {
+                    s_lastTrace[pid] = clockNow;
                     float gSpeed = -1.0f, gDir = -99.0f;
                     actor->GetGraphVariableImplFloat("Speed", gSpeed);
                     actor->GetGraphVariableImplFloat("Direction", gDir);
@@ -1570,17 +1638,17 @@ namespace F4MP
             }
             // Direction: written by GraphOverride (fraction of a turn), not here.
 
-            // Estado con HISTERESIS (umbral distinto para arrancar y parar, sin vibrar).
+            // State with HYSTERESIS (different start and stop thresholds, no flicker).
             const bool wantMoving = st.moving   ? (st.smoothSpeed >   8.0f) : (st.smoothSpeed >  30.0f);
             const bool wantSprint = rp.isSprinting && wantMoving;   // sender's own sprint state
 
             actor->SetGraphVariableBool("IsSprinting", wantSprint);
-            // Agacharse: variables cada frame + EVENTO en la transicion (la variable sola no
-            // basta; el grafo entra en modo agachado con el evento, como andar con moveStart).
+            // Sneaking: variables every frame + an EVENT on the change (the variable alone isn't enough; the
+            // graph enters sneak mode on the event, like walking on moveStart).
             actor->SetGraphVariableBool("IsSneaking", rp.isSneaking);
             actor->SetGraphVariableBool("bIsSneaking", rp.isSneaking);
-            // Re-afirmar el ESTADO agachado CADA frame: si solo se pone al cambiar, el cuerpo
-            // se vuelve a levantar solo. Asi se mantiene agachado mientras el jugador lo este.
+            // Re-assert the sneaking STATE EVERY frame: set only on the change, the body stands up again by
+            // itself. This keeps it crouched as long as the player is.
             if (actor->IsSneaking() != rp.isSneaking) {
                 actor->SetSneaking(rp.isSneaking);
             }
@@ -1589,7 +1657,7 @@ namespace F4MP
                 st.sneaking = rp.isSneaking;
             }
 
-            // Arma en mano: al cambiar, desenfundar/enfundar (cambia la postura del cuerpo).
+            // Weapon out: draw/holster on the change (changes the body's stance).
             // Weapon out or away like its player. Checked against the body's real state twice a
             // second too: equipping or a graph reset can holster it behind our back, and a body
             // with no weapon out can't show the player's aiming and shots.
@@ -1606,9 +1674,9 @@ namespace F4MP
             if (actor->IsInCombat()) {
                 actor->StopCombat();
                 if (st.recalmAt == std::chrono::steady_clock::time_point{})
-                    REX::INFO("[F4MP] body of player {} was pulled into combat: stopped", pid);
-                st.recalmAt = ahora + std::chrono::milliseconds(300);
-            } else if (st.recalmAt != std::chrono::steady_clock::time_point{} && ahora >= st.recalmAt) {
+                    REX::INFO("[FathersFallout] body of player {} was pulled into combat: stopped", pid);
+                st.recalmAt = clockNow + std::chrono::milliseconds(300);
+            } else if (st.recalmAt != std::chrono::steady_clock::time_point{} && clockNow >= st.recalmAt) {
                 actor->InitiateDoNothingPackage();   // combat replaced it; without it the AI holsters
                 st.recalmAt = {};
                 st.lastDrawCheck = {};               // put the weapon back the way its player has it
@@ -1618,21 +1686,21 @@ namespace F4MP
             // stayed half-drawn for good, refusing every aim and shot.
             GraphOverride::SetWantDrawn(actor, rp.weaponDrawn);
             if (!Coop::EquipmentSettled(pid, fid)) {
-                st.lastDrawCheck = ahora;
+                st.lastDrawCheck = clockNow;
             } else {
                 if (rp.weaponDrawn && st.drawReached && KeepDrawn(actor)) {
                     static int s_kept = 0;
-                    if (s_kept++ < 20) REX::INFO("[F4MP] body of player {}: its AI started holstering - kept drawn", pid);
+                    if (s_kept++ < 20) REX::INFO("[FathersFallout] body of player {}: its AI started holstering - kept drawn", pid);
                 }
-                const bool actual = WeaponStateOf(actor) >= 3;
+                const bool bodyPos = WeaponStateOf(actor) >= 3;
                 const bool changed = st.weaponDrawn != rp.weaponDrawn;
                 // Reached the wanted state since our last request? Then a later difference means
                 // something else changed it (0.5 s to correct). Not reached yet: the draw animation
                 // may still be playing, so 1.5 s. Re-asking every 0.5 s restarted the draw, and the
                 // guard below then reset the AI, which holstered it: hands stayed empty.
-                if (actual == st.weaponDrawn) st.drawReached = true;
-                const float since = std::chrono::duration<float>(ahora - st.lastDrawCheck).count();
-                const bool drifted = actual != rp.weaponDrawn && since > (st.drawReached ? 0.5f : 1.5f);
+                if (bodyPos == st.weaponDrawn) st.drawReached = true;
+                const float since = std::chrono::duration<float>(clockNow - st.lastDrawCheck).count();
+                const bool drifted = bodyPos != rp.weaponDrawn && since > (st.drawReached ? 0.5f : 1.5f);
                 const bool undone = drifted && st.drawReached;   // was right, then changed behind our back
                 if (changed || drifted) {
                     // Stuck half-way (wants to draw / drawing, or the same for holstering) since our last
@@ -1647,13 +1715,13 @@ namespace F4MP
                         GraphOverride::SendEvent(actor, rp.weaponDrawn ? "WeapEquip" : "Unequip");
                         static int s_stuck = 0;
                         if (s_stuck++ < 20)
-                            REX::INFO("[F4MP] body of player {}: weapon stuck in state {} - reset, {} again", pid,
+                            REX::INFO("[FathersFallout] body of player {}: weapon stuck in state {} - reset, {} again", pid,
                                 ws, rp.weaponDrawn ? "drawing" : "holstering");
                     }
                     actor->DrawWeaponMagicHands(rp.weaponDrawn);
                     st.quickUntilMs = NowMs() + 3000;
                     st.weaponDrawn = rp.weaponDrawn;
-                    st.lastDrawCheck = ahora;
+                    st.lastDrawCheck = clockNow;
                     st.drawReached = false;
                     if (drifted && g_bodyTrace)
                         REX::INFO("[Trace] p{} weapon {} again (state {}, process {})", pid, rp.weaponDrawn ? "drawn" : "holstered",
@@ -1661,14 +1729,14 @@ namespace F4MP
                 }
                 // Something else still fights the weapon state: 3 undone in 5 s = re-calm the AI.
                 if (undone) {
-                    st.redraws.push_back(ahora);
-                    std::erase_if(st.redraws, [&](auto t) { return ahora - t > std::chrono::seconds(5); });
+                    st.redraws.push_back(clockNow);
+                    std::erase_if(st.redraws, [&](auto t) { return clockNow - t > std::chrono::seconds(5); });
                     if (st.redraws.size() >= 3) {
                         st.redraws.clear();
                         actor->StopCombat();
                         actor->InitiateDoNothingPackage();
                         static int s_warned = 0;
-                        if (s_warned++ < 20) REX::WARN("[F4MP] body of player {}: weapon keeps changing on its own; AI calmed again", pid);
+                        if (s_warned++ < 20) REX::WARN("[FathersFallout] body of player {}: weapon keeps changing on its own; AI calmed again", pid);
                     }
                 }
             }
@@ -1679,7 +1747,7 @@ namespace F4MP
                 // Not before the graph exists, or the event is silently dropped.
                 float graphReady = 0.0f;
                 if (!actor->GetGraphVariableImplFloat("Speed", graphReady)) continue;
-                REX::INFO("[F4MP] body {} ready: moving {}, sprint {}", pid, wantMoving, wantSprint);
+                REX::INFO("[FathersFallout] body {} ready: moving {}, sprint {}", pid, wantMoving, wantSprint);
                 st.moving = false;      // the transition code below sends moveStart/SprintStart
                 st.sprinting = false;
                 // Standing: say so. A body spawned while the engine had it walking (testing: right after an interior
@@ -1709,7 +1777,7 @@ namespace F4MP
                     ok = StartMoving(actor, rp.isSneaking);
                     static int s_logged = 0;
                     if (s_logged++ < 30)
-                        REX::INFO("[F4MP] body of player {}: walk refused 0.25 s - stance {}{}, start -> {}", pid,
+                        REX::INFO("[FathersFallout] body of player {}: walk refused 0.25 s - stance {}{}, start -> {}", pid,
                             rp.isSneaking ? "sneaking" : "standing", off ? " resent" : " already right", ok);
                 }
                 if (ok) st.moveRefused = 0;
@@ -1731,11 +1799,11 @@ namespace F4MP
             if (!st.moving || st.sprinting) {
                 if (!st.moving) { st.gait = 0; st.gaitTries = 0; }
             } else {
-                if (st.gait == 0) { st.gait = 1; st.gaitWant = 1; st.gaitWantSince = ahora; }   // moveStart = the walk
+                if (st.gait == 0) { st.gait = 1; st.gaitWant = 1; st.gaitWantSince = clockNow; }   // moveStart = the walk
                 const int want = st.gait == 2 ? (st.rxSmooth > 180.0f ? 2 : 1) : (st.rxSmooth > 240.0f ? 2 : 1);
                 // A change has to hold 0.3 s: a speed spike on starting flipped walk to jog and back.
-                if (want == st.gait || want != st.gaitWant) { st.gaitWant = want; st.gaitWantSince = ahora; }
-                const bool held = ahora - st.gaitWantSince > std::chrono::milliseconds(300);
+                if (want == st.gait || want != st.gaitWant) { st.gaitWant = want; st.gaitWantSince = clockNow; }
+                const bool held = clockNow - st.gaitWantSince > std::chrono::milliseconds(300);
                 if (want != st.gait && held) {
                     // The weapon stance has its own names: holstered takes "Run"/"Walk", weapon out takes
                     // "runStart"/"walkStart". Whichever this stance accepts.
@@ -1755,12 +1823,12 @@ namespace F4MP
                     if (ok || given) { st.gait = want; st.gaitTries = 0; }
                     static int s_logged = 0;
                     if ((ok || given) && s_logged++ < 60)
-                        REX::INFO("[F4MP] body of player {}: {} -> {}", pid, ev, ok ? "accepted" : "refused for 1 s, taken as set");
+                        REX::INFO("[FathersFallout] body of player {}: {} -> {}", pid, ev, ok ? "accepted" : "refused for 1 s, taken as set");
                 }
             }
 
-            // Salto: variable cada frame + evento al despegar. Probamos varios nombres de
-            // evento y registramos cual es valido (return true) para quedarnos con ese.
+            // Jump: variable every frame + an event on take-off. Several event names are tried and the one the
+            // graph accepts (returns true) is kept.
             actor->SetGraphVariableBool("bInJumpState", rp.isJumping);
             actor->SetGraphVariableBool("IsJumping", rp.isJumping);
             if (st.jumping != rp.isJumping) {
@@ -1770,7 +1838,7 @@ namespace F4MP
                     // all through the jump (refused every quarter second until the landing).
                     const bool ok = GraphOverride::SendEvent(actor, "jumpStart") || GraphOverride::SendEvent(actor, "JumpUp");
                     static int s_logged = 0;
-                    if (s_logged++ < 20) REX::INFO("[F4MP] body of player {} jumps: {}", pid, ok);
+                    if (s_logged++ < 20) REX::INFO("[FathersFallout] body of player {} jumps: {}", pid, ok);
                 } else {
                     // Landed. Without this the body stayed in the jump's fall pose (arms up) for
                     // good and refused every later jump. Same events the player's own
@@ -1779,7 +1847,7 @@ namespace F4MP
                     bool ok = GraphOverride::SendEvent(actor, land);
                     if (!ok) ok = GraphOverride::SendEvent(actor, "jumpLand");
                     static int s_logged = 0;
-                    if (s_logged++ < 20) REX::INFO("[F4MP] body of player {} landed: {} -> {}", pid, land, ok);
+                    if (s_logged++ < 20) REX::INFO("[FathersFallout] body of player {} landed: {} -> {}", pid, land, ok);
                     st.moving = false;      // the landing replaces the locomotion state: resend it
                     st.sprinting = false;
                 }
@@ -1787,7 +1855,7 @@ namespace F4MP
             }
 
             // Not while crouched: the sneak walk/run clips have no footstep events.
-            const bool senderStands = ahora - st.lastRxMoveAt > std::chrono::milliseconds(800);
+            const bool senderStands = clockNow - st.lastRxMoveAt > std::chrono::milliseconds(800);
             switch (StepWatch(actor, st, st.moving, st.smoothSpeed, rp.isJumping || rp.isSneaking || Activity::BodyInPowerArmor(pid), senderStands)) {
             case 1: {
                 static int s_logged = 0;
@@ -1808,15 +1876,13 @@ namespace F4MP
             default: break;
             }
 
-            // Log throttled (1/s): mide el DESFASE cuerpo vs objetivo (para diagnosticar
-            // la desincronizacion). Si 'desync' crece cuando el jugador se mueve, es que el
-            // cuerpo no llega/se va; si el cuerpo va en direccion girada, se vera aqui.
+            // Throttled log (1/s): how far the body is from its target. If 'desync' grows while the player
+            // moves, the body falls behind or overshoots; a body walking the wrong way shows here too.
             static std::chrono::steady_clock::time_point lastLog{};
-            if (std::chrono::duration<float>(ahora - lastLog).count() > 10.0f) {
-                lastLog = ahora;
-                // DIAGNOSTICO: leer que Speed tiene el grafo AHORA (tras fijarla). Si sale
-                // ~0, el motor nos la esta pisando (no ve al cuerpo moverse) -> hay que
-                // moverlo de verdad. cc = si encontro el controlador fisico.
+            if (std::chrono::duration<float>(clockNow - lastLog).count() > 10.0f) {
+                lastLog = clockNow;
+                // DIAGNOSTICS: the graph's Speed NOW (after setting it). ~0 means the engine overwrote it (it
+                // doesn't see the body move). cc = whether the physics controller was found.
                 float gSpeed = -1.0f;
                 actor->GetGraphVariableImplFloat("Speed", gSpeed);
                 float gDir = -99.0f;
@@ -1824,7 +1890,7 @@ namespace F4MP
                 const bool hasCC = actor->currentProcess && actor->currentProcess->middleHigh &&
                                    actor->currentProcess->middleHigh->charController.get();
                 bool gSneak = false; actor->GetGraphVariableImplBool("IsSneaking", gSneak);
-                REX::INFO("[F4MP] player {} | rxSpeed={:.0f} | Speed={:.1f} | snkRx={} snkBody={} snkGraph={} | jump={}",
+                REX::INFO("[FathersFallout] player {} | rxSpeed={:.0f} | Speed={:.1f} | snkRx={} snkBody={} snkGraph={} | jump={}",
                     pid, it->second.speed, gSpeed, rp.isSneaking, actor->IsSneaking(), gSneak, rp.isJumping);
             }
         }
@@ -1839,21 +1905,19 @@ namespace F4MP
             }
         }
 
-        // 2. Resolver un spawn pendiente (el placeatme es asincrono).
+        // 2. Finish a pending spawn (placeatme is asynchronous).
         if (g_spawnPending) {
             if (std::chrono::duration<float>(std::chrono::steady_clock::now() - g_spawnAt).count() > 0.4f) {
                 RE::Actor* actor = FindNearbyActor(g_spawnBase, ClaimedFormIds());
                 if (actor && RE::TESForm::GetFormByID(actor->GetFormID()) != actor) {
                     // The respawn check looks bodies up by FormID; if that can't find this actor
                     // it would be "lost" every tick. Refuse it loudly instead.
-                    REX::WARN("[F4MP] spawned actor {:#x} not resolvable by FormID; not using it", actor->GetFormID());
-                } else if (actor && remotos.find(g_spawnFor) != remotos.end()) {
+                    REX::WARN("[FathersFallout] spawned actor {:#x} not resolvable by FormID; not using it", actor->GetFormID());
+                } else if (actor && remotes.find(g_spawnFor) != remotes.end()) {
                     g_bodies[g_spawnFor] = actor->GetFormID();
                     g_bodyBase[g_spawnFor] = g_spawnBase;
-                    // CALMAR LA IA del cuerpo: es un NPC y, si no, deambula por su cuenta y
-                    // se va a otro sitio distinto del marcador. El "paquete de no hacer nada"
-                    // hace que deje de moverse solo, pero sigue animandose cuando lo movemos
-                    // nosotros con Actor::Move.
+                    // CALM the body's AI: it's an NPC and would otherwise wander off on its own. The "do nothing"
+                    // package stops it moving by itself; it still animates when we move it.
                     actor->InitiateDoNothingPackage();
                     actor->StopCombat();
                     // Never starts a fight, never runs or panics when hit (its player decides that).
@@ -1877,14 +1941,14 @@ namespace F4MP
                         snprintf(cmd, sizeof(cmd), "%X.addtofaction 1C21C 0", actor->GetFormID());
                         RE::Console::ExecuteCommand(cmd);
                     }
-                    REX::INFO("[F4MP] body assigned to player {} (actor {:#x}), AI calmed, in PlayerFaction", g_spawnFor, actor->GetFormID());
+                    REX::INFO("[FathersFallout] body assigned to player {} (actor {:#x}), AI calmed, in PlayerFaction", g_spawnFor, actor->GetFormID());
                 }
                 g_spawnPending = false;
             }
-            return;  // un spawn a la vez
+            return;  // one spawn at a time
         }
 
-        // 3. Iniciar un spawn para el primer jugador remoto sin cuerpo.
+        // 3. Start a spawn for the first remote player without a body.
         // Guard rails: at most one spawn every 3 s and 20 per session, so a body that keeps
         // "vanishing" can never flood the world with copies.
         {
@@ -1901,11 +1965,11 @@ namespace F4MP
             auto* cell = pl ? pl->GetParentCell() : nullptr;
             if (!cell || !cell->IsAttached()) return;
         }
-        for (auto& [pid, pos] : remotos) {
+        for (auto& [pid, pos] : remotes) {
             if (g_bodies.find(pid) == g_bodies.end() && IsNearLocalPlayer(pos, Range::BodySpawn())) {
                 ++g_spawnCount;
                 g_recentSpawns.push_back(std::chrono::steady_clock::now());
-                if (g_recentSpawns.size() == 15) REX::WARN("[F4MP] 15 body spawns in 5 minutes: pausing body spawns for a while");
+                if (g_recentSpawns.size() == 15) REX::WARN("[FathersFallout] 15 body spawns in 5 minutes: pausing body spawns for a while");
                 // The player's own character if we have their appearance, else a neutral body.
                 g_spawnBase = Appearance::GetBodyBase(pid);
                 if (!g_spawnBase) {
@@ -1919,14 +1983,14 @@ namespace F4MP
                 g_spawnPending = true;
                 g_spawnFor = pid;
                 g_spawnAt = std::chrono::steady_clock::now();
-                REX::INFO("[F4MP] spawning body for player {}", pid);
+                REX::INFO("[FathersFallout] spawning body for player {}", pid);
                 break;
             }
         }
     }
 
     // ================= NPCs (host autoritativo) =================
-    // FormIDs de NPCs que este cliente ha "tomado" (les apagamos la IA para conducirlos).
+    // FormIDs of NPCs this game has "taken over" (AI off, driven by the host's state).
     static std::unordered_set<uint32_t> g_drivenNpcs;
     struct NpcAnimState {   // keyed by local FormID
         bool moving = false; float smoothSpeed = 0.0f;
@@ -1945,7 +2009,7 @@ namespace F4MP
     struct NpcSample { RE::NiPoint3 pos; std::chrono::steady_clock::time_point at; };
     static std::unordered_map<uint32_t, NpcSample> g_npcSamples;
 
-    // HOST: difunde el estado de los NPCs "fijos" cercanos, identificados por FormID.
+    // HOST: broadcasts the state of nearby placed NPCs, by FormID.
     static void BroadcastNpcs()
     {
         auto& net = Network::NetworkClient::GetInstance();
@@ -1955,7 +2019,7 @@ namespace F4MP
         auto* tes = RE::TES::GetSingleton();
         if (!tes) return;
         const RE::NiPoint3 myPos = pl->GetPosition();
-        const auto claimed = ClaimedFormIds();   // cuerpos de jugador: NO son NPCs
+        const auto claimed = ClaimedFormIds();   // player bodies are NOT NPCs
 
         // Whole loaded area (not just the cell we stand in: enemies across a cell border, or a
         // corpse that ragdolled into the next cell, used to drop out of sync), nearest first.
@@ -1980,10 +2044,10 @@ namespace F4MP
             if (!ref || ref == static_cast<RE::TESObjectREFR*>(pl))
                 continue;
             const uint32_t fid = ref->GetFormID();
-            if (claimed.find(fid) != claimed.end())    // es un cuerpo de otro jugador, no un NPC
+            if (claimed.find(fid) != claimed.end())    // another player's body, not an NPC
                 continue;
             auto* actor = ref->As<RE::Actor>();
-            if (!actor)                                // solo actores (NPCs/criaturas)
+            if (!actor)                                // actors only (NPCs/creatures)
                 continue;
             // Disabled = not in our world (yet): story NPCs placed for later quests. Sending them made
             // a guest enable and pull them, which hung her game's load.
@@ -1991,7 +2055,11 @@ namespace F4MP
                 continue;
             // Runtime actor: FormIDs differ per machine, so clients get a spawn announcement and
             // map our ID to their copy (sync/DynamicActors).
-            if (fid >= DynamicActors::kRuntimeIdStart) {
+            // Our companion: ours wherever we go; the others place a copy of it (sync/DynamicActors).
+            const bool companion = DynamicActors::IsOurCompanion(actor);
+            if (companion) {
+                DynamicActors::AnnounceCompanion(actor);
+            } else if (fid >= DynamicActors::kRuntimeIdStart) {
                 auto* base = ref->GetObjectReference();
                 const uint32_t b = base ? base->GetFormID() : 0;
                 if (b == kDummyBase || b == kBodyBaseMale || b == kBodyBaseFemale || b >= 0xFFF00000)
@@ -1999,7 +2067,7 @@ namespace F4MP
                 DynamicActors::HostAnnounce(actor);
             }
 
-            if (!Authority::IOwn(actor)) continue;    // another player's game runs this one
+            if (!companion && !Authority::IOwn(actor)) continue;    // another player's game runs this one
             Network::NpcStateMsg msg{};
             msg.formId = fid;
             msg.ownerId = net.GetPlayerId();
@@ -2018,7 +2086,8 @@ namespace F4MP
             msg.isSneaking = actor->IsSneaking();
             msg.isDead = actor->IsDead(false);
             msg.flags = (actor->GetWeaponMagicDrawn() ? Network::kNpcWeaponDrawn : 0) |
-                        (msg.speed > 260.0f ? Network::kNpcRunning : 0);   // NPC runs are ~300-450, walks ~80-140
+                        (msg.speed > 260.0f ? Network::kNpcRunning : 0) |   // NPC runs are ~300-450, walks ~80-140
+                        (companion ? Network::kNpcCompanion : 0);
             msg.health = Coop::GetHealth(actor);
             net.SendPacket(Network::MessageType::NpcState, &msg, sizeof(msg));
             count++;
@@ -2109,8 +2178,11 @@ namespace F4MP
         if (hx * hx + hy * hy > 2500.0f * 2500.0f) { s_since = now; s_missing.clear(); return; }
         if (now - s_since < std::chrono::seconds(8)) return;   // the host's stream has to settle first
 
+        // The host's companion comes as a copy: our own Piper standing here isn't the host's (in the host's
+        // world she's at the host's side), so it doesn't count as sent.
         std::unordered_set<uint32_t> sent;
-        for (auto& [key, st] : npcs) sent.insert(static_cast<uint32_t>(key));
+        for (auto& [key, st] : npcs)
+            if (!(st.flags & Network::kNpcCompanion)) sent.insert(static_cast<uint32_t>(key));
         const auto claimed = ClaimedFormIds();
         const float radius = Range::Loaded() * 0.5f;   // well inside what the host sends (nearest 128)
         std::vector<RE::Actor*> ghosts;
@@ -2152,14 +2224,15 @@ namespace F4MP
             const uint32_t owner = static_cast<uint32_t>(key >> 32);
             const uint32_t fid = static_cast<uint32_t>(key);
             if (owner == me) continue;
-            RE::Actor* actor = nullptr;
-            if (fid >= DynamicActors::kRuntimeIdStart) {
-                actor = DynamicActors::Resolve(owner, fid);   // owner's runtime ID -> our copy
-            } else {
-                auto* form = RE::TESForm::GetFormByID(fid);
-                actor = form ? form->As<RE::Actor>() : nullptr;
+            // Their companion: only ever our copy of it (never the same NPC in our world, who may be ours).
+            const bool companion = (s.flags & Network::kNpcCompanion) != 0;
+            RE::Actor* actor = companion ? DynamicActors::Resolve(owner, fid) : DynamicActors::ResolveNpc(owner, fid);
+            // The same NPC is OUR companion here (both players took Dogmeat): ours runs with us, theirs is a copy.
+            if (actor && DynamicActors::IsOurCompanion(actor)) {
+                if (g_drivenOwner.erase(actor->GetFormID())) ReleaseDriven(actor->GetFormID());
+                continue;
             }
-            if (actor && !actor->Get3D() && fid < DynamicActors::kRuntimeIdStart && owner == Authority::HostId() && !TravelBusy())
+            if (actor && !actor->Get3D() && !companion && fid < DynamicActors::kRuntimeIdStart && owner == Authority::HostId() && !TravelBusy())
                 PullHostNpc(actor, s);                        // elsewhere (or gone) in our world
             {
                 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_why;
@@ -2186,7 +2259,7 @@ namespace F4MP
                     actor->SetBaseActorValue(*avs->attackDamageMult, 0.0f);
                 }
                 GraphOverride::SetMirror(local, true);   // idles only as its owner's copy plays them
-                REX::INFO("[F4MP] NPC {:#x} mirrored from player {}", local, owner);
+                REX::INFO("[FathersFallout] NPC {:#x} mirrored from player {}", local, owner);
             }
             g_drivenOwner[local] = owner;
             // Its own AI must never fight: it went for a body or the player on sight (testing: a mirrored radroach
@@ -2195,7 +2268,7 @@ namespace F4MP
                 actor->StopCombat();
                 actor->InitiateDoNothingPackage();
                 static int s_calmed = 0;
-                if (s_calmed++ < 20) REX::INFO("[F4MP] mirrored NPC {:#x} went into combat on its own: stopped", local);
+                if (s_calmed++ < 20) REX::INFO("[FathersFallout] mirrored NPC {:#x} went into combat on its own: stopped", local);
             }
 
             // Dead here but alive in its owner's game (the museum raiders were long dead in
@@ -2221,18 +2294,18 @@ namespace F4MP
             if (s.isDead || actor->IsDead(false)) continue;   // corpses ragdoll locally
             if (Activity::MirrorSeated(local)) continue;      // on its owner's seat: the furniture places and animates it
 
-            // Conducir posicion (interpolada suave) + heading, como los cuerpos de jugador.
-            const RE::NiPoint3 objetivo{ s.x, s.y, s.z };
-            const RE::NiPoint3 actual = actor->GetPosition();
-            const RE::NiPoint3 delta = objetivo - actual;
+            // Drive position (smoothly interpolated) + heading, like player bodies.
+            const RE::NiPoint3 goal{ s.x, s.y, s.z };
+            const RE::NiPoint3 bodyPos = actor->GetPosition();
+            const RE::NiPoint3 delta = goal - bodyPos;
             const float dist = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
             if (dist > 1500.0f) {
-                actor->SetPosition(objetivo, true);
+                actor->SetPosition(goal, true);
             } else {
                 const float alpha = 0.35f;
-                actor->SetPosition(RE::NiPoint3{ actual.x + delta.x * alpha,
-                                                 actual.y + delta.y * alpha,
-                                                 actual.z + delta.z * alpha }, true);
+                actor->SetPosition(RE::NiPoint3{ bodyPos.x + delta.x * alpha,
+                                                 bodyPos.y + delta.y * alpha,
+                                                 bodyPos.z + delta.z * alpha }, true);
             }
             auto& anim = g_npcAnim[local];
             // Turn toward the owner's heading over a few ticks (a snap every update looked like twitching).
@@ -2298,13 +2371,13 @@ namespace F4MP
                 if (want != anim.ownerDrawn) {
                     anim.ownerDrawn = want;
                     static int s_logged = 0;
-                    if (s_logged++ < 40) REX::INFO("[F4MP] mirrored NPC {:#x}: owner's copy has its weapon {} (flags {:#x}, ours drawn {} state {})", local,
+                    if (s_logged++ < 40) REX::INFO("[FathersFallout] mirrored NPC {:#x}: owner's copy has its weapon {} (flags {:#x}, ours drawn {} state {})", local,
                         want ? "out" : "away", s.flags, actor->GetWeaponMagicDrawn(), static_cast<int>(actor->weaponState) & 7);
                 }
                 const bool kept = want && KeepDrawn(actor);
                 if (kept) {
                     static int s_kept = 0;
-                    if (s_kept++ < 20) REX::INFO("[F4MP] mirrored NPC {:#x}: its AI started holstering - kept drawn", local);
+                    if (s_kept++ < 20) REX::INFO("[FathersFallout] mirrored NPC {:#x}: its AI started holstering - kept drawn", local);
                 }
                 if (Coop::TakeNpcRedraw(local) && want) {
                     anim.drawAt = t;
@@ -2320,7 +2393,7 @@ namespace F4MP
                         GraphOverride::SendEvent(actor, want ? "WeapEquip" : "Unequip");
                         static int s_stuck = 0;
                         if (s_stuck++ < 20)
-                            REX::INFO("[F4MP] mirrored NPC {:#x}: weapon stuck in state {} - reset, {} again", local,
+                            REX::INFO("[FathersFallout] mirrored NPC {:#x}: weapon stuck in state {} - reset, {} again", local,
                                 ws, want ? "drawing" : "holstering");
                     }
                     anim.drawAt = t;
@@ -2328,7 +2401,7 @@ namespace F4MP
                     actor->DrawWeaponMagicHands(want);
                     static int s_draws = 0;
                     if (s_draws++ < 30)
-                        REX::INFO("[F4MP] mirrored NPC {:#x}: weapon {} (state {} -> {}, drawn now {})", local, want ? "drawn" : "away",
+                        REX::INFO("[FathersFallout] mirrored NPC {:#x}: weapon {} (state {} -> {}, drawn now {})", local, want ? "drawn" : "away",
                             ws, WeaponStateOf(actor), WeaponStateOf(actor) >= 3);
                 }
             }
@@ -2344,23 +2417,23 @@ namespace F4MP
     static void SpawnDummy()
     {
         // 1. Spawnear via consola (funciona de forma fiable).
-        REX::INFO("[F4MP] spawn: placeatme");
+        REX::INFO("[FathersFallout] spawn: placeatme");
         RE::Console::ExecuteCommand("player.placeatme 7 1");
 
-        // 2. El spawn es asincrono: esperar un poco y, en el hilo principal,
-        //    localizar el actor y moverlo a un lado (prueba de spawn+find+move).
+        // 2. The spawn is asynchronous: wait a little, then on the main thread find the actor and move
+        //    it aside (spawn + find + move test).
         std::thread([]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
             F4SE::GetTaskInterface()->AddTask([]() {
                 RE::Actor* actor = FindNearbyActor(kDummyBase, ClaimedFormIds());
-                if (!actor) { REX::WARN("[F4MP] spawn: spawned actor not found"); return; }
+                if (!actor) { REX::WARN("[FathersFallout] spawn: spawned actor not found"); return; }
                 g_dummies.insert(actor->GetFormID());
 
                 auto* pl = RE::PlayerCharacter::GetSingleton();
                 RE::NiPoint3 target = pl ? pl->GetPosition() : RE::NiPoint3{};
                 target.x += 300.0f;  // moverlo 300 unidades a un lado
                 actor->SetPosition(target, true);
-                REX::INFO("[F4MP] spawn: actor {:#x} encontrado y movido", actor->GetFormID());
+                REX::INFO("[FathersFallout] spawn: actor {:#x} wasFound y movido", actor->GetFormID());
             });
         }).detach();
     }
@@ -2369,7 +2442,7 @@ namespace F4MP
     // Travel uses the game's own commands: coc <cell> (interior) / cow <worldspace> x y (exterior),
     // then setpos. The setpos task is queued through F4SE, which holds tasks until the new area has
     // finished loading.
-    static bool g_travelOnJoin = true;          // F4MP.ini [Connect] TravelOnJoin
+    static bool g_travelOnJoin = true;          // FathersFallout.ini [Connect] TravelOnJoin
     static std::atomic<bool> g_travelDone{ false };
     static std::mutex g_travelLock;
     static bool g_travelPending = false;
@@ -2393,9 +2466,9 @@ namespace F4MP
     {
         auto& net = Network::NetworkClient::GetInstance();
         const uint32_t hostId = Authority::HostId();
-        auto remotos = net.GetRemotePlayers();
-        auto it = remotos.find(hostId);
-        if (!net.IsConnected() || g_isHost || it == remotos.end()) {
+        auto remotes = net.GetRemotePlayers();
+        auto it = remotes.find(hostId);
+        if (!net.IsConnected() || g_isHost || it == remotes.end()) {
             if (!a_quiet) Notify("FathersFallout: the host's position isn't known yet");
             return false;
         }
@@ -2429,14 +2502,14 @@ namespace F4MP
             // black screen that took 80-110 s in testing and over 5 minutes for a guest.
             Notify(std::format("FathersFallout: the host is {:.0f} m away - walk over, or use Go to host in the menu",
                 distance * 0.0142875f));
-            REX::INFO("[F4MP] joined {:.0f} units from the host in the same worldspace: no automatic trip", distance);
+            REX::INFO("[FathersFallout] joined {:.0f} units from the host in the same worldspace: no automatic trip", distance);
             return false;
         } else if (travel.empty()) {
             Notify("FathersFallout: can't travel to the host's location (unknown place)");
-            REX::WARN("[F4MP] go to host: no editor id for space {:#x}", target.cellId);
+            REX::WARN("[FathersFallout] go to host: no editor id for space {:#x}", target.cellId);
             return false;
         }
-        REX::INFO("[F4MP] go to host {} at {:.0f} {:.0f} {:.0f} (space {:#x}): {}", hostId, target.x, target.y, target.z,
+        REX::INFO("[FathersFallout] go to host {} at {:.0f} {:.0f} {:.0f} (space {:#x}): {}", hostId, target.x, target.y, target.z,
             target.cellId, travel.empty() ? "same space" : travel);
         Notify(travel.empty() ? "FathersFallout: travelling to the host..."
                               : "FathersFallout: travelling to the host - the black screen can take a minute or two");
@@ -2491,7 +2564,7 @@ namespace F4MP
                 "player.setpos z " + std::to_string(target.z + 20.0f),
             };
             for (auto& c : cmds) RE::Console::ExecuteCommand(c.c_str());
-            REX::INFO("[F4MP] arrived next to the host ({:.0f} {:.0f} {:.0f})", x, y, target.z);
+            REX::INFO("[FathersFallout] arrived next to the host ({:.0f} {:.0f} {:.0f})", x, y, target.z);
             Notify("FathersFallout: you're next to the host");
         });
     }
@@ -2503,9 +2576,9 @@ namespace F4MP
         auto& net = Network::NetworkClient::GetInstance();
         if (!net.IsConnected()) { g_travelDone = false; return; }
         if (g_isHost || !g_travelOnJoin || g_travelDone || g_inIntro) return;
-        auto remotos = net.GetRemotePlayers();
-        auto host = remotos.find(Authority::HostId());
-        if (host == remotos.end() || host->second.cellId == 0) return;   // where the host is isn't known yet
+        auto remotes = net.GetRemotePlayers();
+        auto host = remotes.find(Authority::HostId());
+        if (host == remotes.end() || host->second.cellId == 0) return;   // where the host is isn't known yet
         if (!SettledFor(5)) return;   // let the save finish loading before starting another load
         // Mid-load (a door just taken) we're nowhere: a trip decided now picked the wrong kind.
         if (Authority::LocalSpaceAtomic() == 0) return;
@@ -2545,7 +2618,7 @@ namespace F4MP
     };
     static LooksMenuWatcher g_looksWatcher;
 
-    // Remember connection choices in F4MP.ini so the next session connects by itself.
+    // Remember connection choices in FathersFallout.ini so the next session connects by itself.
     static void SaveConnectIni(bool a_autoConnect)
     {
         const std::string ini = IniPath();
@@ -2554,16 +2627,19 @@ namespace F4MP
         WritePrivateProfileStringA("Connect", "Port", std::to_string(g_serverPort).c_str(), ini.c_str());
         WritePrivateProfileStringA("Connect", "Name", g_playerName, ini.c_str());
         WritePrivateProfileStringA("Connect", "Host", g_isHost ? "1" : "0", ini.c_str());
+        WritePrivateProfileStringA("Connect", "Password", g_password, ini.c_str());
     }
 
-    // Host without ServerExe set: look for F4MPServer.exe in the usual places.
+    // Host without ServerExe set: look for the server in the usual places.
     static void FindServerExe()
     {
         if (!g_serverExe.empty()) return;
         const std::string plugins = IniPath().substr(0, IniPath().find_last_of("\\/"));
         const std::string candidates[] = {
+            plugins + "\\server\\FathersFalloutServer.exe",
+            plugins + "\\F4MP-server\\FathersFalloutServer.exe",
             plugins + "\\F4MP-server\\F4MPServer.exe",
-            plugins + "\\..\\..\\..\\F4MP-server\\F4MPServer.exe",   // game folder\F4MP-server
+            plugins + "\\..\\..\\..\\F4MP-server\\F4MPServer.exe",   // game folder\F4MP-server (old versions)
         };
         for (auto& c : candidates) {
             if (GetFileAttributesA(c.c_str()) != INVALID_FILE_ATTRIBUTES) {
@@ -2574,7 +2650,7 @@ namespace F4MP
         }
     }
 
-    // ---- Pagina del menu (la dibuja el framework) ----
+    // ---- Menu page (drawn by the menu framework) ----
     static void RenderPlayTogether()
     {
         auto& net = Network::NetworkClient::GetInstance();
@@ -2583,8 +2659,8 @@ namespace F4MP
         if (net.IsConnected()) {
             ImGuiMCP::TextColored(ImGuiMCP::ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Connected to %s as %s (%s)",
                 net.GetTarget().c_str(), g_playerName, g_isHost ? "host" : "joined");
-            auto remotos = net.GetRemotePlayers();
-            ImGuiMCP::Text("Other players here: %d", (int)remotos.size());
+            auto remotes = net.GetRemotePlayers();
+            ImGuiMCP::Text("Other players here: %d", (int)remotes.size());
             if (!g_isHost) {
                 if (ImGuiMCP::Button("Go to host")) GoToHost();
                 ImGuiMCP::SameLine();
@@ -2641,6 +2717,7 @@ namespace F4MP
                 ImGuiMCP::InputTextWithHint("Host's IP", "e.g. 203.0.113.25", g_serverAddr, sizeof(g_serverAddr));
                 ImGuiMCP::InputInt("Port", &g_serverPort);
             }
+            ImGuiMCP::InputTextWithHint("Password", "only if the host set one", g_password, sizeof(g_password), ImGuiMCP::ImGuiInputTextFlags_Password);
             ImGuiMCP::Checkbox("Join automatically next time a save loads", &s_auto);
             if (ImGuiMCP::Checkbox("Travel to the host when I join", &g_travelOnJoin))
                 WritePrivateProfileStringA("Connect", "TravelOnJoin", g_travelOnJoin ? "1" : "0", IniPath().c_str());
@@ -2657,21 +2734,29 @@ namespace F4MP
         } else {
             FindServerExe();
             ImGuiMCP::InputInt("Port", &g_serverPort);
+            ImGuiMCP::InputTextWithHint("Password", "empty = anyone who finds your game can join", g_password, sizeof(g_password), ImGuiMCP::ImGuiInputTextFlags_Password);
+            ImGuiMCP::TextDisabled("Friends type the same password when they join. Don't use your Steam or email password.");
             ImGuiMCP::Checkbox("Host automatically next time a save loads", &s_auto);
             if (ImGuiMCP::Button("Host a game")) {
                 g_isHost = true;
+                g_serverRestarted = false;
                 std::snprintf(g_serverAddr, sizeof(g_serverAddr), "127.0.0.1");
                 SaveConnectIni(s_auto);
                 RefreshInIntro();
                 ConnectNow(2);
             }
             if (g_serverExe.empty())
-                ImGuiMCP::TextWrapped("Start F4MPServer.exe first (or set ServerExe= in F4MP.ini to have it started for you).");
+                ImGuiMCP::TextWrapped("Start FathersFalloutServer.exe first (or set ServerExe= in FathersFallout.ini to have it started for you).");
             else
                 ImGuiMCP::TextDisabled("Starts the server for you: %s", g_serverExe.c_str());
             if (Network::SteamLink::Available()) {
                 if (ImGuiMCP::Checkbox("Let Steam friends join (no IP or port forwarding)", &g_steamHosting))
                     WritePrivateProfileStringA("Connect", "Steam", g_steamHosting ? "1" : "0", IniPath().c_str());
+                bool friendsOnly = Network::SteamLink::FriendsOnly();
+                if (ImGuiMCP::Checkbox("Steam: only people on my friends list", &friendsOnly)) {
+                    Network::SteamLink::SetFriendsOnly(friendsOnly);
+                    WritePrivateProfileStringA("Connect", "SteamFriendsOnly", friendsOnly ? "1" : "0", IniPath().c_str());
+                }
                 ImGuiMCP::TextDisabled("Your friend code: %llu  (%s)", Network::SteamLink::MySteamId() & 0xFFFFFFFFull, Network::SteamLink::MyName().c_str());
                 if (Network::SteamLink::IsHosting())
                     ImGuiMCP::TextDisabled("Hosting through Steam: %d friend(s) joined that way.", Network::SteamLink::RelayedPlayers());
@@ -2793,7 +2878,7 @@ namespace F4MP
         }
     }
 
-    // ---- HUD: marcador flotante sobre cada jugador remoto (mundo -> pantalla) ----
+    // ---- HUD: a floating tag over each remote player (world -> screen) ----
     static void __stdcall RenderHud()
     {
         auto& net = Network::NetworkClient::GetInstance();
@@ -2803,8 +2888,16 @@ namespace F4MP
         if (!local) return;
         const RE::NiPoint3 myPos = local->GetPosition();
 
-        // Not over a loading screen.
-        if (auto* ui = RE::UI::GetSingleton(); ui && ui->GetMenuOpen("LoadingMenu")) return;
+        // Not over a loading screen, the F1 menu
+        // (tags were drawn over its text) or the game's full-screen menus.
+        if (F4SEMenuFramework::IsAnyBlockingWindowOpened()) return;
+        if (auto* ui = RE::UI::GetSingleton()) {
+            static constexpr const char* kCovering[] = { "LoadingMenu", "PipboyMenu", "PauseMenu", "MainMenu", "LooksMenu",
+                "ContainerMenu", "BarterMenu", "TerminalMenu", "LevelUpMenu", "SPECIALMenu", "CookingMenu", "ExamineMenu",
+                "Console", "BookMenu" };
+            for (const char* m : kCovering)
+                if (ui->GetMenuOpen(m)) return;
+        }
 
         auto* io = ImGuiMCP::GetIO();
         if (!io) return;
@@ -2825,14 +2918,14 @@ namespace F4MP
             DL::AddText(dl, ImVec2(x, y), c, t);
         };
 
-        auto remotos = net.GetRemotePlayers();
+        auto remotes = net.GetRemotePlayers();
         const uint32_t mySpace = Authority::LocalSpaceAtomic();
         std::unordered_map<uint32_t, RE::NiPoint3> bodyAt;
         {
             std::lock_guard l(g_tagLock);
             bodyAt = g_tagBodyPos;
         }
-        for (const auto& [id, p] : remotos) {
+        for (const auto& [id, p] : remotes) {
             // Another interior / worldspace: its coordinates mean nothing here (the tag floated in a
             // random spot of ours).
             if (p.cellId && mySpace && p.cellId != mySpace) continue;
@@ -2841,7 +2934,7 @@ namespace F4MP
             if (auto b = bodyAt.find(id); b != bodyAt.end()) at = b->second;
             // Anchor a little above the head.
             RE::NiPoint3 anchorS = RE::HUDMenuUtils::WorldPtToScreenPt3(RE::NiPoint3{ at.x, at.y, at.z + 135.0f });
-            if (anchorS.z <= 0.0f) continue;  // detras de la camara
+            if (anchorS.z <= 0.0f) continue;  // behind the camera
             if (anchorS.x < -0.1f || anchorS.x > 1.1f || anchorS.y < -0.1f || anchorS.y > 1.1f) continue;
             const float ax = anchorS.x * W, ay = (1.0f - anchorS.y) * H;
 
@@ -2887,17 +2980,17 @@ namespace F4MP
         if (s_registered) return;
         s_registered = true;
         if (!F4SEMenuFramework::IsInstalled()) {
-            REX::INFO("[F4MP] F4SE Menu Framework NOT installed: no menu");
+            REX::INFO("[FathersFallout] F4SE Menu Framework NOT installed: no menu");
             return;
         }
         F4SEMenuFramework::AddHudElement(OnFrameHud);
         F4SEMenuFramework::SetSection("FathersFallout");
         F4SEMenuFramework::AddSectionItem("Menu", RenderMenu);
         F4SEMenuFramework::AddHudElement(RenderHud);
-        REX::INFO("[F4MP] menu + HUD registered");
+        REX::INFO("[FathersFallout] menu + HUD registered");
     }
 
-    // Optional Data\F4SE\Plugins\F4MP.ini:
+    // Optional Data\F4SE\Plugins\FathersFallout.ini:
     //   [Connect]
     //   AutoConnect=1        connect as soon as a save finishes loading
     //   Server=127.0.0.1
@@ -2919,11 +3012,13 @@ namespace F4MP
             g_serverExe = exe;
             g_isHost = GetPrivateProfileIntA("Connect", "Host", 0, ini) != 0;
             g_steamHosting = GetPrivateProfileIntA("Connect", "Steam", 1, ini) != 0;
+            GetPrivateProfileStringA("Connect", "Password", "", g_password, sizeof(g_password), ini);
+            Network::SteamLink::SetFriendsOnly(GetPrivateProfileIntA("Connect", "SteamFriendsOnly", 1, ini) != 0);
             g_travelOnJoin = GetPrivateProfileIntA("Connect", "TravelOnJoin", 1, ini) != 0;
             Coop::GetSettings().friendlyFire = GetPrivateProfileIntA("Sync", "FriendlyFire", 1, ini) != 0;
         }
         if (!GetPrivateProfileIntA("Connect", "AutoConnect", 0, ini)) return;
-        if (RefreshInIntro()) { NotifyIntro(); REX::INFO("[F4MP] auto-connect skipped: this save is in the pre-war intro"); return; }
+        if (RefreshInIntro()) { NotifyIntro(); REX::INFO("[FathersFallout] auto-connect skipped: this save is in the pre-war intro"); return; }
         s_done = true;
 
         GetPrivateProfileStringA("Connect", "Server", g_serverAddr, g_serverAddr, sizeof(g_serverAddr), ini);
@@ -2932,7 +3027,7 @@ namespace F4MP
         g_isHost = GetPrivateProfileIntA("Connect", "Host", 0, ini) != 0;
 
         ConnectNow(5);  // ~1 min of attempts: covers starting the game before the server
-        REX::INFO("[F4MP] auto-connect to {}:{} as '{}' ({})", g_serverAddr, g_serverPort, g_playerName,
+        REX::INFO("[FathersFallout] auto-connect to {}:{} as '{}' ({})", g_serverAddr, g_serverPort, g_playerName,
             g_isHost ? "host" : "client");
     }
 
@@ -2963,9 +3058,9 @@ namespace F4MP
             auto* alwaysActive = RE::GetINISetting("bAlwaysActive:General");
             if (alwaysActive && alwaysActive->GetType() == RE::Setting::SETTING_TYPE::kBinary) {
                 alwaysActive->SetBinary(true);
-                REX::INFO("[F4MP] bAlwaysActive forced on (game keeps running when unfocused)");
+                REX::INFO("[FathersFallout] bAlwaysActive forced on (game keeps running when unfocused)");
             } else {
-                REX::WARN("[F4MP] bAlwaysActive:General not found; game will pause when unfocused");
+                REX::WARN("[FathersFallout] bAlwaysActive:General not found; game will pause when unfocused");
             }
 
             if (!g_netThreadStarted.exchange(true)) {
@@ -2985,10 +3080,10 @@ namespace F4MP
                 PlayerEvents::SetLogAll(g_bodyTrace);
                 PlayerEvents::Install();
                 if (auto* ui = RE::UI::GetSingleton()) ui->RegisterSink<RE::MenuOpenCloseEvent>(&g_looksWatcher);
-                if (g_consoleBridge) REX::WARN("[F4MP] console bridge ON (debug/testing only)");
+                if (g_consoleBridge) REX::WARN("[FathersFallout] console bridge ON (debug/testing only)");
                 LoadSaveFromLauncher();
                 std::thread(NetThread).detach();
-                REX::INFO("[F4MP] network ready, network thread running");
+                REX::INFO("[FathersFallout] network ready, network thread running");
             }
         }
     }
@@ -2997,8 +3092,8 @@ namespace F4MP
 F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4SE::Init(a_f4se);
-    REX::INFO("[F4MP] FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb (GPL v3 + NOTICE)");
-    REX::INFO("[F4MP] plugin loaded (CommonLibF4)");
+    REX::INFO("[FathersFallout] FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb (GPL v3 + NOTICE)");
+    REX::INFO("[FathersFallout] plugin loaded (CommonLibF4)");
     F4MP::CrashLog::Install();
 
     F4SE::GetMessagingInterface()->RegisterListener(F4MP::OnMessage);

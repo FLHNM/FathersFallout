@@ -7,6 +7,37 @@
 #include <algorithm>
 #include <cctype>
 
+namespace {
+    constexpr int kHandshakeSeconds = 10;        // a connection must say who it is within this
+    constexpr size_t kMaxPending = 16;           // connections waiting for their handshake at once
+    constexpr int kMaxBadPasswords = 5;          // per address per minute, then it waits a minute
+    constexpr uint32_t kMaxMessagesPerSecond = 6000;   // a host in a busy area sends ~1500/s
+    // Close reasons (GNS application range 1000+); the text reaches the other game as the end reason.
+    constexpr int kEndProtocol = 1001, kEndFull = 1002, kEndPassword = 1003, kEndLocked = 1004,
+                  kEndTimeout = 1005, kEndNeedsUpdate = 1006;
+
+    // Player names come from the other game: printable, trimmed, never empty.
+    std::string CleanName(const char* raw, size_t cap) {
+        std::string out;
+        for (size_t i = 0; i < cap && raw[i]; ++i) {
+            const unsigned char c = static_cast<unsigned char>(raw[i]);
+            if (c >= 0x20 && c != 0x7F) out += static_cast<char>(c);
+        }
+        out.erase(0, out.find_first_not_of(' '));
+        out.erase(out.find_last_not_of(' ') + 1);
+        return out.empty() ? std::string("Wanderer") : out;
+    }
+
+    // Same time whatever matches, so a wrong password can't be guessed a letter at a time.
+    bool SamePassword(const std::string& a, const char* b, size_t cap) {
+        const size_t lb = strnlen(b, cap);
+        unsigned diff = static_cast<unsigned>(a.size() ^ lb);
+        for (size_t i = 0; i < cap; ++i)
+            diff |= static_cast<unsigned char>(i < a.size() ? a[i] : 0) ^ static_cast<unsigned char>(i < lb ? b[i] : 0);
+        return diff == 0;
+    }
+}
+
 GameServer& GameServer::GetInstance() {
     static GameServer instance;
     return instance;
@@ -29,10 +60,10 @@ bool GameServer::Initialize(uint16_t port) {
         return false;
     }
 
-    // Permitir conexiones IP sin autenticacion de Steam.
+    // Allow plain IP connections (no Steam authentication).
     SteamNetworkingUtils()->SetGlobalConfigValueInt32(k_ESteamNetworkingConfig_IP_AllowWithoutAuth, 1);
 
-    // Registrar el callback global de cambios de estado de conexion.
+    // Global callback for connection state changes.
     SteamNetworkingUtils()->SetGlobalCallback_SteamNetConnectionStatusChanged(&GameServer::OnConnStatusChangedStatic);
 
     SteamNetworkingIPAddr bindAddr;
@@ -59,7 +90,7 @@ bool GameServer::Initialize(uint16_t port) {
     m_initialized = true;
     m_running = true;
 
-    // Hilo de heartbeat al master server (si esta configurado).
+    // Heartbeat thread to the master server (when one is set).
     if (!m_master.empty()) {
         std::thread([this]() {
             while (m_running) {
@@ -69,7 +100,7 @@ bool GameServer::Initialize(uint16_t port) {
                     players = GetPlayerCount();
                 }
                 Heartbeat::Send(m_master, m_name, m_port, players, m_maxPlayers);
-                // dormir 10s comprobando m_running cada 100ms para salir rapido
+                // sleep 10 s, checking m_running every 100 ms to quit quickly
                 for (int i = 0; i < 100 && m_running; ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
@@ -82,6 +113,7 @@ bool GameServer::Initialize(uint16_t port) {
     spdlog::info("  Port        : {}", port);
     spdlog::info("  Players     : 0/{}", m_maxPlayers);
     spdlog::info("  Tick rate   : {}/s", m_tickRate);
+    spdlog::info("  Password    : {}", m_password.empty() ? "none (anyone who can reach this port can join)" : "on");
     spdlog::info("  Listening for connections...");
     spdlog::info("  Type 'help' for commands.");
     spdlog::info("========================================");
@@ -129,7 +161,7 @@ void GameServer::Run() {
             lastTick = now;
         }
 
-        // Estado periodico cada 30 segundos (estilo Rust).
+        // Status line every 30 s.
         if (std::chrono::duration<float>(now - m_lastStatus).count() >= 30.0f) {
             PrintStatus();
             m_lastStatus = now;
@@ -140,8 +172,9 @@ void GameServer::Run() {
 }
 
 void GameServer::Update() {
-    // Procesa estados de conexion (dispara OnConnStatusChanged) y mensajes.
+    // Connection state changes (fires OnConnStatusChanged), then messages.
     m_sockets->RunCallbacks();
+    DropStaleHandshakes();
     ProcessMessages();
     ProcessConsoleCommands();
 }
@@ -154,25 +187,104 @@ uint32_t GameServer::GetPlayerCount() const {
     return count;
 }
 
-void GameServer::HandleConnectionRequest(HSteamNetConnection conn, const ConnectionRequestMsg* msg) {
+void GameServer::Refuse(HSteamNetConnection conn, int reason, const char* why) {
+    m_pending.erase(conn);
+    m_rates.erase(conn);
+    m_sockets->CloseConnection(conn, reason, why, false);
+}
+
+void GameServer::DropStaleHandshakes() {
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = m_pending.begin(); it != m_pending.end();) {
+        if (now - it->second > std::chrono::seconds(kHandshakeSeconds)) {
+            const HSteamNetConnection conn = it->first;
+            it = m_pending.erase(it);
+            m_rates.erase(conn);
+            m_sockets->CloseConnection(conn, kEndTimeout, "No handshake", false);
+            spdlog::warn("[Server] a connection sent no handshake in {} s: closed", kHandshakeSeconds);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// A connection sending more than kMaxMessagesPerSecond has the rest of that second dropped (true = drop).
+bool GameServer::OverRateLimit(HSteamNetConnection conn) {
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    // Neither joined nor waiting for its handshake (refused or closed a moment ago): nothing to read.
+    if (!m_clients.count(conn) && !m_pending.count(conn)) return true;
+    const auto now = std::chrono::steady_clock::now();
+    auto& r = m_rates[conn];
+    if (now - r.windowStart >= std::chrono::seconds(1)) {
+        if (r.dropped)
+            spdlog::warn("[Server] connection {} sent too much: {} messages dropped last second", conn, r.dropped);
+        r.windowStart = now;
+        r.count = 0;
+        r.dropped = 0;
+    }
+    if (++r.count <= kMaxMessagesPerSecond) return false;
+    ++r.dropped;
+    return true;
+}
+
+void GameServer::HandleConnectionRequest(HSteamNetConnection conn, const ConnectionRequestMsg& msg, bool hasPassword) {
     std::lock_guard<std::mutex> lock(m_clientsMutex);
 
-    if (msg->protocolVersion != PROTOCOL_VERSION) {
-        spdlog::warn("[Server] Connection rejected: protocol {} (server {})", msg->protocolVersion, PROTOCOL_VERSION);
-        m_sockets->CloseConnection(conn, 0, "Protocol version mismatch", false);
+    if (m_clients.count(conn)) return;   // a second handshake on the same connection: already in
+
+    SteamNetConnectionInfo_t info{};
+    m_sockets->GetConnectionInfo(conn, &info);
+    char addrBuf[SteamNetworkingIPAddr::k_cchMaxString]{};
+    info.m_addrRemote.ToString(addrBuf, sizeof(addrBuf), false);
+    // Steam guests come in through the host's game on this PC (127.0.0.1): never locked out here,
+    // or the host would be too; the host's Steam relay counts those per Steam account instead.
+    const bool local = info.m_addrRemote.IsLocalHost();
+    const std::string addr = addrBuf;
+    const std::string name = CleanName(msg.playerName, sizeof(msg.playerName));
+    const auto now = std::chrono::steady_clock::now();
+
+    if (msg.protocolVersion != PROTOCOL_VERSION) {
+        spdlog::warn("[Server] Connection rejected: protocol {} (server {})", msg.protocolVersion, PROTOCOL_VERSION);
+        const std::string why = "Different FathersFallout version (host protocol " + std::to_string(PROTOCOL_VERSION) +
+                                ", yours " + std::to_string(msg.protocolVersion) + ") - everyone needs the same update";
+        Refuse(conn, kEndProtocol, why.c_str());
         return;
+    }
+
+    if (!m_password.empty()) {
+        auto& bad = m_badTries[addr];
+        if (!local && now < bad.lockedUntil) {
+            spdlog::warn("[Server] {} refused: too many wrong passwords from this address", name);
+            Refuse(conn, kEndLocked, "Too many wrong passwords - wait a minute and try again");
+            return;
+        }
+        if (!hasPassword) {
+            spdlog::warn("[Server] {} refused: their FathersFallout is too old for a password", name);
+            Refuse(conn, kEndNeedsUpdate, "This host uses a password: update FathersFallout to Update 23 or newer");
+            return;
+        }
+        if (!SamePassword(m_password, msg.password, sizeof(msg.password))) {
+            if (now - bad.first > std::chrono::minutes(1)) { bad.first = now; bad.count = 0; }
+            if (++bad.count >= kMaxBadPasswords && !local) bad.lockedUntil = now + std::chrono::minutes(1);
+            spdlog::warn("[Server] {} refused: wrong password", name);
+            Refuse(conn, kEndPassword, "Wrong password");
+            return;
+        }
+        m_badTries.erase(addr);
     }
 
     if (m_clients.size() >= m_maxPlayers) {
         spdlog::warn("[Server] Connection rejected: server full");
-        m_sockets->CloseConnection(conn, 0, "Server full", false);
+        Refuse(conn, kEndFull, "Server full");
         return;
     }
+    m_pending.erase(conn);
 
     ClientInfo client{};
     client.id = m_nextClientId++;
     client.connection = conn;
-    client.name = msg->playerName;
+    client.name = name;
     client.isConnected = true;
     client.lastUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
@@ -184,7 +296,7 @@ void GameServer::HandleConnectionRequest(HSteamNetConnection conn, const Connect
     acceptMsg.currentPlayers = GetPlayerCount();
     acceptMsg.maxPlayers = m_maxPlayers;
 
-    // Enviamos el ConnectionAccepted con su cabecera para que el cliente lo entienda.
+    // ConnectionAccepted with its header, the way the game reads it.
     MessageHeader header;
     header.type = MessageType::ConnectionAccepted;
     header.size = sizeof(MessageHeader) + sizeof(acceptMsg);
@@ -218,9 +330,8 @@ void GameServer::HandlePlayerPosition(HSteamNetConnection conn, const PlayerPosi
         it->second.lastUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
 
-        // Sobreescribimos el playerId con el ID autoritativo del servidor.
-        // Asi no dependemos de que el cliente lo ponga bien (el simulador no lo
-        // pone y saldria como "jugador 0"), y evitamos suplantaciones.
+        // The playerId is overwritten with the server's own id for this connection: no relying on the
+        // sender to fill it in, and no posing as someone else.
         PlayerPositionMsg out = *msg;
         out.playerId = it->second.id;
         BroadcastMessage(MessageType::PlayerPosition, &out, sizeof(out), it->second.id);
@@ -234,6 +345,7 @@ void GameServer::HandleChatMessage(HSteamNetConnection conn, const ChatMessageMs
     if (it != m_clients.end()) {
         ChatMessageMsg broadcastMsg = *msg;
         broadcastMsg.senderId = it->second.id;
+        broadcastMsg.message[sizeof(broadcastMsg.message) - 1] = '\0';   // never relay an unterminated string
         BroadcastMessage(MessageType::ChatMessage, &broadcastMsg, sizeof(broadcastMsg), 0);
     }
 }
@@ -242,7 +354,7 @@ void GameServer::HandleNpcState(HSteamNetConnection conn, const NpcStateMsg* msg
     std::lock_guard<std::mutex> lock(m_clientsMutex);
     auto it = m_clients.find(conn);
     if (it == m_clients.end()) return;
-    // Reenviar tal cual al resto (lo manda el host). El servidor no interpreta el NPC.
+    // Relayed as is to everyone else (the NPC's owner sends it); the server doesn't read it.
     BroadcastMessage(MessageType::NpcState, msg, sizeof(NpcStateMsg), it->second.id);
 }
 
@@ -263,17 +375,17 @@ void GameServer::HandlePlayerAppearance(HSteamNetConnection conn, const PlayerAp
     auto it = m_clients.find(conn);
     if (it == m_clients.end()) return;
 
-    // Guardar con el id autoritativo del servidor.
+    // Stored with the server's id for this connection.
     PlayerAppearanceMsg mine = *msg;
     mine.playerId = it->second.id;
     it->second.appearance = mine;
     it->second.hasAppearance = true;
 
-    // 1. Repartir mi apariencia a los demas.
+    // 1. Send this player's appearance to the others.
     BroadcastMessage(MessageType::PlayerAppearance, &mine, sizeof(mine), it->second.id);
 
-    // 2. Enviar al recien llegado las apariencias ya conocidas (directo a su conn,
-    //    sin SendMessageToClient para no re-bloquear el mutex).
+    // 2. Send the newcomer the appearances already known (straight to its connection: not through
+    //    SendMessageToClient, which would lock the mutex again).
     for (auto& [c, cl] : m_clients) {
         if (c == conn || !cl.hasAppearance) continue;
         MessageHeader header;
@@ -357,14 +469,21 @@ void GameServer::ProcessMessages() {
 
     for (int i = 0; i < msgCount; ++i) {
         SteamNetworkingMessage_t* msg = msgs[i];
+        if (OverRateLimit(msg->m_conn)) { msg->Release(); continue; }
         if (msg->m_cbSize >= (int)sizeof(MessageHeader)) {
             const auto* header = reinterpret_cast<const MessageHeader*>(msg->m_pData);
             const void* payload = reinterpret_cast<const uint8_t*>(msg->m_pData) + sizeof(MessageHeader);
 
             switch (header->type) {
-                case MessageType::ConnectionRequest:
-                    if (auto* m = PayloadAs<ConnectionRequestMsg>(msg)) HandleConnectionRequest(msg->m_conn, m);
+                case MessageType::ConnectionRequest: {
+                    // Update 22 and older send the request without the password field.
+                    const size_t got = (size_t)msg->m_cbSize - sizeof(MessageHeader);
+                    if (got < kConnectionRequestV1Size) break;
+                    ConnectionRequestMsg req{};
+                    memcpy(&req, payload, std::min(got, sizeof(req)));
+                    HandleConnectionRequest(msg->m_conn, req, got >= sizeof(req));
                     break;
+                }
                 case MessageType::PlayerPosition:
                     if (auto* m = PayloadAs<PlayerPositionMsg>(msg)) HandlePlayerPosition(msg->m_conn, m);
                     break;
@@ -399,11 +518,20 @@ void GameServer::OnConnStatusChangedStatic(SteamNetConnectionStatusChangedCallba
 void GameServer::OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_t* info) {
     switch (info->m_info.m_eState) {
         case k_ESteamNetworkingConnectionState_Connecting: {
-            // Nueva conexion entrante: aceptar y meterla en el poll group.
+            // New incoming connection: accept it and add it to the poll group.
             if (m_sockets->AcceptConnection(info->m_hConn) != k_EResultOK) {
                 m_sockets->CloseConnection(info->m_hConn, 0, nullptr, false);
                 spdlog::warn("[Server] Failed to accept connection");
                 break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_clientsMutex);
+                if (m_pending.size() >= kMaxPending) {
+                    m_sockets->CloseConnection(info->m_hConn, kEndFull, "Too many connections waiting", false);
+                    spdlog::warn("[Server] refused a connection: {} already waiting for their handshake", m_pending.size());
+                    break;
+                }
+                m_pending[info->m_hConn] = std::chrono::steady_clock::now();
             }
             m_sockets->SetConnectionPollGroup(info->m_hConn, m_pollGroup);
             spdlog::info("[Server] Connection accepted, waiting for handshake");
@@ -413,6 +541,8 @@ void GameServer::OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_t* 
         case k_ESteamNetworkingConnectionState_ClosedByPeer:
         case k_ESteamNetworkingConnectionState_ProblemDetectedLocally: {
             std::lock_guard<std::mutex> lock(m_clientsMutex);
+            m_pending.erase(info->m_hConn);
+            m_rates.erase(info->m_hConn);
             auto it = m_clients.find(info->m_hConn);
             if (it != m_clients.end()) {
                 std::string leftName = it->second.name;
@@ -426,7 +556,7 @@ void GameServer::OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_t* 
                 m_clients.erase(it);
 
                 BroadcastMessage(MessageType::ChatMessage, &leaveMsg, sizeof(leaveMsg), playerId);
-                // Avisar a los demas para que borren su cuerpo AL INSTANTE.
+                // Tell the others so they remove the body AT ONCE.
                 PlayerLeftMsg leftPkt{ playerId };
                 BroadcastMessage(MessageType::Disconnect, &leftPkt, sizeof(leftPkt), playerId);
                 spdlog::info("[-] {} left  - players {}/{}", leftName, GetPlayerCount(), m_maxPlayers);
@@ -440,7 +570,7 @@ void GameServer::OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_t* 
     }
 }
 
-// ===================== Consola de administracion =====================
+// ===================== Admin console =====================
 
 double GameServer::UptimeSeconds() const {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - m_startTime).count();
@@ -528,8 +658,9 @@ void GameServer::CmdKick(uint32_t id) {
         if (it->second.id == id) {
             std::string name = it->second.name;
             m_sockets->CloseConnection(it->first, 0, "Kicked by admin", false);
+            m_rates.erase(it->first);
             m_clients.erase(it);
-            // Avisar a los demas para que borren su cuerpo AL INSTANTE.
+            // Tell the others so they remove the body AT ONCE.
             PlayerLeftMsg leftPkt{ id };
             BroadcastMessage(MessageType::Disconnect, &leftPkt, sizeof(leftPkt), id);
             spdlog::info("[admin] '{}' (ID {}) kicked", name, id);

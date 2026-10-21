@@ -106,6 +106,6 @@ namespace F4MP::CrashLog
             CoTaskMemFree(docs);
         }
         g_previous = SetUnhandledExceptionFilter(OnCrash);
-        REX::INFO("[F4MP] crash logger installed{}", g_previous ? " (chained to an earlier crash handler)" : "");
+        REX::INFO("[FathersFallout] crash logger installed{}", g_previous ? " (chained to an earlier crash handler)" : "");
     }
 }
