@@ -1,6 +1,6 @@
 # Known issues & what's being worked on
 
-Update 24.1 (alpha). Already known - no need to report these unless you have new details.
+Update 24.2 (alpha). Already known - no need to report these unless you have new details.
 
 ## Known issues
 

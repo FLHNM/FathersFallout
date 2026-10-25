@@ -1304,13 +1304,16 @@ namespace F4MP
         }
     }
 
-    // Called on F4SE kPreSaveGame: never write bodies into the save. They respawn ~3 s later
+    static std::chrono::steady_clock::time_point g_travelHoldUntil;   // no body spawns before (fast travel)
+    static std::chrono::steady_clock::time_point g_travelGoneAt;      // when we let a fast travel go
+
+    // Bodies, their lights and the frames we gave them leave the world. They respawn ~3 s later
     // through the normal "body is gone" path; these respawns don't count against the cap.
-    static void DespawnBodiesForSave()
+    static void RemoveBodiesFromWorld(const char* why)
     {
         for (auto& [pid, fid] : g_bodies) DespawnBody(fid);
         if (!g_bodies.empty())
-            REX::INFO("[FathersFallout] saving: removed {} body(ies) so they are not stored in the save", g_bodies.size());
+            REX::INFO("[FathersFallout] {}: removed {} body(ies) so they are not stored in the save", why, g_bodies.size());
         g_spawnCount -= std::min<uint32_t>(g_spawnCount, static_cast<uint32_t>(g_bodies.size()));
         g_bodies.clear();
         g_lastHeading.clear();
@@ -1318,6 +1321,108 @@ namespace F4MP
         g_spawnAt = std::chrono::steady_clock::now();
         Activity::Reset();   // the frames we gave bodies (runtime references) mustn't go into the save either
         BodyLights::Clear(); // nor their lights
+    }
+
+    // Called on F4SE kPreSaveGame: never write bodies into the save.
+    // A fast travel's autosave runs while the loading screen is up, next to the game's own
+    // work. Removing bodies then raced the save writing them: it crashed reading a body whose cell
+    // was already gone (Fallout4+0xBF74BD). Those bodies left before the trip (QueueFastTravelHook),
+    // so that save leaves the world alone.
+    static void DespawnBodiesForSave()
+    {
+        if (std::chrono::steady_clock::now() - g_travelGoneAt < std::chrono::seconds(10)) {
+            if (!g_bodies.empty())
+                REX::WARN("[FathersFallout] fast travel save with {} body(ies) out: left as they are", g_bodies.size());
+            return;
+        }
+        RemoveBodiesFromWorld("saving");
+    }
+
+    // Fast travel: the game asks for it from menus and scripts. We hold the request, remove the bodies
+    // in our own frame task (like any despawn), and let the trip (and its autosave) go a few frames
+    // later, once the game has released their 3D (at most ~1.5 s).
+    struct PendingTravel
+    {
+        bool active = false;
+        bool removed = false;
+        RE::ObjectRefHandle marker;
+        bool autoSave = false;
+        std::vector<uint32_t> fids;
+        std::chrono::steady_clock::time_point since;
+    };
+    static PendingTravel g_travel;
+    static std::mutex g_fastTravelLock;
+    // The marker handle comes by pointer (every caller does lea rdx).
+    using QueueFastTravelFn = void (*)(RE::PlayerCharacter*, const RE::ObjectRefHandle*, bool);
+    static REL::Relocation<QueueFastTravelFn> g_queueFastTravel{ RE::ID::PlayerCharacter::QueueFastTravel };
+
+    static void QueueFastTravelHook(RE::PlayerCharacter* a_this, const RE::ObjectRefHandle* a_marker, bool a_allowAutoSave)
+    {
+        {
+            std::lock_guard l(g_fastTravelLock);
+            if (g_travel.active) { g_travel.marker = *a_marker; g_travel.autoSave = a_allowAutoSave; return; }
+            if (!g_bodies.empty() && a_marker) {
+                g_travel = { true, false, *a_marker, a_allowAutoSave, {}, std::chrono::steady_clock::now() };
+                g_travelHoldUntil = g_travel.since + std::chrono::seconds(15);
+                return;
+            }
+        }
+        g_travelGoneAt = std::chrono::steady_clock::now();
+        g_queueFastTravel(a_this, a_marker, a_allowAutoSave);
+    }
+
+    // Runs every frame (BodiesSync).
+    static void PollPendingTravel()
+    {
+        std::unique_lock l(g_fastTravelLock);
+        if (!g_travel.active) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (!g_travel.removed) {
+            for (auto& [pid, fid] : g_bodies) g_travel.fids.push_back(fid);
+            RemoveBodiesFromWorld("fast travel");
+            g_travel.removed = true;
+            g_travel.since = now;
+            return;
+        }
+        const auto waited = now - g_travel.since;
+        bool gone = true;
+        for (uint32_t fid : g_travel.fids) {
+            auto* form = RE::TESForm::GetFormByID(fid);
+            auto* ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
+            if (g_bodyTrace && ref)
+                REX::INFO("[Trace] travel wait: body {:#x} deleted {} cell {} 3D {}", fid, ref->IsDeleted(),
+                    static_cast<const void*>(ref->GetParentCell()), static_cast<const void*>(ref->Get3D()));
+            // A deleted reference stays listed until its cell unloads; once its 3D is released it is
+            // in the state every other save has handled fine.
+            if (ref && (!ref->IsDeleted() || ref->Get3D())) gone = false;
+        }
+        if (waited < std::chrono::milliseconds(250) || (!gone && waited < std::chrono::milliseconds(1500))) return;
+        const PendingTravel t = g_travel;
+        g_travel = {};
+        l.unlock();
+        REX::INFO("[FathersFallout] fast travel goes ahead after {} ms (bodies released: {})",
+            std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(), gone);
+        g_travelGoneAt = now;
+        if (auto* pl = RE::PlayerCharacter::GetSingleton()) g_queueFastTravel(pl, &t.marker, t.autoSave);
+    }
+
+    // Every place the game queues a fast travel (map, Papyrus, ...) calls QueueFastTravel directly.
+    static void InstallFastTravelHook()
+    {
+        static constexpr std::pair<std::uint64_t, std::size_t> kCalls[] = {
+            { 2205011, 0x73 }, { 2219737, 0x4E }, { 2225458, 0x2E4 }, { 2252425, 0x31 } };
+        int hooked = 0;
+        for (auto [id, off] : kCalls) {
+            const auto src = REL::ID(id).address() + off;
+            const auto* b = reinterpret_cast<const std::uint8_t*>(src);
+            if (b[0] != 0xE8 || src + 5 + *reinterpret_cast<const std::int32_t*>(b + 1) != g_queueFastTravel.address()) {
+                REX::WARN("[FathersFallout] fast travel call {}+{:#x} not found (game update?): not hooked", id, off);
+                continue;
+            }
+            REL::GetTrampoline().write_call<5>(src, QueueFastTravelHook);
+            ++hooked;
+        }
+        REX::INFO("[FathersFallout] fast travel hooked at {}/4 call(s): bodies leave before the travel's autosave", hooked);
     }
 
     // Area of interest for remote bodies: see sync/Range.h (follows uGridsToLoad).
@@ -1542,6 +1647,7 @@ namespace F4MP
 
     static void BodiesSync()
     {
+        PollPendingTravel();
         // An intro save loaded while connected: leave the session before anything travels or syncs.
         {
             static std::chrono::steady_clock::time_point s_next{};
@@ -2233,6 +2339,7 @@ namespace F4MP
             if (g_recentSpawns.size() >= 15) return;   // something keeps eating bodies: don't flood the world
         }
         if (std::chrono::steady_clock::now() - g_spawnAt < std::chrono::seconds(3)) return;
+        if (g_travel.active || std::chrono::steady_clock::now() < g_travelHoldUntil) return;
         // Not during or right after a loading screen: a body placed while the cell was still
         // coming in (the joiner's fast travel to the host) existed but was never drawn.
         {
@@ -3514,10 +3621,11 @@ namespace F4MP
 F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4MP::CrashLog::KeepPreviousLog();
-    F4SE::Init(a_f4se);
+    F4SE::Init(a_f4se, { .trampoline = true, .trampolineSize = 128 });
     REX::INFO("[FathersFallout] FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb (GPL v3 + NOTICE)");
     REX::INFO("[FathersFallout] plugin loaded (CommonLibF4)");
     F4MP::CrashLog::Install();
+    F4MP::InstallFastTravelHook();
 
     F4SE::GetMessagingInterface()->RegisterListener(F4MP::OnMessage);
     F4MP::Workshop::RegisterSerialization();
