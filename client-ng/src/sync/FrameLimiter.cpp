@@ -4,6 +4,7 @@
 
 #include "pch.h"
 #include "sync/FrameLimiter.h"
+#include "sync/CrashLog.h"
 
 #include <Windows.h>
 
@@ -80,6 +81,7 @@ namespace F4MP::FrameLimiter
         if (now.QuadPart - s_lastReport > g_freq.QuadPart * 30) {
             s_lastReport = now.QuadPart;
             REX::INFO("[FathersFallout] fps {:.1f} (cap {})", g_fps, kTargetFps);
+            CrashLog::Reassert();   // cheap; a handler installed later (another mod) can push ours out
         }
         g_last.QuadPart = deadline > now.QuadPart - period ? deadline : now.QuadPart;
     }

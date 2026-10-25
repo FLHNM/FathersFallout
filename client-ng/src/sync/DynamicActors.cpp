@@ -39,7 +39,7 @@ namespace F4MP::DynamicActors
 
         // owner side
         std::unordered_map<uint32_t, Clock::time_point> g_lastAnnounced;
-        std::unordered_set<uint32_t> g_ourHostile;   // announced ones hostile to our player: stay ours
+        std::unordered_set<uint32_t> g_ourClaimed;   // announced once: stay ours while they exist
         // mirror side
         std::unordered_map<uint64_t, Announce> g_announced;       // (owner, ref) -> latest announce
         std::unordered_map<uint64_t, uint32_t> g_map;             // (owner, ref) -> local FormID
@@ -180,16 +180,18 @@ namespace F4MP::DynamicActors
         // Not before we know where the host is: right after joining every spot looked like ours, and the
         // settlers around a guest were claimed ahead of the host's own.
         if (!Authority::HostAreaKnown()) return;
-        // Enemies are claimed once, where we had the area when they appeared, and stay ours (Authority::IOwn).
-        // Everyone else is announced only while their spot is ours.
-        if (!g_ourHostile.contains(hostId) && !Authority::IOwnArea(actor)) return;
+        // Claimed once, where we had the area when they appeared, and ours from then on (Authority::IOwn).
+        // Only enemies used to stay ours: a settler or trader of ours stopped being announced whenever the
+        // host came close, the host's copy was removed 15 s later and placed again when the area flipped
+        // back.
+        if (!g_ourClaimed.contains(hostId) && !Authority::IOwnArea(actor)) return;
         const auto now = Clock::now();
         if (auto it = g_lastAnnounced.find(hostId); it != g_lastAnnounced.end() && now - it->second < kAnnounceEvery) return;
 
         const uint32_t spawnForm = SpawnFormFor(actor);
         if (!spawnForm) return;   // nothing the others could copy: not claimed, area rules apply
         g_lastAnnounced[hostId] = now;
-        if (auto* pl = Player(); pl && !actor->IsDead(false) && actor->GetHostileToActor(pl)) g_ourHostile.insert(hostId);
+        g_ourClaimed.insert(hostId);
         Network::CoopDynamicActorMsg msg{};
         msg.hostRefId = hostId;
         msg.spawnFormId = spawnForm;
@@ -263,7 +265,7 @@ namespace F4MP::DynamicActors
         return g_mappedLocal.contains(localFormId) || g_retired.contains(localFormId) || IsPendingCopy(localFormId);
     }
 
-    bool IsOurAnnounced(uint32_t localFormId) { return g_ourHostile.contains(localFormId) && !g_mappedLocal.contains(localFormId); }
+    bool IsOurAnnounced(uint32_t localFormId) { return g_ourClaimed.contains(localFormId) && !g_mappedLocal.contains(localFormId); }
 
     bool OwnerOf(uint32_t localFormId, uint32_t& ownerId, uint32_t& ownerRefId)
     {
@@ -283,13 +285,16 @@ namespace F4MP::DynamicActors
         if (!pl) return;
         const auto now = Clock::now();
 
-        // 1. Finish a spawn: the new actor is the runtime actor that wasn't there before.
-        if (g_inFlight && now - g_flight.at > std::chrono::milliseconds(500)) {
-            g_inFlight = false;
-            RE::Actor* found = nullptr;
+        // 1. Finish a spawn: the new actor is the runtime actor that wasn't there before. Looked for from the
+        //    next frame on: placeatme puts it at our feet, and waiting a fixed half second before moving it
+        //    showed every copy popping up next to the player and vanishing again.
+        RE::Actor* found = nullptr;
+        if (g_inFlight && now - g_flight.at > std::chrono::milliseconds(30))
             ForEachRuntimeActor(2000.0f, [&](RE::Actor* a) {
                 if (!found && !g_flight.before.contains(a->GetFormID()) && !IsCoopOwned(a)) found = a;
             });
+        if (g_inFlight && (found || now - g_flight.at > std::chrono::milliseconds(500))) {
+            g_inFlight = false;
             auto ann = g_announced.find(g_flight.key);
             if (found && ann != g_announced.end()) {
                 found->InitiateDoNothingPackage();
@@ -336,7 +341,7 @@ namespace F4MP::DynamicActors
         // Our own announced actors that are gone: a reused runtime ID mustn't count as ours.
         for (auto it = g_lastAnnounced.begin(); it != g_lastAnnounced.end();) {
             auto* a = Lookup<RE::Actor>(it->first);
-            if (!a || a->IsDeleted() || now - it->second > std::chrono::minutes(2)) { g_ourHostile.erase(it->first); it = g_lastAnnounced.erase(it); }
+            if (!a || a->IsDeleted() || now - it->second > std::chrono::minutes(2)) { g_ourClaimed.erase(it->first); it = g_lastAnnounced.erase(it); }
             else ++it;
         }
 
@@ -364,7 +369,7 @@ namespace F4MP::DynamicActors
             s_lastSweep = now;
             std::vector<RE::Actor*> ghosts;
             ForEachRuntimeActor(Range::Loaded(), [&](RE::Actor* a) {
-                if (!IsCoopOwned(a) && !a->IsDisabled() && !g_ourHostile.contains(a->GetFormID()) && !Authority::IOwnArea(a))
+                if (!IsCoopOwned(a) && !a->IsDisabled() && !g_ourClaimed.contains(a->GetFormID()) && !Authority::IOwnArea(a))
                     ghosts.push_back(a);
             });
             for (auto* a : ghosts) {
@@ -387,7 +392,7 @@ namespace F4MP::DynamicActors
         g_announced.clear();
         g_companionKeys.clear();
         g_lastAnnounced.clear();
-        g_ourHostile.clear();
+        g_ourClaimed.clear();
         // Our own spawns we hid while another player ran the area: back in our world.
         for (uint32_t fid : g_suppressed)
             if (auto* a = Lookup<RE::Actor>(fid); a && a->IsDisabled() && !a->IsDeleted()) a->Enable(false);

@@ -39,8 +39,11 @@ namespace F4MP::PlayerEvents
                         const int n = ++s_seen[ev];
                         if (n <= 3 || n % 100 == 0) REX::INFO("[PlayerEvents] {} -> {} (#{})", ev, ok, n);
                     }
+                    // Only what the player's graph took: fire pressed while the gun was still coming out is refused
+                    // here (no shot), but went out anyway and the other screen fired it once the body had drawn
+                    //.
                     std::lock_guard l(g_lock);
-                    if (g_pending.size() < 256) g_pending.emplace_back(ev);
+                    if (ok && g_pending.size() < 256) g_pending.emplace_back(ev);
                 }
             }
             return ok;

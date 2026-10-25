@@ -27,6 +27,19 @@ namespace F4MP::GraphOverride
     // the graph every update, over anything we set. Unbind Speed/Direction on a body (once per
     // actor; logs the channel names it finds).
     void DetachMovementChannels(RE::Actor* a_body);
+    // A mirrored NPC's heading comes from its owner's game every tick while its own AI still wants to
+    // face elsewhere: the engine's TurnDelta stayed large and the graph turned on the spot for good
+    // (a guest's Dogmeat trotted in place for minutes). Unbound so it can be zeroed.
+    // Speed/Direction too: moved with SetPosition, the engine wrote Speed 0 over ours every frame and the
+    // NPC slid along in its standing pose.
+    void DetachMirrorChannels(RE::Actor* a_npc);
+    // A mirrored NPC's walk speed, written every frame right before its graph samples it (as Set does for bodies).
+    void SetMirrorSpeed(RE::Actor* a_npc, float a_speed);
+    void ClearMirrorSpeed(RE::Actor* a_npc);
+    // No longer mirrored: its Speed channel stays unbound, so its Speed is measured from how it moves from now on.
+    void ReleaseMirrorSpeed(RE::Actor* a_npc);
+    void ProbeEvents(std::uint32_t a_formId);   // test aid: log every graph event this actor gets (0 = off)
+    void KeepMirrorSpeeds(const std::vector<RE::Actor*>& a_live);   // every sync tick: the NPCs mirrored now
 
     // Main thread, every sync tick. Bodies not set here are left to the engine.
     void Set(RE::Actor* a_body, float a_speed, float a_direction);
@@ -45,6 +58,9 @@ namespace F4MP::GraphOverride
     bool TakeResync(RE::Actor* a_body);
     // Its player's weapon state: the engine's own draw/holster events against it are dropped.
     void SetWantDrawn(RE::Actor* a_body, bool a_drawn);
+    // The player's own draw/holster/shot event says it before its position packets do: for a second the
+    // body's weapon follows that, not the (older) weaponDrawn of the stream.
+    void HoldWantDrawn(RE::Actor* a_body, bool a_drawn);
     // Our equipment change is about to holster/redraw the body's weapon: let it through for a moment.
     void AllowWeaponSwap(RE::Actor* a_body);
 

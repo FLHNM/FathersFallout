@@ -9,6 +9,7 @@
 #include "sync/CoopSync.h"
 #include "sync/FrameLimiter.h"
 #include "sync/CrashLog.h"
+#include "sync/BodyLights.h"
 #include "sync/Appearance.h"
 #include "sync/DynamicActors.h"
 #include "sync/Range.h"
@@ -87,7 +88,8 @@ namespace F4MP
         std::chrono::steady_clock::time_point at{};
         RE::NiPoint3 pos{};
         float heading = 0.0f, pitch = 0.0f;
-        bool sneaking = false, jumping = false, weaponDrawn = false;
+        bool sneaking = false, jumping = false, weaponDrawn = false, lightOn = false;
+        uint32_t lightColor = 0;
     };
     static std::mutex g_localLock;
     static LocalSample g_local;
@@ -424,6 +426,107 @@ namespace F4MP
     static RE::Actor* FindNearbyActor(uint32_t baseFormId, const std::unordered_set<uint32_t>& exclude);
     static bool GoToHost(bool a_quiet);
 
+    // Calls an Actor script function on a_actor. Its script object found by type (Preston's is a subclass of
+    // Actor), or made and bound when it has none, the way CommonLib packs a form argument.
+    static bool PapyrusOnActor(RE::Actor* a_actor, const char* a_func, auto... a_args)
+    {
+        auto* game = RE::GameVM::GetSingleton();
+        auto vm = game ? game->GetVM() : nullptr;
+        if (!vm || !a_actor) return false;
+        const auto& handles = vm->GetObjectHandlePolicy();
+        const auto handle = handles.GetHandleForObject(RE::BSScript::GetVMTypeID<RE::Actor>(), static_cast<const void*>(a_actor));
+        if (handle == handles.EmptyHandle()) return false;
+        RE::BSTSmartPointer<RE::BSScript::Object> object;
+        if (!vm->FindBoundObject(handle, "Actor", false, object, false) && vm->CreateObject("Actor", object) && object)
+            vm->GetObjectBindPolicy().BindObject(object, handle);
+        if (!object) return false;
+        return vm->DispatchMethodCall(object, a_func, [&](RE::BSScrapArray<RE::BSScript::Variable>& a_out) {
+            a_out = RE::BSScript::detail::PackVariables(a_args...);
+            return true;
+        }, nullptr);
+    }
+
+    // The same for an ObjectReference function on a reference.
+    static bool PapyrusOnRef(RE::TESObjectREFR* a_ref, const char* a_func, auto... a_args)
+    {
+        auto* game = RE::GameVM::GetSingleton();
+        auto vm = game ? game->GetVM() : nullptr;
+        if (!vm || !a_ref) return false;
+        const auto& handles = vm->GetObjectHandlePolicy();
+        const auto handle = handles.GetHandleForObject(RE::BSScript::GetVMTypeID<RE::TESObjectREFR>(), static_cast<const void*>(a_ref));
+        if (handle == handles.EmptyHandle()) return false;
+        RE::BSTSmartPointer<RE::BSScript::Object> object;
+        if (!vm->FindBoundObject(handle, "ObjectReference", false, object, false) && vm->CreateObject("ObjectReference", object) && object)
+            vm->GetObjectBindPolicy().BindObject(object, handle);
+        if (!object) return false;
+        return vm->DispatchMethodCall(object, a_func, [&](RE::BSScrapArray<RE::BSScript::Variable>& a_out) {
+            a_out = RE::BSScript::detail::PackVariables(a_args...);
+            return true;
+        }, nullptr);
+    }
+
+    // Invisible markers (XMarker) the walked NPCs path to, one each, moved to where the owner's copy stands.
+    // placeatme's marker appears a frame later: one requested at a time, the newcomer near us taken.
+    static std::vector<uint32_t> g_markerFree;
+    static std::unordered_map<uint32_t, uint32_t> g_npcMarker;   // local NPC -> its marker
+    static std::unordered_set<uint32_t> g_markersKnown;          // ours, and markers that were there before a request
+    static std::chrono::steady_clock::time_point g_markerAskedAt{};
+
+    static RE::TESObjectREFR* MarkerFor(uint32_t a_npc)
+    {
+        auto lookup = [](uint32_t id) { auto* f = id ? RE::TESForm::GetFormByID(id) : nullptr; return f ? f->As<RE::TESObjectREFR>() : nullptr; };
+        if (auto it = g_npcMarker.find(a_npc); it != g_npcMarker.end()) {
+            if (auto* m = lookup(it->second); m && !m->IsDeleted()) return m;
+            g_npcMarker.erase(it);
+        }
+        while (!g_markerFree.empty()) {
+            const uint32_t id = g_markerFree.back();
+            g_markerFree.pop_back();
+            if (auto* m = lookup(id); m && !m->IsDeleted()) { g_npcMarker[a_npc] = id; return m; }
+        }
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        auto* tes = RE::TES::GetSingleton();
+        if (!pl || !tes || g_npcMarker.size() >= 48) return nullptr;
+        const auto now = std::chrono::steady_clock::now();
+        auto scan = [&](bool a_take) {
+            RE::TESObjectREFR* found = nullptr;
+            tes->ForEachReferenceInRange(pl->GetPosition(), 400.0f, [&](RE::TESObjectREFR* r) {
+                auto* base = r ? r->GetObjectReference() : nullptr;
+                if (base && base->GetFormID() == 0x3B && r->GetFormID() >= 0xFF000000u && !g_markersKnown.contains(r->GetFormID())) {
+                    if (a_take && !found) found = r;
+                    else if (!a_take) g_markersKnown.insert(r->GetFormID());
+                }
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+            return found;
+        };
+        if (g_markerAskedAt != std::chrono::steady_clock::time_point{} && now - g_markerAskedAt < std::chrono::seconds(2)) {
+            if (auto* m = scan(true)) {
+                g_markersKnown.insert(m->GetFormID());
+                g_npcMarker[a_npc] = m->GetFormID();
+                g_markerAskedAt = {};
+                return m;
+            }
+            return nullptr;   // still on its way
+        }
+        scan(false);   // whatever markers are around now (the explosions' one) are not ours
+        // Forced persistent (ObjectReference.PlaceAtMe): a console placeatme marker is a temporary reference, and
+        // handing one to a script function crashed the game.
+        auto* xmarker = RE::TESForm::GetFormByID(0x3B);
+        if (!xmarker || !PapyrusOnRef(pl, "PlaceAtMe", xmarker, 1, true, false, false)) return nullptr;
+        g_markerAskedAt = now;
+        return nullptr;
+    }
+
+    static void FreeMarker(uint32_t a_npc)
+    {
+        if (auto it = g_npcMarker.find(a_npc); it != g_npcMarker.end()) { g_markerFree.push_back(it->second); g_npcMarker.erase(it); }
+    }
+
+    static float g_npcSpeedMult = 1.0f;   // test aid (bridge f4mp:npcspeed)
+    static std::uint32_t g_mirrorOff = 0;  // test aid (bridge f4mp:mirroroff <hex>): 1 vitals, 2 weapon, 4 idle filter, 8 sneak
+    static bool g_npcAiMove = false;       // test: mirrored NPCs walked by their own AI (see PapyrusOnActor)
+
     static void PollConsoleBridge()
     {
         if (!g_consoleBridge) return;
@@ -499,6 +602,111 @@ namespace F4MP
                             }
                     }
                     REX::INFO("[Bridge]   drawn {} state {} equipped:{}", a->GetWeaponMagicDrawn(), static_cast<int>(a->weaponState) & 7, eq);
+                    continue;
+                }
+                // Test helper: "f4mp:state <hex>" logs an actor's health and fight (Preston turning on the host, U24).
+                if (cmd.rfind("f4mp:state ", 0) == 0) {
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 11, nullptr, 16));
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    auto* pl = RE::PlayerCharacter::GetSingleton();
+                    auto* avs = RE::ActorValue::GetSingleton();
+                    if (!a || !pl || !avs || !avs->health) { REX::INFO("[Bridge] no such actor"); continue; }
+                    auto t = a->currentCombatTarget.get();
+                    REX::INFO("[Bridge] state {:#x}: health {:.1f} combat {} target {:#x} hostile-to-player {} dist {:.0f} process {}", a->GetFormID(),
+                        a->GetActorValue(*avs->health), a->IsInCombat(), t ? t->GetFormID() : 0u, a->GetHostileToActor(pl),
+                        a->GetPosition().GetDistance(pl->GetPosition()), a->currentProcess ? static_cast<int>(a->currentProcess->processLevel) : -1);
+                    continue;
+                }
+                // Test helper: "f4mp:steps <hex>" logs how long ago that body/mirrored NPC's graph sent a footstep.
+                if (cmd.rfind("f4mp:steps ", 0) == 0) {
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 11, nullptr, 16));
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    const long long step = a ? GraphOverride::LastStepMs(a) : 0;
+                    REX::INFO("[Bridge] steps {:#x}: last footstep {} ms ago", f ? f->GetFormID() : 0u, step ? std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - step : -1LL);
+                    continue;
+                }
+                // Test helper: "f4mp:npcspeed <mult>" scales the walk speed given to mirrored NPCs' graphs.
+                if (cmd.rfind("f4mp:npcspeed ", 0) == 0) {
+                    g_npcSpeedMult = static_cast<float>(std::atof(cmd.c_str() + 14));
+                    REX::INFO("[Bridge] mirrored NPC graph speed x{:.2f}", g_npcSpeedMult);
+                    continue;
+                }
+                // Test helper: "f4mp:animstep <hex>" logs the animation time step that actor gets (0 = off).
+                if (cmd.rfind("f4mp:animstep ", 0) == 0) {
+                    AimHook::ProbeDelta(static_cast<std::uint32_t>(std::strtoul(cmd.c_str() + 14, nullptr, 16)));
+                    continue;
+                }
+                // Test helper: "f4mp:npcai 0|1": mirrored NPCs placed every frame (0) or walked by their own AI (1).
+                if (cmd.rfind("f4mp:npcai ", 0) == 0) {
+                    g_npcAiMove = cmd[11] == '1';
+                    REX::INFO("[Bridge] mirrored NPCs {}", g_npcAiMove ? "walked by their own AI" : "placed every frame");
+                    continue;
+                }
+                // Test helper: "f4mp:papyrus <hex> <Actor function>" calls a no-argument Actor script function.
+                if (cmd.rfind("f4mp:papyrus ", 0) == 0) {
+                    char* end = nullptr;
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 13, &end, 16));
+                    std::string fn = end && *end ? end + 1 : "";
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    REX::INFO("[Bridge] papyrus {:#x}.{}() -> {}", f ? f->GetFormID() : 0u, fn, a && PapyrusOnActor(a, fn.c_str()));
+                    continue;
+                }
+                // Test helper: "f4mp:papyrusp <hex>": IsHostileToActor(player), then KeepOffsetFromActor(player, 0 200 0).
+                if (cmd.rfind("f4mp:papyrusp ", 0) == 0) {
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 14, nullptr, 16));
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    RE::Actor* pl = RE::PlayerCharacter::GetSingleton();
+                    const bool h = a && PapyrusOnActor(a, "IsHostileToActor", pl);
+                    const bool k = a && PapyrusOnActor(a, "PathToReference", static_cast<RE::TESObjectREFR*>(pl), 0.0f);
+                    REX::INFO("[Bridge] papyrus with player: IsHostileToActor {} PathToReference(player, walk) {}", h, k);
+                    continue;
+                }
+                if (cmd.rfind("f4mp:events ", 0) == 0) {
+                    GraphOverride::ProbeEvents(static_cast<std::uint32_t>(std::strtoul(cmd.c_str() + 12, nullptr, 16)));
+                    continue;
+                }
+                if (cmd.rfind("f4mp:mirroroff ", 0) == 0) {
+                    g_mirrorOff = static_cast<std::uint32_t>(std::strtoul(cmd.c_str() + 15, nullptr, 16));
+                    REX::INFO("[Bridge] mirror features off: {:#x}", g_mirrorOff);
+                    continue;
+                }
+                // Test helper: "f4mp:synctime" = the menu's "Sync time with host".
+                if (cmd == "f4mp:synctime") {
+                    REX::INFO("[Bridge] sync time with host -> {}", Coop::SyncTimeWithHost());
+                    continue;
+                }
+                // Test helper: "f4mp:clock" logs the calendar (the hour and the days-passed counters).
+                if (cmd == "f4mp:clock") {
+                    auto* cal = RE::Calendar::GetSingleton();
+                    if (cal && cal->gameHour && cal->gameDaysPassed)
+                        REX::INFO("[Bridge] clock hour {:.3f} daysPassed {:.4f} raw {:.4f} day {} month {}", cal->gameHour->value,
+                            cal->gameDaysPassed->value, cal->rawDaysPassed, cal->gameDay ? cal->gameDay->value : -1.0f,
+                            cal->gameMonth ? cal->gameMonth->value : -1.0f);
+                    continue;
+                }
+                // Test helper: "f4mp:crashtest" crashes the game on purpose, to check what the crash logger writes.
+                if (cmd == "f4mp:crashtest") {
+                    REX::WARN("[Bridge] crashing on purpose (crash logger test)");
+                    *reinterpret_cast<volatile int*>(static_cast<uintptr_t>(0x10)) = 1;
+                    continue;
+                }
+                // Test helper: "f4mp:gvar <hex> <name>..." logs an actor's graph variables (float, int or bool).
+                if (cmd.rfind("f4mp:gvar ", 0) == 0) {
+                    std::istringstream in(cmd.substr(10));
+                    std::string id, name;
+                    in >> id;
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(id.c_str(), nullptr, 16));
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    if (!a) { REX::INFO("[Bridge] no such actor"); continue; }
+                    std::string out;
+                    while (in >> name) {
+                        float fv = 0.0f; int iv = 0; bool bv = false;
+                        if (a->GetGraphVariableImplFloat(name, fv)) out += std::format(" {}={:.2f}", name, fv);
+                        else if (a->GetGraphVariableImplInt(name, iv)) out += std::format(" {}={}", name, iv);
+                        else if (a->GetGraphVariableImplBool(name, bv)) out += std::format(" {}={}", name, bv);
+                        else out += " " + name + "=?";
+                    }
+                    REX::INFO("[Bridge] actor {:#x} graph:{}", a->GetFormID(), out);
                     continue;
                 }
                 // Test helper: "f4mp:pitchscale <graph units per radian>" for the bodies' aim.
@@ -851,6 +1059,7 @@ namespace F4MP
                         msg.isSneaking = ls.sneaking;
                         msg.isJumping = ls.jumping;              // in the air / jumping
                         msg.weaponDrawn = ls.weaponDrawn;  // weapon out?
+                        if (ls.lightOn) msg.extraFlags |= Network::kPosLightOn | (ls.lightColor << Network::kPosLightColorShift);   // Pip-Boy light / headlamp
                         msg.cellId = Authority::LocalSpaceAtomic();   // interior cell / worldspace
                         lastSend = now;
                         net.SendPacket(Network::MessageType::PlayerPosition, &msg, sizeof(msg));
@@ -986,6 +1195,7 @@ namespace F4MP
                            // Standing still: is the body still getting closer to its spot, or blocked?
                            std::chrono::steady_clock::time_point idleCheckAt{}; float idleCheckLag = 0.0f; bool blocked = false;
                            bool parked = false;   // stuck off its spot while its player stands: put there once, then left alone
+                           bool senderIdle = false;   // its player has stood still for 250 ms (no walk wanted, whatever we measure)
                            RE::NiPoint3 idleCheckTarget{};
                            // The received speed jumps 0 / 1x / 2x between packets (sends and frames aren't in
                            // step): smoothed for the gait, and "standing" only after 250 ms without movement.
@@ -995,7 +1205,7 @@ namespace F4MP
                            RE::NiPoint3 lastPos{}; std::chrono::steady_clock::time_point lastPosAt{}; bool havePos = false;
                            // Footstep watchdog (StepWatch): the walk/run must really play while the body moves.
                            bool prevMoving = false; long long movingSinceMs = 0, stillSinceMs = 0, lastKickMs = 0;
-                           long long lastStep = 0, stillStepsFrom = 0, quickUntilMs = 0; int stillSteps = 0; };
+                           long long lastStep = 0, stillStepsFrom = 0, quickUntilMs = 0; int stillSteps = 0; int idleKicks = 0; };
     static std::unordered_map<uint32_t, BodyAnimState> g_animState;
     static bool g_lastOkSpeed = false, g_lastOkDir = false;       // retorno de SetGraphVariable (debug)
     static bool g_graphDumped = false;                            // graph variables dumped already?
@@ -1069,6 +1279,8 @@ namespace F4MP
         static auto s_last = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
         if (g_spawnPending || now - s_last < std::chrono::seconds(5)) return;
+        // A spawn we gave up on can still land late: not a leftover yet (the next spawn's FindNearbyActor takes it).
+        if (now - g_spawnAt < std::chrono::seconds(8)) return;
         s_last = now;
 
         auto* tes = RE::TES::GetSingleton();
@@ -1105,6 +1317,7 @@ namespace F4MP
         g_animState.clear();
         g_spawnAt = std::chrono::steady_clock::now();
         Activity::Reset();   // the frames we gave bodies (runtime references) mustn't go into the save either
+        BodyLights::Clear(); // nor their lights
     }
 
     // Area of interest for remote bodies: see sync/Range.h (follows uGridsToLoad).
@@ -1136,6 +1349,11 @@ namespace F4MP
             g_local.sneaking = player->IsSneaking();
             g_local.jumping = player->IsJumping();
             g_local.weaponDrawn = player->GetWeaponMagicDrawn();
+            g_local.lightOn = player->IsPipboyLightOn();
+            static uint32_t s_color = 0;
+            static auto s_colorAt = std::chrono::steady_clock::time_point{};
+            if (g_local.at - s_colorAt > std::chrono::seconds(2)) { s_colorAt = g_local.at; s_color = BodyLights::LocalColor(); }
+            g_local.lightColor = s_color;   // Pip-Boy color can change in the settings
         }
         Authority::LocalSpace();   // keeps the space the network thread sends current
         float speed = -1.0f, dir = -1.0f;
@@ -1265,7 +1483,23 @@ namespace F4MP
     {
         const char* first = sneaking ? "moveStartAnimated" : "moveStart";
         const char* second = sneaking ? "moveStart" : "moveStartAnimated";
-        return GraphOverride::SendEvent(actor, first) || GraphOverride::SendEvent(actor, second);
+        if (GraphOverride::SendEvent(actor, first) || GraphOverride::SendEvent(actor, second)) return true;
+        // Weapon out the stance has its own starts. After the
+        // footstep watchdog restarted the walk of a body with its gun out, moveStart was refused for seconds
+        // at a time and the body slid along on still feet.
+        return !sneaking && actor->GetWeaponMagicDrawn() &&
+               (GraphOverride::SendEvent(actor, "walkStart") || GraphOverride::SendEvent(actor, "runStart"));
+    }
+
+    // A mirrored NPC starts walking the way the game starts its own walk (testing, vanilla Preston pathing: walkStart,
+    // moveForward, MoveStart in one frame). moveStart alone was refused or left the graph in a slow shuffle without
+    // a direction: the NPCs walked in slow motion on the other screen.
+    static bool StartMovingNpc(RE::Actor* actor, bool sneaking)
+    {
+        const bool walk = GraphOverride::SendEvent(actor, "walkStart");
+        const bool fwd = GraphOverride::SendEvent(actor, "moveForward");
+        const bool start = StartMoving(actor, sneaking);
+        return walk || fwd || start;
     }
 
     // Footstep watchdog for bodies and mirrored NPCs. Locomotion events go out only when our idea of the
@@ -1277,7 +1511,7 @@ namespace F4MP
     // standing: what the sender says (its speed), not our measurement: a body put back on its spot read as
     // moving for a moment every time, and that kept resetting the count.
     template <class S>
-    static int StepWatch(RE::Actor* actor, S& st, bool moving, float speed, bool skip, bool standing)
+    static int StepWatch(RE::Actor* actor, S& st, bool moving, float speed, bool skip, bool standing, long long patience = 1500)
     {
         const long long now = NowMs();
         if (moving != st.prevMoving) {
@@ -1289,10 +1523,13 @@ namespace F4MP
         const bool newStep = step && step != st.lastStep;
         st.lastStep = step;
         // Right after a draw/holster look sooner: 0.8 s, not 1.5 s.
-        const long long wait = now < st.quickUntilMs ? 800 : 1500;
+        const long long wait = now < st.quickUntilMs ? (std::min)(800LL, patience) : patience;
         if (!step || skip || now - st.lastKickMs < (now < st.quickUntilMs ? 1000 : 3000)) return 0;
+        if (newStep) st.idleKicks = 0;
         if (moving && !standing) {
-            if (speed > 70.0f && now - st.movingSinceMs > wait && now - step > wait) { st.lastKickMs = now; return 1; }
+            // Some gaits never step: two kicks with no footstep after them = leave it be.
+            if (st.idleKicks >= 2) return 0;
+            if (speed > 70.0f && now - st.movingSinceMs > wait && now - step > wait) { st.lastKickMs = now; ++st.idleKicks; return 1; }
             return 0;
         }
         // Turning on the spot steps too: only a steady stream (4 in 2.5 s, a walk steps every ~0.6 s) is walking in place.
@@ -1348,6 +1585,7 @@ namespace F4MP
             }
             g_lastHeading.clear();
             g_animState.clear();
+            BodyLights::Clear();
             return;
         }
         auto remotes = net.GetRemotePlayers();
@@ -1421,6 +1659,18 @@ namespace F4MP
             g_bodies.erase(pid);
             g_lastHeading.erase(pid);
             g_animState.erase(pid);
+        }
+
+        // Their Pip-Boy lights (or headlamps), following the bodies.
+        {
+            std::vector<BodyLights::Want> lights;
+            for (auto& [pid, fid] : g_bodies) {
+                auto it = remotes.find(pid);
+                auto* form = RE::TESForm::GetFormByID(fid);
+                lights.push_back({ pid, form ? form->As<RE::Actor>() : nullptr, it != remotes.end() && (it->second.extraFlags & Network::kPosLightOn) != 0,
+                    it != remotes.end() ? it->second.extraFlags >> Network::kPosLightColorShift : 0u });
+            }
+            BodyLights::Sync(lights);
         }
 
         // 1. Move each body smoothly toward its player's position.
@@ -1502,6 +1752,7 @@ namespace F4MP
                 st.rxSmooth = st.rxSmooth * 0.9f + rxv * 0.1f;
                 if (it->second.speed > 10.0f) st.lastRxMoveAt = clockNow;
                 const bool idle = clockNow - st.lastRxMoveAt > std::chrono::milliseconds(250);
+                st.senderIdle = idle;
                 if (idle) st.rxSmooth = 0.0f;
                 if (!idle) {
                     st.blocked = false;
@@ -1518,7 +1769,10 @@ namespace F4MP
                     const RE::NiPoint3 tm = goal - st.idleCheckTarget;
                     const bool spotStill = tm.x * tm.x + tm.y * tm.y + tm.z * tm.z < 8.0f * 8.0f;
                     const bool noProgress = lagXY > st.idleCheckLag - 4.0f;
-                    st.blocked = lagXY < 64.0f && noProgress;
+                    // Not while its walk still plays: right after its player stopped, the walk's own motion
+                    // cancelled our pull ("no progress"), the body was let go as blocked, walked on ~50 units
+                    // and was snapped back.
+                    st.blocked = lagXY < 64.0f && noProgress && !st.moving;
                     // Further off, or at another height (stairs, a floor inside), and not getting there: it
                     // was pushed every tick for good, that push read as walking, and the body walked in place
                     // after every interior load. Put it on the spot once and leave it.
@@ -1639,7 +1893,9 @@ namespace F4MP
             // Direction: written by GraphOverride (fraction of a turn), not here.
 
             // State with HYSTERESIS (different start and stop thresholds, no flicker).
-            const bool wantMoving = st.moving   ? (st.smoothSpeed >   8.0f) : (st.smoothSpeed >  30.0f);
+            // Its player stopped: stop the walk now. Our pull toward the last spot kept the measured speed
+            // up, so the body stepped down to a walk and carried on past its player instead.
+            const bool wantMoving = !st.senderIdle && (st.moving ? (st.smoothSpeed > 8.0f) : (st.smoothSpeed > 30.0f));
             const bool wantSprint = rp.isSprinting && wantMoving;   // sender's own sprint state
 
             actor->SetGraphVariableBool("IsSprinting", wantSprint);
@@ -1768,6 +2024,17 @@ namespace F4MP
                 // local player crouched (the body's AI copies that): if the graph's stance isn't its player's,
                 // put it back first, then start walking again. Only then: resending sneakStart every quarter
                 // second restarted the crouch each time, and a crouching body glided along for good.
+                // Refused because it already walks: a landing (jumpLandToRun) or a sprint put the graph in its
+                // locomotion itself, and moveStart is only taken from standing. Fresh footsteps say so: count
+                // it as moving, so the gait events go out (seen refused for 6 s, sliding meanwhile).
+                if (wantMoving && !ok && st.moveRefused >= 4) {
+                    const long long step = GraphOverride::LastStepMs(actor);
+                    if (step && NowMs() - step < 700) {
+                        ok = true;
+                        static int s_logged = 0;
+                        if (s_logged++ < 20) REX::INFO("[FathersFallout] body of player {}: walk refused but it is walking already (footsteps): taken as moving", pid);
+                    }
+                }
                 if (wantMoving && !ok && ++st.moveRefused >= 15) {
                     st.moveRefused = 0;
                     std::int32_t inSneak = 0;
@@ -1775,6 +2042,9 @@ namespace F4MP
                     const bool off = known && (inSneak != 0) != rp.isSneaking;
                     if (off) GraphOverride::SendEvent(actor, rp.isSneaking ? "sneakStart" : "sneakStop");
                     ok = StartMoving(actor, rp.isSneaking);
+                    // Still refused with no footsteps: the graph sits in a locomotion state that doesn't play
+                    // (refused for 4 s after the watchdog's restart). Stop it, then start from standing.
+                    if (!ok && GraphOverride::SendEvent(actor, "moveStop")) ok = StartMoving(actor, rp.isSneaking);
                     static int s_logged = 0;
                     if (s_logged++ < 30)
                         REX::INFO("[FathersFallout] body of player {}: walk refused 0.25 s - stance {}{}, start -> {}", pid,
@@ -1907,8 +2177,14 @@ namespace F4MP
 
         // 2. Finish a pending spawn (placeatme is asynchronous).
         if (g_spawnPending) {
-            if (std::chrono::duration<float>(std::chrono::steady_clock::now() - g_spawnAt).count() > 0.4f) {
+            const float waited = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_spawnAt).count();
+            if (waited > 0.4f) {
                 RE::Actor* actor = FindNearbyActor(g_spawnBase, ClaimedFormIds());
+                // Not there yet: right after a load placeatme took longer
+                // than 0.4 s. Giving up at once let SweepOrphanBodies delete the late body as a "leftover",
+                // and the next spawn the same way: the friend's body flickered out after travelling.
+                if (!actor && waited < 3.0f) return;
+                if (!actor) REX::WARN("[FathersFallout] body for player {} didn't appear within 3 s; trying again", g_spawnFor);
                 if (actor && RE::TESForm::GetFormByID(actor->GetFormID()) != actor) {
                     // The respawn check looks bodies up by FormID; if that can't find this actor
                     // it would be "lost" every tick. Refuse it loudly instead.
@@ -1999,6 +2275,12 @@ namespace F4MP
         bool drawn = false; bool ownerDrawn = false; std::chrono::steady_clock::time_point drawAt{};
         bool prevMoving = false; long long movingSinceMs = 0, stillSinceMs = 0, lastKickMs = 0;   // footstep watchdog
         long long lastStep = 0, stillSteps = 0, stillStepsFrom = 0, quickUntilMs = 0;
+        int idleKicks = 0;   // StepWatch walk kicks in a row that brought no footstep
+        int moveRefused = 0;  // ticks moveStart was refused in a row
+        int gaitTries = 0;    // ticks the gait event was refused in a row (~1 s: taken as set)
+        bool channelsOff = false; bool bodyLike = false;   // Speed/Direction unbound (SetPosition mode): its own walk can't run
+        bool aiOn = false; RE::NiPoint3 aiOffset{}; float aiAngle = 0.0f; std::chrono::steady_clock::time_point aiAt{}, aiMarkerAt{};
+        bool haveSample = false; RE::NiPoint3 sample{}, vel{}; std::chrono::steady_clock::time_point sampleAt{};
     };
     static std::unordered_map<uint32_t, NpcAnimState> g_npcAnim;
     // Mirrored NPCs replay their owner's attacks (CoopNpcAnim) for show: the owner's game deals the
@@ -2105,6 +2387,11 @@ namespace F4MP
         RE::Console::ExecuteCommand(cmd);
         GraphOverride::SetMirror(localFid, false);
         g_npcAnim.erase(localFid);
+        // Back on its own AI with Speed unbound: Speed from how it really moves (else it slid wherever it walked).
+        if (auto* f = RE::TESForm::GetFormByID(localFid); auto* a = f ? f->As<RE::Actor>() : nullptr) {
+            GraphOverride::ReleaseMirrorSpeed(a);
+            FreeMarker(localFid);
+        }
         if (auto it = g_npcDamageMult.find(localFid); it != g_npcDamageMult.end()) {
             auto* f = RE::TESForm::GetFormByID(localFid);
             auto* a = f ? f->As<RE::Actor>() : nullptr;
@@ -2119,6 +2406,7 @@ namespace F4MP
     // newer save), disabled (not met yet) or dead is brought here; from then on NpcsSync drives it.
     // This changes the guest's own save: while playing as a guest, the host's world is the world.
     static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> g_lastPull;
+    static std::unordered_map<uint32_t, int> g_pullTries;   // pulls in a row that left it without 3D
 
     // Whether the host is in the same interior cell / worldspace as us. Interiors have their own
     // coordinates, so distances between players in different spaces mean nothing.
@@ -2140,6 +2428,12 @@ namespace F4MP
         auto& last = g_lastPull[actor->GetFormID()];
         if (now - last < std::chrono::seconds(10)) return;
         last = now;
+        // A few NPCs (bodies the host had dragged) never got their 3D here and were moved
+        // again every 10 s for the whole session, sliding and floating on the guest's screen.
+        int& tries = g_pullTries[actor->GetFormID()];
+        if (tries >= 3) return;
+        if (++tries == 3)
+            REX::WARN("[World] host's NPC {:#x} still not shown after 3 tries: left where our world has it", actor->GetFormID());
         char cmd[64];
         const bool wasDisabled = actor->IsDisabled();
         if (wasDisabled) actor->Enable(false);
@@ -2206,12 +2500,19 @@ namespace F4MP
         }
     }
 
+    // Mirrored NPCs walked by their own AI: Actor.PathToReference to a marker kept where the owner's copy stands,
+    // so the game walks and runs them with their own animations. Placed every
+    // frame instead (SetPosition), vanilla NPCs' legs played a slow walk whatever Speed we gave them (testing, the
+    // user watching Preston and Dogmeat beside a body that stepped right). Bridge f4mp:npcai 0/1 switches
+    // (g_npcAiMove, declared with the bridge).
+
     static void NpcsSync()
     {
         auto& net = Network::NetworkClient::GetInstance();
         if (!net.IsConnected() || Coop::IsLoadOrderMismatch()) {
             for (auto& [fid, owner] : g_drivenOwner) ReleaseDriven(fid);
             g_drivenOwner.clear();
+            GraphOverride::KeepMirrorSpeeds({});   // released ones checked against their actors even now
             return;
         }
 
@@ -2219,6 +2520,9 @@ namespace F4MP
         const uint32_t me = net.GetPlayerId();
         auto npcs = net.GetRemoteNpcs();
         std::unordered_set<uint32_t> seen;
+        std::vector<RE::Actor*> mirroredNow;
+        int aiCalls = 0;   // PathToReference calls this tick (Papyrus queue: a crowd mustn't flood it)
+        auto* myChar = RE::PlayerCharacter::GetSingleton();
 
         for (auto& [key, s] : npcs) {
             const uint32_t owner = static_cast<uint32_t>(key >> 32);
@@ -2234,6 +2538,8 @@ namespace F4MP
             }
             if (actor && !actor->Get3D() && !companion && fid < DynamicActors::kRuntimeIdStart && owner == Authority::HostId() && !TravelBusy())
                 PullHostNpc(actor, s);                        // elsewhere (or gone) in our world
+            else if (actor && actor->Get3D())
+                g_pullTries.erase(actor->GetFormID());
             {
                 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_why;
                 auto& w = s_why[fid];
@@ -2290,15 +2596,97 @@ namespace F4MP
                     s_deadSince.erase(local);
                 }
             }
-            Coop::ApplyNpcVitals(actor, owner, fid, s.health, s.isDead);
+            if (!(g_mirrorOff & 1)) Coop::ApplyNpcVitals(actor, owner, fid, s.health, s.isDead);
+            GraphOverride::SetMirror(local, !(g_mirrorOff & 4));
             if (s.isDead || actor->IsDead(false)) continue;   // corpses ragdoll locally
             if (Activity::MirrorSeated(local)) continue;      // on its owner's seat: the furniture places and animates it
 
-            // Drive position (smoothly interpolated) + heading, like player bodies.
-            const RE::NiPoint3 goal{ s.x, s.y, s.z };
+            // Drive position (smoothly interpolated) + heading, like player bodies. NPC states come ~10/s (bodies
+            // every frame): chasing each new spot moved them in surges, gliding and stopping between packets
+            //. Between packets the goal runs on at the owner's measured velocity (a fifth of a
+            // second at most, height as sent).
+            auto& anim = g_npcAnim[local];
+            const auto tnow = std::chrono::steady_clock::now();
+            {
+                const RE::NiPoint3 at{ s.x, s.y, s.z };
+                const RE::NiPoint3 d = at - anim.sample;
+                if (!anim.haveSample || d.x * d.x + d.y * d.y + d.z * d.z > 1.0f) {
+                    const float dt = std::chrono::duration<float>(tnow - anim.sampleAt).count();
+                    if (anim.haveSample && dt > 0.03f && dt < 0.6f)
+                        anim.vel = RE::NiPoint3{ anim.vel.x * 0.5f + d.x / dt * 0.5f, anim.vel.y * 0.5f + d.y / dt * 0.5f, 0.0f };
+                    else
+                        anim.vel = {};
+                    anim.sample = at;
+                    anim.sampleAt = tnow;
+                    anim.haveSample = true;
+                } else if (tnow - anim.sampleAt > std::chrono::milliseconds(300)) {
+                    anim.vel = {};   // no new spot for a while: it stands
+                }
+                if (s.speed < 10.0f) anim.vel = {};
+            }
+            const float lead = (std::min)(std::chrono::duration<float>(tnow - anim.sampleAt).count(), 0.2f);
+            const RE::NiPoint3 goal{ s.x + anim.vel.x * lead, s.y + anim.vel.y * lead, s.z };
             const RE::NiPoint3 bodyPos = actor->GetPosition();
             const RE::NiPoint3 delta = goal - bodyPos;
             const float dist = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+            RE::TESObjectREFR* marker = g_npcAiMove && myChar ? MarkerFor(local) : nullptr;
+            if (marker) {
+                if (anim.channelsOff) {   // switched over live: its graph needs its own Speed back
+                    anim.channelsOff = false;
+                    GraphOverride::ClearMirrorSpeed(actor);
+                    actor->Reset3D(false, 0, true, 0);
+                }
+                if (dist > 600.0f) actor->SetPosition(goal, true);   // too far behind (blocked, a jump): on the spot
+                const bool ownerMoves = s.speed > 10.0f;
+                const bool run = (s.flags & Network::kNpcRunning) || s.speed > 150.0f;
+                // The marker follows the owner's copy (~3/s); the walk follows the marker. A new PathToReference
+                // cancels the one under way: asked every 0.35 s they only turned on the spot, re-planning.
+                const RE::NiPoint3 moved = goal - anim.aiOffset;
+                if (aiCalls < 8 && tnow - anim.aiMarkerAt > std::chrono::milliseconds(300) &&
+                    (!anim.aiOn || moved.x * moved.x + moved.y * moved.y > 24.0f * 24.0f)) {
+                    ++aiCalls;
+                    anim.aiMarkerAt = tnow;
+                    anim.aiOffset = goal;
+                    char cmd[64];
+                    std::snprintf(cmd, sizeof(cmd), "%X.setpos x %.1f", marker->GetFormID(), goal.x);
+                    RE::Console::ExecuteCommand(cmd);
+                    std::snprintf(cmd, sizeof(cmd), "%X.setpos y %.1f", marker->GetFormID(), goal.y);
+                    RE::Console::ExecuteCommand(cmd);
+                    std::snprintf(cmd, sizeof(cmd), "%X.setpos z %.1f", marker->GetFormID(), goal.z);
+                    RE::Console::ExecuteCommand(cmd);
+                }
+                const bool gaitChanged = run != (anim.aiAngle > 0.5f);
+                const bool farOff = dist > 60.0f;
+                if (!anim.aiOn || gaitChanged || (farOff && tnow - anim.aiAt > std::chrono::seconds(4))) {
+                    if (aiCalls < 8 && (ownerMoves || farOff || !anim.aiOn)) {
+                        ++aiCalls;
+                        // Off the do-nothing package first: on it, the walk order only turned it toward the marker.
+                        if (!anim.aiOn) PapyrusOnActor(actor, "EvaluatePackage");
+                        anim.aiOn = true;
+                        anim.aiAngle = run ? 1.0f : 0.0f;
+                        anim.aiAt = tnow;
+                        const bool sent = PapyrusOnActor(actor, "PathToReference", marker, run ? 1.0f : 0.0f);
+                        static int s_logged = 0;
+                        if (s_logged++ < 12)
+                            REX::INFO("[FathersFallout] mirrored NPC {:#x}: walks to its owner's spot ({}, {:.0f} off) -> {}", local, run ? "run" : "walk", dist, sent);
+                    }
+                }
+                // Standing where its owner's copy stands: face the same way.
+                if (!ownerMoves && dist < 60.0f) {
+                    if (!anim.init) { anim.init = true; anim.heading = s.angleZ; }
+                    float diff = s.angleZ - anim.heading;
+                    while (diff > 3.14159265f) diff -= 6.2831853f;
+                    while (diff < -3.14159265f) diff += 6.2831853f;
+                    anim.heading += std::fabs(diff) < 0.02f ? diff : diff * 0.2f;
+                    actor->SetHeading(anim.heading);
+                } else {
+                    anim.heading = actor->GetHeading();
+                }
+            } else if (g_npcAiMove && myChar) {
+                // Its marker is on its way: leave its graph alone (cutting Speed here left its own walk without one).
+                if (dist > 600.0f) actor->SetPosition(goal, true);
+            } else {
+            if (anim.aiOn) { anim.aiOn = false; FreeMarker(local); actor->InitiateDoNothingPackage(); }
             if (dist > 1500.0f) {
                 actor->SetPosition(goal, true);
             } else {
@@ -2307,7 +2695,6 @@ namespace F4MP
                                                  bodyPos.y + delta.y * alpha,
                                                  bodyPos.z + delta.z * alpha }, true);
             }
-            auto& anim = g_npcAnim[local];
             // Turn toward the owner's heading over a few ticks (a snap every update looked like twitching).
             if (!anim.init) { anim.init = true; anim.heading = s.angleZ; }
             {
@@ -2322,17 +2709,36 @@ namespace F4MP
             anim.smoothSpeed = anim.smoothSpeed * 0.8f + s.speed * 0.2f;
             actor->SetGraphVariableBool("bIsSynced", true);
             actor->SetGraphVariableFloat("Speed", anim.smoothSpeed);
+            // Its own AI's wish to turn (we set the heading) kept it stepping round on the spot; walking is forward.
+            if (g_mirrorOff & 0x10) {   // test: exactly as bodies (Speed/Direction only; turning left to the engine)
+                if (!anim.bodyLike) { anim.bodyLike = true; actor->Reset3D(false, 0, true, 0); }
+                GraphOverride::DetachMovementChannels(actor);
+            } else {
+                GraphOverride::DetachMirrorChannels(actor);
+                actor->SetGraphVariableFloat("TurnDelta", 0.0f);
+            }
+            anim.channelsOff = true;
+            GraphOverride::SetMirrorSpeed(actor, anim.smoothSpeed * g_npcSpeedMult);
+            mirroredNow.push_back(actor);
             const bool wantMoving = anim.moving ? (anim.smoothSpeed > 8.0f) : (anim.smoothSpeed > 30.0f);
             if (wantMoving != anim.moving) {
-                if (wantMoving) StartMoving(actor, anim.sneaking);
+                // Once, as the game does for its own walk. The graph answers "refused" even when it starts walking,
+                // and resending every tick restarted the walk from its first frame 30 times a second: the slow-motion
+                // NPCs.
+                if (wantMoving) StartMovingNpc(actor, anim.sneaking);
                 else GraphOverride::SendEvent(actor, "moveStop");
+                static int s_logged = 0;
+                if (s_logged++ < 60)
+                    REX::INFO("[FathersFallout] mirrored NPC {:#x}: {} at {:.0f}", local, wantMoving ? "moves" : "stops", anim.smoothSpeed);
                 anim.moving = wantMoving;
-                anim.gait = wantMoving ? 1 : 0;
+                anim.gait = 1;   // walkStart is the walk; the run goes out below when it runs
             }
-            switch (StepWatch(actor, anim, anim.moving, anim.smoothSpeed, anim.sneaking, s.speed < 10.0f && anim.smoothSpeed < 15.0f)) {
+            // Some NPC walks step only every ~3 s: the
+            // 1.5 s watchdog restarted his walk each time, a hitch every few seconds.
+            switch (StepWatch(actor, anim, anim.moving, anim.smoothSpeed, anim.sneaking, s.speed < 10.0f && anim.smoothSpeed < 15.0f, 4000)) {
             case 1: {
                 static int s_logged = 0;
-                if (s_logged++ < 40) REX::INFO("[StepWatch] mirrored NPC {:#x}: moving ({:.0f}) but no footsteps for 1.5 s - walk sent again", local, anim.smoothSpeed);
+                if (s_logged++ < 40) REX::INFO("[StepWatch] mirrored NPC {:#x}: moving ({:.0f}) but no footsteps for 4 s - walk sent again", local, anim.smoothSpeed);
                 anim.moving = false;   // moveStart again next tick
                 anim.gait = 0;
                 break;
@@ -2345,26 +2751,34 @@ namespace F4MP
             }
             default: break;
             }
+            }   // SetPosition mode
             // Crouched like its owner's copy (sent since the start, never applied).
-            if (anim.sneaking != s.isSneaking) {
+            if (!(g_mirrorOff & 8) && anim.sneaking != s.isSneaking) {
                 actor->SetSneaking(s.isSneaking);
                 GraphOverride::SendEvent(actor, s.isSneaking ? "SneakStart" : "SneakStop");
                 anim.sneaking = s.isSneaking;
             }
             // Running, not walking fast: the walk animation slid at a run's speed. Same event names as bodies.
+            // NPCs walk at ~75; moved faster than ~140 their walk legs plainly
+            // trailed the ground, so that is already the run.
             if (anim.moving) {
-                const bool run = (s.flags & Network::kNpcRunning) || anim.smoothSpeed > (anim.gait == 2 ? 180.0f : 240.0f);
+                const bool run = (s.flags & Network::kNpcRunning) || anim.smoothSpeed > (anim.gait == 2 ? 110.0f : 140.0f);
                 const int want = run ? 2 : 1;
                 if (want != anim.gait) {
                     const bool drawn = actor->GetWeaponMagicDrawn();
                     const char* a = want == 2 ? (drawn ? "runStart" : "Run") : (drawn ? "walkStart" : "Walk");
                     const char* b = want == 2 ? (drawn ? "Run" : "runStart") : (drawn ? "Walk" : "walkStart");
-                    if (GraphOverride::SendEvent(actor, a) || GraphOverride::SendEvent(actor, b)) anim.gait = want;
+                    // Once per change (resent every tick it restarted the gait, the slow-motion legs): the first name the
+                    // graph knows, the other only if that one was refused.
+                    if (!GraphOverride::SendEvent(actor, a)) GraphOverride::SendEvent(actor, b);
+                    static int s_logged = 0;
+                    if (s_logged++ < 60) REX::INFO("[FathersFallout] mirrored NPC {:#x}: {} at {:.0f}", local, want == 2 ? "run" : "walk", anim.smoothSpeed);
+                    anim.gait = want;
                 }
             }
             // Weapon out or away like the owner's copy (its AI is on a do-nothing package and kept whatever
             // it had: raiders with holstered guns shooting, settlers with guns out). Twice a second at most.
-            {
+            if (!(g_mirrorOff & 2)) {
                 const bool want = (s.flags & Network::kNpcWeaponDrawn) != 0;
                 const auto t = std::chrono::steady_clock::now();
                 GraphOverride::SetMirrorDrawn(local, want);
@@ -2407,6 +2821,7 @@ namespace F4MP
             }
         }
 
+        GraphOverride::KeepMirrorSpeeds(mirroredNow);
         // No longer mirrored (owner stopped sending it, or the area is ours now): free its AI.
         for (auto it = g_drivenOwner.begin(); it != g_drivenOwner.end();) {
             if (!seen.contains(it->first)) { ReleaseDriven(it->first); it = g_drivenOwner.erase(it); }
@@ -2663,6 +3078,11 @@ namespace F4MP
             ImGuiMCP::Text("Other players here: %d", (int)remotes.size());
             if (!g_isHost) {
                 if (ImGuiMCP::Button("Go to host")) GoToHost();
+                ImGuiMCP::SameLine();
+                // Day here, night there: the host's time of day and weather right now.
+                if (ImGuiMCP::Button("Sync time with host"))
+                    Notify(Coop::SyncTimeWithHost() ? "FathersFallout: time of day synced with the host"
+                                                    : "FathersFallout: the host hasn't sent its time yet - try again in a moment");
                 ImGuiMCP::SameLine();
             }
             if (ImGuiMCP::Button("Disconnect")) net.Disconnect();
@@ -3042,6 +3462,7 @@ namespace F4MP
         // Saves only: a New Game starts in the pre-war intro, and travelling to the host from there
         // would break it. New players join once they've left Vault 111 and saved.
         if (a_msg->type == F4SE::MessagingInterface::kPostLoadGame) {
+            F4MP::CrashLog::Reassert();
             F4MP::Workshop::OnGameLoaded();
             F4MP::Coop::OnGameLoaded();
             AutoConnectFromIni();
@@ -3053,6 +3474,7 @@ namespace F4MP
         }
 
         if (a_msg->type == F4SE::MessagingInterface::kGameDataReady) {
+            F4MP::CrashLog::Reassert();
             // Keep simulating while the window is unfocused. A host that alt-tabs would
             // otherwise freeze the shared world and queue every incoming sync message.
             auto* alwaysActive = RE::GetINISetting("bAlwaysActive:General");
@@ -3091,6 +3513,7 @@ namespace F4MP
 
 F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
+    F4MP::CrashLog::KeepPreviousLog();
     F4SE::Init(a_f4se);
     REX::INFO("[FathersFallout] FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb (GPL v3 + NOTICE)");
     REX::INFO("[FathersFallout] plugin loaded (CommonLibF4)");

@@ -56,6 +56,7 @@ namespace F4MP::Coop
 
     void RegisterSinks();   // once, at kGameDataReady
     void Tick();            // ~10/s while connected
+    bool SyncTimeWithHost();   // guest: the host's clock and weather now (menu); false before the host sent one
     void OnDisconnected();  // forget all per-session state
     void OnGameLoaded();    // kPostLoadGame: hits sent before the load are dropped for a moment
 

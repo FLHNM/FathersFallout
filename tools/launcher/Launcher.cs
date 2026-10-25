@@ -32,8 +32,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.23.0.0")]
-[assembly: AssemblyFileVersion("0.23.0.0")]
+[assembly: AssemblyVersion("0.24.1.0")]
+[assembly: AssemblyFileVersion("0.24.1.0")]
 
 namespace F4MPLauncher
 {
@@ -820,12 +820,18 @@ namespace F4MPLauncher
         // addresses, Steam IDs, friend codes, the Windows user name in folder paths), then the report form.
         void ShareLog()
         {
-            string log = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "My Games", "Fallout4", "F4SE", "FathersFallout.log");
-            if (!File.Exists(log)) { Say("NO CO-OP LOG YET - PLAY A SESSION FIRST (THE LOG IS MADE WHEN THE GAME STARTS)."); return; }
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "My Games", "Fallout4", "F4SE");
+            string log = Path.Combine(dir, "FathersFallout.log");
+            // The game rewrites its log on every start, so a player who relaunched after a crash only sent
+            // the new session: since Update 24 the one before is kept as FathersFallout-previous.log.
+            string previous = Path.Combine(dir, "FathersFallout-previous.log");
+            if (!File.Exists(log) && !File.Exists(previous)) { Say("NO CO-OP LOG YET - PLAY A SESSION FIRST (THE LOG IS MADE WHEN THE GAME STARTS)."); return; }
             try {
-                string text;
-                using (var f = new FileStream(log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var r = new StreamReader(f)) text = r.ReadToEnd();
+                string text = "";
+                if (File.Exists(log))
+                    text += "===== LATEST SESSION (" + File.GetLastWriteTime(log).ToString("yyyy-MM-dd HH:mm") + ") =====\r\n" + ReadShared(log) + "\r\n";
+                if (File.Exists(previous))
+                    text += "\r\n===== SESSION BEFORE THAT (" + File.GetLastWriteTime(previous).ToString("yyyy-MM-dd HH:mm") + ") =====\r\n" + ReadShared(previous);
                 text = CleanLog(text);
                 string outFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
                     "FathersFallout-log-" + DateTime.Now.ToString("yyyyMMdd-HHmm") + ".txt");
@@ -837,6 +843,12 @@ namespace F4MPLauncher
             } catch (Exception e) {
                 Say("COULDN'T COPY THE LOG: " + e.Message.ToUpper());
             }
+        }
+
+        static string ReadShared(string path)
+        {
+            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var r = new StreamReader(f)) return r.ReadToEnd();
         }
 
         static string CleanLog(string t)

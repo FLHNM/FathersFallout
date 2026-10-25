@@ -62,7 +62,8 @@ struct PlayerPositionMsg {
     uint32_t playerId;
     float x, y, z;
     float pitch;         // look up/down (client's velocityX slot, relayed as is)
-    float velocityY, velocityZ;
+    uint32_t extraFlags; // client's kPos* bits (Pip-Boy light...), relayed as is; was the unused velocityY
+    float velocityZ;
     float angleZ;        // view heading
     float speed;         // movement speed
     float moveDir;       // movement direction relative to facing

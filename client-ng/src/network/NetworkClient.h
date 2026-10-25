@@ -108,7 +108,8 @@ struct PlayerPositionMsg {
     uint32_t playerId;
     float x, y, z;
     float pitch;         // look up/down (rad, + = down, as the game's angle.x); was the unused velocityX
-    float velocityY, velocityZ;
+    uint32_t extraFlags; // kPos* bits (Update 24); was the unused velocityY, which every older game sent as 0.0f
+    float velocityZ;
     float angleZ;        // view heading (rad): where the player looks
     float speed;         // movement speed (units/s)
     float moveDir;       // movement direction relative to facing (rad, 0 = forward)
@@ -120,6 +121,10 @@ struct PlayerPositionMsg {
     bool isJumping;
     bool weaponDrawn;   // weapon out (combat stance)
 };
+// Packed: a size change would make older games drop every position (they check the size).
+static_assert(sizeof(PlayerPositionMsg) == 50, "PlayerPositionMsg must keep its size: older games read it");
+constexpr uint32_t kPosLightOn = 1u << 0;   // Pip-Boy light / power armor headlamp on
+constexpr uint32_t kPosLightColorShift = 8; // bits 8-31: that Pip-Boy's color 0xRRGGBB (0 = not sent)
 
 // Player appearance (old format, still relayed): sent once on connect.
 struct PlayerAppearanceMsg {

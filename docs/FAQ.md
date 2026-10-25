@@ -57,8 +57,8 @@ the same mods, or base game + DLC only. Texture or mesh mods without plugins are
 
 ## How do I report a bug?
 
-1. **Right after playing** (the log is replaced every time the game starts), open the launcher and
-   press **[ SHARE LOG ]**.
+1. **Right after playing**, open the launcher and press **[ SHARE LOG ]**. Since Update 24 it also
+   sends the session before, so after a crash you can restart the game and still send the crashed session.
 2. It saves `FathersFallout-log-<date>.txt` to your Desktop with **personal details removed**
    (IP addresses, Steam IDs, friend codes, your Windows user name) and opens the
    [bug report form](https://github.com/FLHNM/FathersFallout/issues/new?template=bug_report.yml).

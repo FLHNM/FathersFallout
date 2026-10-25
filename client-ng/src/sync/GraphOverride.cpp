@@ -35,6 +35,7 @@ namespace F4MP::GraphOverride
             std::atomic<float> pitch{ 0.0f };      // radians, + = down
             std::atomic<bool> resync{ false };   // engine changed the graph's state: resend ours
             std::atomic<int> wantDrawn{ -1 };      // its player's weapon: 1 out, 0 away, -1 unknown
+            std::atomic<long long> wantHoldUntil{ 0 };   // a draw/shot event set wantDrawn ahead of the position stream
             std::atomic<long long> swapUntil{ 0 }; // ms clock: our own equip change may holster/draw
         };
 
@@ -43,7 +44,20 @@ namespace F4MP::GraphOverride
             return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         }
         std::array<Slot, 32> g_slots;
+        // Mirrored NPCs: only their walk speed, written like the bodies' (their own table: the body slots also
+        // decide which engine events a body drops).
+        struct NpcSlot
+        {
+            std::atomic<const Holder*> holder{ nullptr };
+            std::atomic<float> speed{ 0.0f };
+            std::atomic<bool> measured{ false };   // released: Speed from how fast it really moves (its own AI walks it)
+            std::uint32_t formId = 0;
+            RE::NiPoint3 lastPos{};
+            long long lastMs = 0;
+        };
+        std::array<NpcSlot, 64> g_npcSlots;
         std::atomic<unsigned long long> g_weaponBlocked{ 0 };
+        std::atomic<std::uint32_t> g_eventProbe{ 0 };   // test aid: log every graph event this actor gets
 
         PreUpdate_t g_original = nullptr;
         // Graph Pitch per radian of look pitch ([Bridge] f4mp:pitchscale).
@@ -143,6 +157,46 @@ namespace F4MP::GraphOverride
                 g_overrides.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
+            // Set at ~30/s from the sync, the engine's 0 won most frames: the legs played a slow walk while the
+            // NPC moved at its owner's pace, sliding.
+            for (auto& s : g_npcSlots) {
+                if (s.holder.load(std::memory_order_acquire) != a_self) continue;
+                static const RE::BSFixedString kSpeed{ "Speed" };
+                static const RE::BSFixedString kSpeedSmoothed{ "SpeedSmoothed" };
+                static const RE::BSFixedString kDirection{ "Direction" };
+                auto* holder = const_cast<Holder*>(a_self);
+                if (s.measured.load(std::memory_order_relaxed)) {
+                    const auto pos = static_cast<const RE::Actor*>(a_self)->data.location;
+                    const long long now = NowMs();
+                    const float dt = (now - s.lastMs) / 1000.0f;
+                    if (s.lastMs && dt > 0.005f && dt < 0.5f) {
+                        const float dx = pos.x - s.lastPos.x, dy = pos.y - s.lastPos.y;
+                        const float v = std::sqrt(dx * dx + dy * dy) / dt;
+                        s.speed.store(s.speed.load(std::memory_order_relaxed) * 0.8f + (v < 1200.0f ? v : 0.0f) * 0.2f, std::memory_order_relaxed);
+                    }
+                    s.lastPos = pos;
+                    s.lastMs = now;
+                    holder->SetGraphVariableFloat(kSpeed, s.speed.load(std::memory_order_relaxed));
+                    holder->SetGraphVariableFloat(kSpeedSmoothed, s.speed.load(std::memory_order_relaxed));
+                    holder->SetGraphVariableFloat(kDirection, 0.0f);
+                    return;
+                }
+                const float speed = s.speed.load(std::memory_order_relaxed);
+                holder->SetGraphVariableFloat(kSpeed, speed);
+                holder->SetGraphVariableFloat(kSpeedSmoothed, speed);
+                holder->SetGraphVariableFloat(kDirection, 0.0f);   // it walks the way it faces
+                // The engine sets the walk to a quarter of its speed on an actor whose AI does nothing (testing: a mirrored
+                // Preston had WalkSpeedMult 0.25, a body 1.0): the slow-motion NPCs seen at the Diner.
+                static const RE::BSFixedString kWalkMult{ "WalkSpeedMult" };
+                static const RE::BSFixedString kRunMult{ "RunSpeedMult" };
+                holder->SetGraphVariableFloat(kWalkMult, 1.0f);
+                holder->SetGraphVariableFloat(kRunMult, 1.0f);
+                // The dog graph's name for it. Graphs without
+                // a variable just refuse the write.
+                static const RE::BSFixedString kDogWalkMult{ "fWalkClipMult" };
+                holder->SetGraphVariableFloat(kDogWalkMult, 1.0f);
+                return;
+            }
         }
 
         const Holder* HolderOf(RE::Actor* a_actor) { return a_actor ? static_cast<const Holder*>(a_actor) : nullptr; }
@@ -193,6 +247,10 @@ namespace F4MP::GraphOverride
                 const bool ok = g_originalNotify(a_self, a_event);
                 slot->resync.store(true, std::memory_order_release);
                 return ok;
+            }
+            if (const auto probe = g_eventProbe.load(std::memory_order_relaxed); probe && static_cast<RE::Actor*>(a_self)->GetFormID() == probe) {
+                const char* ev = a_event.c_str();
+                REX::INFO("[GraphOverride] probe {:#x}: {} event {}", probe, t_ours ? "our" : "engine", ev ? ev : "?");
             }
             if (!t_ours) {
                 // A mirrored NPC idles only as its owner's copy does (CoopNpcAnim): its own AI picked
@@ -326,7 +384,17 @@ namespace F4MP::GraphOverride
 
     void SetWantDrawn(RE::Actor* a_body, bool a_drawn)
     {
-        if (Slot* s = SlotOf(HolderOf(a_body))) s->wantDrawn.store(a_drawn ? 1 : 0, std::memory_order_relaxed);
+        Slot* s = SlotOf(HolderOf(a_body));
+        if (!s || NowMs() < s->wantHoldUntil.load(std::memory_order_relaxed)) return;
+        s->wantDrawn.store(a_drawn ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    void HoldWantDrawn(RE::Actor* a_body, bool a_drawn)
+    {
+        Slot* s = SlotOf(HolderOf(a_body));
+        if (!s) return;
+        s->wantDrawn.store(a_drawn ? 1 : 0, std::memory_order_relaxed);
+        s->wantHoldUntil.store(NowMs() + 1000, std::memory_order_relaxed);
     }
 
     void AllowWeaponSwap(RE::Actor* a_body)
@@ -389,41 +457,102 @@ namespace F4MP::GraphOverride
             }
         }
 
-        std::vector<void*> g_detached;   // graph managers whose movement channels are unbound
+        std::vector<void*> g_detached;       // graph managers whose movement channels are unbound
+        std::vector<void*> g_turnDetached;   // mirrored NPCs' graph managers whose turn channels are unbound
+
+        // Unbinds the named channels of an actor's graph. Per graph manager, not per actor: a 3D reset
+        // (weapon swap, cell change) builds a new manager with its channels bound again.
+        void Detach(RE::Actor* a_actor, std::vector<void*>& a_done, std::initializer_list<const char*> a_names, const char* a_what)
+        {
+            if (!a_actor) return;
+            RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
+            if (!a_actor->GetAnimationGraphManagerImpl(mgr) || !mgr) return;   // graph not loaded yet
+            void* key = mgr.get();
+            for (auto* m : a_done) if (m == key) return;
+            a_done.push_back(key);
+            if (a_done.size() > 64) a_done.erase(a_done.begin());
+
+            auto* arr = reinterpret_cast<RawArray*>(reinterpret_cast<char*>(mgr.get()) + kBoundChannelOffset);
+            if (!arr->data || arr->size > 256) {
+                REX::WARN("[GraphOverride] bound channels look wrong (size {}), not touching them", arr->size);
+                return;
+            }
+            std::string names;
+            std::uint32_t kept = 0, removed = 0;
+            for (std::uint32_t i = 0; i < arr->size; ++i) {
+                void* ch = arr->data[i];
+                const char* name = ch ? ChannelName(ch) : nullptr;
+                names += name ? name : "?";
+                names += ' ';
+                bool drop = false;
+                for (auto* n : a_names) drop = drop || (name && _stricmp(name, n) == 0);
+                if (drop) { removed++; continue; }   // its reference is leaked on purpose (tiny, once per graph)
+                arr->data[kept++] = ch;
+            }
+            arr->size = kept;
+            REX::INFO("[GraphOverride] {} {:#x}: bound channels [{}] -> unbound {}", a_what, a_actor->GetFormID(), names, removed);
+        }
     }
 
     void DetachMovementChannels(RE::Actor* a_body)
     {
-        if (!a_body) return;
-        RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
-        if (!a_body->GetAnimationGraphManagerImpl(mgr) || !mgr) return;   // graph not loaded yet
-        // Per graph manager, not per actor: a 3D reset (weapon swap, cell change) builds a new
-        // manager with its channels bound again.
-        void* key = mgr.get();
-        for (auto* m : g_detached) if (m == key) return;
-        g_detached.push_back(key);
-        if (g_detached.size() > 64) g_detached.erase(g_detached.begin());
+        Detach(a_body, g_detached, { "Speed", "Direction", "SpeedSmoothed", "DirectionDegrees", "Pitch" }, "body");
+    }
 
-        auto* arr = reinterpret_cast<RawArray*>(reinterpret_cast<char*>(mgr.get()) + kBoundChannelOffset);
-        if (!arr->data || arr->size > 256) {
-            REX::WARN("[GraphOverride] bound channels look wrong (size {}), not touching them", arr->size);
-            return;
+    void SetMirrorSpeed(RE::Actor* a_npc, float a_speed)
+    {
+        const Holder* h = HolderOf(a_npc);
+        if (!h) return;
+        NpcSlot* free = nullptr;
+        for (auto& s : g_npcSlots) {
+            const Holder* cur = s.holder.load(std::memory_order_relaxed);
+            if (cur == h) { free = &s; break; }
+            if (!cur && !free) free = &s;
         }
-        std::string names;
-        std::uint32_t kept = 0, removed = 0;
-        for (std::uint32_t i = 0; i < arr->size; ++i) {
-            void* ch = arr->data[i];
-            const char* name = ch ? ChannelName(ch) : nullptr;
-            names += name ? name : "?";
-            names += ' ';
-            const bool drop = name && (_stricmp(name, "Speed") == 0 || _stricmp(name, "Direction") == 0 ||
-                                       _stricmp(name, "SpeedSmoothed") == 0 || _stricmp(name, "DirectionDegrees") == 0 ||
-                                       _stricmp(name, "Pitch") == 0);
-            if (drop) { removed++; continue; }   // its reference is leaked on purpose (tiny, once per body)
-            arr->data[kept++] = ch;
+        if (!free) return;
+        free->measured.store(false, std::memory_order_relaxed);
+        free->formId = a_npc->GetFormID();
+        free->speed.store(a_speed, std::memory_order_relaxed);
+        free->holder.store(h, std::memory_order_release);
+    }
+
+    void ReleaseMirrorSpeed(RE::Actor* a_npc)
+    {
+        const Holder* h = HolderOf(a_npc);
+        for (auto& s : g_npcSlots)
+            if (h && s.holder.load(std::memory_order_relaxed) == h) { s.lastMs = 0; s.measured.store(true, std::memory_order_relaxed); }
+    }
+
+    void ClearMirrorSpeed(RE::Actor* a_npc)
+    {
+        const Holder* h = HolderOf(a_npc);
+        for (auto& s : g_npcSlots)
+            if (h && s.holder.load(std::memory_order_relaxed) == h) s.holder.store(nullptr, std::memory_order_release);
+    }
+
+    void KeepMirrorSpeeds(const std::vector<RE::Actor*>& a_live)
+    {
+        for (auto& s : g_npcSlots) {
+            const Holder* cur = s.holder.load(std::memory_order_relaxed);
+            if (!cur) continue;
+            bool live = false;
+            for (auto* a : a_live) live = live || HolderOf(a) == cur;
+            // Released ones stay while that same actor still exists (a freed actor's memory may hold another).
+            if (!live && s.measured.load(std::memory_order_relaxed)) {
+                auto* f = RE::TESForm::GetFormByID(s.formId);
+                auto* a = f ? f->As<RE::Actor>() : nullptr;
+                live = a && HolderOf(a) == cur && !a->IsDeleted() && a->Get3D();
+            }
+            if (!live) s.holder.store(nullptr, std::memory_order_release);
         }
-        arr->size = kept;
-        REX::INFO("[GraphOverride] body {:#x}: bound channels [{}] -> unbound {}", a_body->GetFormID(), names, removed);
+    }
+
+    void DetachMirrorChannels(RE::Actor* a_npc)
+    {
+        // Speed too: left bound, the engine's 0 won on Dogmeat's graph and he glided in his standing pose.
+        // An unbound channel can't be bound again: back on its own AI the NPC keeps a measured Speed (ReleaseMirrorSpeed).
+        Detach(a_npc, g_turnDetached, { "TurnDelta", "TurnDeltaSmoothed", "Speed", "SpeedSmoothed", "Direction", "DirectionDegrees" },
+            "mirrored NPC");
     }
 
     void Set(RE::Actor* a_body, float a_speed, float a_direction)
@@ -490,6 +619,8 @@ namespace F4MP::GraphOverride
         // Idle forms play through events named idle... (IdleSmoking, idleChairSitting, IdleStop...).
         return a_ev && _strnicmp(a_ev, "idle", 4) == 0;
     }
+
+    void ProbeEvents(std::uint32_t a_formId) { g_eventProbe.store(a_formId, std::memory_order_relaxed); }
 
     void SetMirror(std::uint32_t a_formId, bool a_on)
     {

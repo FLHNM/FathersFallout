@@ -3,7 +3,7 @@ includes("lib/commonlibf4")
 
 set_project("FathersFallout")
 set_license("GPL-3.0")
-set_version("0.23.0")
+set_version("0.24.1")
 set_languages("c++23")
 set_warnings("allextra")
 

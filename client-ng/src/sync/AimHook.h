@@ -17,7 +17,8 @@ namespace RE { class Actor; }
 namespace F4MP::AimHook
 {
     void Install();   // once, at game data ready
-    void SetTrace(bool a_on);   // [Debug] AimTrace: log where shots (bodies' and ours) hit
+    void SetTrace(bool a_on);
+    void ProbeDelta(std::uint32_t a_formId);   // test aid: log that actor's animation time steps   // [Debug] AimTrace: log where shots (bodies' and ours) hit
     void InstallSpine(RE::Actor* a_anyBody);   // once, from the first body (its class's vtable)
     void SetSpine(int a_mode, float a_scale);   // bridge f4mp:spine <0 off|1|2> <scale>
     // Main thread, every sync tick: the body's facing (rad, 0 = +Y) and look pitch (rad, + = down).

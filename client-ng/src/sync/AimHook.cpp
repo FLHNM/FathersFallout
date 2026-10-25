@@ -125,8 +125,14 @@ namespace F4MP::AimHook
             else a_node->local.rotate = a_node->local.rotate * P * R.Transpose() * P.Transpose();
         }
 
+        std::atomic<std::uint32_t> g_deltaProbe{ 0 };   // test aid: log this ref's animation time steps
+
         void UpdateAnimationHook(RE::TESObjectREFR* a_ref, float a_delta)
         {
+            if (const auto probe = g_deltaProbe.load(std::memory_order_relaxed); probe && a_ref && a_ref->GetFormID() == probe) {
+                static std::atomic<int> s_n{ 0 };
+                if (s_n.fetch_add(1, std::memory_order_relaxed) % 30 == 0) REX::INFO("[AimHook] {:#x} animation step {:.4f} s", probe, a_delta);
+            }
             g_origUpdAnim(a_ref, a_delta);
             const int mode = g_spineMode.load(std::memory_order_relaxed);
             if (!mode) return;
@@ -226,6 +232,7 @@ namespace F4MP::AimHook
     }
 
     void SetTrace(bool a_on) { g_trace.store(a_on, std::memory_order_relaxed); }
+    void ProbeDelta(std::uint32_t a_formId) { g_deltaProbe.store(a_formId, std::memory_order_relaxed); }
 
     void SetSpine(int a_mode, float a_scale)
     {

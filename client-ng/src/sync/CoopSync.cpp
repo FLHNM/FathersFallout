@@ -264,6 +264,14 @@ namespace F4MP::Coop
         struct WantMods { uint32_t weapon = 0; uint8_t count = 0; CoopModEntry mods[kMaxItemMods]{}; };
         std::unordered_map<uint32_t, WantMods> g_wantMods;                   // playerId -> weapon mods
         std::unordered_map<uint32_t, std::vector<uint32_t>> g_appliedMods;   // body FormID -> ModKey applied
+        // Quick weapon swaps (a guest went 10mm, shotgun, 10mm, laser musket within seconds in a
+        // museum fight, and the host's game crashed during the next one). Every change drops a modded copy,
+        // picks it up and rebuilds the body's 3D, so a change is only applied once it has held for a moment
+        // and at most every kEquipMinGap per body: a run of swaps ends up as one rebuild with the last weapon.
+        std::unordered_map<uint32_t, Clock::time_point> g_wantChangedAt;     // playerId -> last change received
+        std::unordered_map<uint32_t, Clock::time_point> g_equipAppliedAt;    // body FormID -> last change applied
+        constexpr auto kEquipSettle = std::chrono::milliseconds(350);
+        constexpr auto kEquipMinGap = std::chrono::milliseconds(900);
 
         // What we last put on each body (body FormID -> sorted forms). The engine's equipped
         // flags on inventory stacks are not set for NPC bodies (verified in game: always empty),
@@ -356,6 +364,11 @@ namespace F4MP::Coop
                 auto applied = g_appliedEquip.find(bodyId);
                 const bool modsChanged = g_appliedMods[bodyId] != modKey;
                 if (applied != g_appliedEquip.end() && applied->second == want->second && !modsChanged) continue;
+                if (applied != g_appliedEquip.end()) {   // the first outfit goes on at once
+                    const auto now = Clock::now();
+                    if (now - g_wantChangedAt[pid] < kEquipSettle || now - g_equipAppliedAt[bodyId] < kEquipMinGap) continue;
+                }
+                g_equipAppliedAt[bodyId] = Clock::now();
                 const auto& w = want->second;
                 auto wanted = [&](uint32_t fid) { return std::binary_search(w.begin(), w.end(), fid); };
 
@@ -1236,8 +1249,21 @@ namespace F4MP::Coop
             std::memcpy(name, m.name, sizeof(m.name));
             auto* body = BodyOfPlayer(m.senderId);
             if (!body) return;
-            // A newer aim/shot replaces one still waiting (the player moved on).
-            if (WorthRetry(name)) std::erase_if(g_animRetry, [&](auto& r) { return r.pid == m.senderId; });
+            // Draw-and-shoot in one press: WeapEquip and attackStart come before the position packet that says the
+            // weapon is out, and the body's own draw was dropped as its AI "drawing against its player"
+            // (a quarter of the host's shots refused, the first shot of each fight 0.7 s late or lost).
+            const bool out = _stricmp(name, "WeapEquip") == 0 || WorthRetry(name);
+            if (out || _stricmp(name, "Unequip") == 0) GraphOverride::HoldWantDrawn(body, out);
+            // Shots still waiting stay queued (a newer one used to replace them: lost shots); aims are replaced.
+            if (WorthRetry(name)) {
+                const bool shot = _strnicmp(name, "attackStart", 11) == 0;
+                std::erase_if(g_animRetry, [&](auto& r) { return r.pid == m.senderId && (!shot || _strnicmp(r.name.c_str(), "attackStart", 11) != 0); });
+                int waiting = 0;
+                for (auto& r : g_animRetry) waiting += r.pid == m.senderId;
+                if (waiting >= 2)   // two waiting at most: the oldest goes
+                    if (auto old = std::find_if(g_animRetry.begin(), g_animRetry.end(), [&](auto& r) { return r.pid == m.senderId; }); old != g_animRetry.end())
+                        g_animRetry.erase(old);
+            }
             const bool ok = GraphOverride::SendEvent(body, name);
             static int s_logged = 0, s_refused = 0;
             if (s_logged++ < 600) REX::INFO("[Coop] body of player {}: {} -> {}", m.senderId, name, ok);
@@ -1255,7 +1281,9 @@ namespace F4MP::Coop
         void RetryAnimEvents()
         {
             const auto now = Clock::now();
+            std::unordered_set<uint32_t> tried;   // oldest first, one per player per tick
             for (auto it = g_animRetry.begin(); it != g_animRetry.end();) {
+                if (!tried.insert(it->pid).second) { ++it; continue; }
                 auto* body = BodyOfPlayer(it->pid);
                 const bool ok = body && GraphOverride::SendEvent(body, it->name.c_str());
                 const bool expired = now - it->since > it->window;
@@ -1491,9 +1519,22 @@ namespace F4MP::Coop
             Send(MessageType::CoopWorldTime, msg);
         }
 
+        // The host's latest clock (every 2 s): the menu's "Sync time with host" applies it at once.
+        CoopWorldTimeMsg g_hostTime{};
+        Clock::time_point g_hostTimeAt{};
+
+        void ApplyWorldTime(const CoopWorldTimeMsg& m, bool a_force);
+
         void OnWorldTime(const CoopWorldTimeMsg& m)
         {
             if (IsHost() || m.senderId == Authority::MyId()) return;
+            g_hostTime = m;
+            g_hostTimeAt = Clock::now();
+            ApplyWorldTime(m, false);
+        }
+
+        void ApplyWorldTime(const CoopWorldTimeMsg& m, bool a_force)
+        {
             auto* cal = RE::Calendar::GetSingleton();
             if (!cal || !cal->gameHour || !cal->gameDay || !cal->gameMonth || !cal->gameYear || !cal->timeScale) return;
 
@@ -1503,13 +1544,20 @@ namespace F4MP::Coop
             diff = std::min(diff, 24.0f - diff);   // 23:59 vs 00:01 is 2 minutes apart
             const bool newDate = cal->gameDay->value != m.gameDay || cal->gameMonth->value != m.gameMonth ||
                                  cal->gameYear->value != m.gameYear;
-            if (diff > 0.05f || newDate) {
+            if (a_force || diff > 0.05f || newDate) {
                 static bool s_logged = false;
-                if (!s_logged || diff > 0.5f) {
+                if (!s_logged || diff > 0.5f || a_force) {
                     s_logged = true;
                     REX::INFO("[Coop] clock {:.2f}h -> host {:.2f}h (day {}/{}/{})", cal->gameHour->value, m.gameHour,
                         m.gameMonth + 1, m.gameDay, m.gameYear);
                 }
+                // GameDaysPassed moves with the hour: a guest joined at midnight, the clock said
+                // the host's 6 am, and their sky stayed night all session. Only the time of day (+-12 h): the two
+                // saves' dates differ by weeks, and moving by that sent the counter below zero.
+                float dh = m.gameHour - cal->gameHour->value;
+                if (dh > 12.0f) dh -= 24.0f;
+                if (dh < -12.0f) dh += 24.0f;
+                if (cal->gameDaysPassed) cal->gameDaysPassed->value += dh / 24.0f;
                 cal->gameHour->value = m.gameHour;
                 cal->gameDay->value = m.gameDay;
                 cal->gameMonth->value = m.gameMonth;
@@ -1522,7 +1570,7 @@ namespace F4MP::Coop
             auto* cell = player ? player->parentCell : nullptr;
             auto* sky = RE::Sky::GetSingleton();
             if (!m.weatherFormId || !sky || !cell || cell->IsInterior()) return;
-            if (sky->currentWeather && sky->currentWeather->GetFormID() == m.weatherFormId) return;
+            if (!a_force && sky->currentWeather && sky->currentWeather->GetFormID() == m.weatherFormId) return;
             if (auto* weather = LookupForm<RE::TESWeather>(m.weatherFormId)) {
                 sky->ForceWeather(weather, false);
                 REX::INFO("[Coop] weather -> host's {:#x}", m.weatherFormId);
@@ -1781,6 +1829,28 @@ namespace F4MP::Coop
             return s_companions && a->IsInFaction(s_companions);
         }
 
+        // A body's replayed shot (0 damage, for show) that hit an NPC who isn't against us: in Fallout 4 even
+        // that counts as an attack by the player's side. Preston once turned on the host in the
+        // museum, and the quest couldn't go on. Calmed in Tick if it picked a fight with one of us.
+        std::vector<std::pair<uint32_t, Clock::time_point>> g_bodyHitNpcs;
+
+        void CalmBodyHitNpcs()
+        {
+            auto* pl = RE::PlayerCharacter::GetSingleton();
+            const auto now = Clock::now();
+            for (auto it = g_bodyHitNpcs.begin(); it != g_bodyHitNpcs.end();) {
+                auto* a = LookupForm<RE::Actor>(it->first);
+                auto target = a && a->IsInCombat() ? a->currentCombatTarget.get() : RE::NiPointer<RE::Actor>{};
+                const bool onUs = target && (target.get() == pl || GetPlayerIdForBody(target->GetFormID()));
+                if (onUs) {
+                    a->StopCombat();
+                    REX::INFO("[Coop] NPC {:#x} turned on {:#x} after a body's replayed shot hit it: calmed", it->first, target->GetFormID());
+                }
+                if (onUs || !a || now - it->second > std::chrono::seconds(6)) it = g_bodyHitNpcs.erase(it);
+                else ++it;
+            }
+        }
+
         class HitSink final : public RE::BSTEventSink<RE::TESHitEvent>
         {
         public:
@@ -1803,6 +1873,12 @@ namespace F4MP::Coop
                     REX::INFO("[HitTrace] target {:#x} cause {:#x} usesHitData {} health {:.1f} flags {:#x}",
                         target ? target->GetFormID() : 0u, cause ? cause->GetFormID() : 0u, e.usesHitData,
                         e.usesHitData ? e.hitData.healthDamage : -1.0f, e.usesHitData ? static_cast<uint32_t>(e.hitData.flags.underlying()) : 0u);
+                }
+                if (auto* pl = RE::PlayerCharacter::GetSingleton(); target && cause && target != pl && GetPlayerIdForBody(cause->GetFormID()) &&
+                        !GetPlayerIdForBody(target->GetFormID()) && !IsMirroredNpc(target->GetFormID())) {
+                    auto* npc = target->As<RE::Actor>();
+                    if (npc && !npc->IsDead(false) && !npc->GetHostileToActor(pl) && g_bodyHitNpcs.size() < 64)
+                        g_bodyHitNpcs.emplace_back(npc->GetFormID(), Clock::now());
                 }
                 // A body's replayed shot hit our player. The real hit (if any) is the shooter's own and
                 // reaches us as CoopPlayerDamage; this copy is for show: give the health back.
@@ -2148,14 +2224,17 @@ namespace F4MP::Coop
                 if (auto* m = As<CoopEquipmentMsg>(item); m && g_settings.equipment) {
                     const uint8_t n = std::min<uint8_t>(m->count, static_cast<uint8_t>(std::size(m->forms)));
                     auto& want = g_wantEquip[m->senderId];
+                    auto& wm = g_wantMods[m->senderId];
+                    const auto oldForms = want;
+                    const auto oldKey = ModKey(wm.weapon, wm.mods, wm.count);
                     want.assign(m->forms, m->forms + n);
                     // Power armor pieces (and the frame item) worn as plain armor drew a broken body:
                     // the body gets a frame of its own with them on it (sync/Activity, CoopPowerArmor).
                     std::erase_if(want, [](uint32_t f) { return IsPowerArmorItem(LookupForm<RE::TESForm>(f)); });
-                    auto& wm = g_wantMods[m->senderId];
                     wm.weapon = m->weaponFormId;
                     wm.count = std::min<uint8_t>(m->numWeaponMods, static_cast<uint8_t>(kMaxItemMods));
                     std::copy_n(m->weaponMods, wm.count, wm.mods);
+                    if (want != oldForms || ModKey(wm.weapon, wm.mods, wm.count) != oldKey) g_wantChangedAt[m->senderId] = Clock::now();
                 }
                 break;
             case MessageType::CoopPlayerDamage:
@@ -2271,10 +2350,24 @@ namespace F4MP::Coop
         REX::INFO("[Coop] event sinks registered (container, activate, hit {})", static_cast<void*>(hitSrc));
     }
 
+    bool SyncTimeWithHost()
+    {
+        if (IsHost() || g_hostTimeAt == Clock::time_point{}) return false;
+        // The host's clock moved on since that message: by the game time those real seconds are worth.
+        CoopWorldTimeMsg m = g_hostTime;
+        const float secs = std::chrono::duration<float>(Clock::now() - g_hostTimeAt).count();
+        m.gameHour += secs * m.timeScale / 3600.0f;
+        if (m.gameHour >= 24.0f) m.gameHour -= 24.0f;   // the date follows with the host's next message
+        ApplyWorldTime(m, true);
+        REX::INFO("[Coop] time synced with the host by hand: {:.2f}h", m.gameHour);
+        return true;
+    }
+
     void Tick()
     {
         auto& net = NetworkClient::GetInstance();
         if (!net.IsConnected()) return;
+        CalmBodyHitNpcs();
 
         if (!g_helloSent) {
             g_helloSent = true;
@@ -2364,6 +2457,8 @@ namespace F4MP::Coop
         g_wantMods.clear();
         g_appliedEquip.clear();
         g_appliedMods.clear();
+        g_wantChangedAt.clear();
+        g_equipAppliedAt.clear();
         g_npcWornSent.clear();
         g_npcWornWant.clear();
         g_npcWornApplied.clear();
