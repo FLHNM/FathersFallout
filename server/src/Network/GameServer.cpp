@@ -416,8 +416,8 @@ void GameServer::BroadcastMessage(MessageType type, const void* data, uint32_t s
         memcpy(buffer.data() + sizeof(MessageHeader), data, size);
     }
 
-    // Positions and NPC states: unreliable, newest wins (a lost one must not hold up the rest).
-    const int flags = (type == MessageType::PlayerPosition || type == MessageType::NpcState)
+    // Positions, NPC states and voice: unreliable, newest wins (a lost one must not hold up the rest).
+    const int flags = (type == MessageType::PlayerPosition || type == MessageType::NpcState || type == MessageType::CoopVoice)
                           ? k_nSteamNetworkingSend_UnreliableNoNagle : k_nSteamNetworkingSend_Reliable;
     for (const auto& [conn, client] : m_clients) {
         if (client.isConnected && client.id != excludeId) {

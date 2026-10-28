@@ -377,6 +377,11 @@ namespace F4MP::GraphOverride
         t_ours = true;
         const bool ok = a_body && a_body->NotifyAnimationGraphImpl(a_event);
         t_ours = false;
+        // Aiming down sights swaps the locomotion subgraph: a moving body kept its position but lost the walk
+        // and glided until the footstep watchdog (1.5 s) noticed (39% of aimed movement had
+        // no footsteps, 13% otherwise). An equip/unequip "fixed" it because those resync; aiming does too now.
+        if (ok && a_event && _strnicmp(a_event, "rifleSighted", 12) == 0)
+            if (Slot* s = SlotOf(HolderOf(a_body))) s->resync.store(true, std::memory_order_release);
         return ok;
     }
 

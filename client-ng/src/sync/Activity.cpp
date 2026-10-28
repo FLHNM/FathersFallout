@@ -11,9 +11,12 @@
 #include "sync/GraphOverride.h"
 #include "sync/Workshop.h"
 #include "network/NetworkClient.h"
+#include "sync/CallHooks.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -44,8 +47,47 @@ namespace F4MP::Activity
 
         bool Usable(RE::Actor* a) { return a && a->Get3D() && !a->IsDisabled() && !a->IsDead(false); }
 
+        // ---- idles the game starts: every call to AIProcess::SetupSpecialIdle ----
+        // middleHigh->currentIdle is set only for an instant while an idle starts: the 3/s check read 0 nearly
+        // always.
+        // The game's own calls (sandbox, idle markers, scenes; AI threads too) go through hooked call sites.
+        struct Played { uint32_t idle = 0; uint32_t seq = 0; Clock::time_point at{}; };
+        std::mutex g_playedLock;
+        std::unordered_map<uint32_t, Played> g_played;   // actor FormID -> the last idle its game started
+        std::atomic<int> g_playedLogged{ 0 };
+
+        using SetupSpecialIdleFn = bool (*)(RE::AIProcess*, RE::Actor&, RE::DEFAULT_OBJECT, RE::TESIdleForm*, bool, RE::TESObjectREFR*);
+        REL::Relocation<SetupSpecialIdleFn> g_setupSpecialIdle{ RE::ID::AIProcess::SetupSpecialIdle };
+
+        bool SetupSpecialIdleHook(RE::AIProcess* a_proc, RE::Actor& a_actor, RE::DEFAULT_OBJECT a_do, RE::TESIdleForm* a_idle,
+            bool a_test, RE::TESObjectREFR* a_target)
+        {
+            const bool ok = g_setupSpecialIdle(a_proc, a_actor, a_do, a_idle, a_test, a_target);
+            if (ok && a_idle && a_idle->GetFormID() < 0xFF000000) {
+                const uint32_t fid = a_actor.GetFormID();
+                {
+                    std::lock_guard l(g_playedLock);
+                    auto& p = g_played[fid];
+                    p.idle = a_idle->GetFormID();
+                    ++p.seq;
+                    p.at = Clock::now();
+                    if (g_played.size() > 1024) g_played.clear();
+                }
+                if (g_playedLogged.fetch_add(1, std::memory_order_relaxed) < 120)
+                    REX::INFO("[Activity] {:#x} started idle {:#x} ({})", fid, a_idle->GetFormID(), a_idle->GetFormEditorID());
+            }
+            return ok;
+        }
+
+        void InstallIdleHook()
+        {
+            std::size_t found = 0;
+            const auto n = HookAllCalls(g_setupSpecialIdle.address(), SetupSpecialIdleHook, 48, &found);
+            REX::INFO("[Activity] idle starts hooked at {} of {} call site(s)", n, found);
+        }
+
         // ---- NPCs this game runs: what each was last said to be doing ----
-        struct Sent { uint32_t seatOwner = 0, seatRef = 0, marker = 0, idle = 0; Clock::time_point at{}; };
+        struct Sent { uint32_t seatOwner = 0, seatRef = 0, marker = 0, idle = 0, idleSeq = 0; Clock::time_point at{}; RE::NiPoint3 idlePos{}; };
         std::unordered_map<uint32_t, Sent> g_sent;   // our FormID -> last sent
 
         // ---- NPCs mirrored here: what their owner's copy is doing, and what we did about it ----
@@ -53,12 +95,12 @@ namespace F4MP::Activity
         {
             uint32_t owner = 0;
             uint32_t seat = 0, marker = 0;   // local furniture FormID (0 = none)
-            uint32_t idle = 0;
+            uint32_t idle = 0, idleSeq = 0;
             Clock::time_point at{};          // last message
             uint32_t seated = 0;             // furniture we put it on
             int tries = 0;
             Clock::time_point nextTry{};
-            uint32_t idlePlayed = 0;
+            uint32_t idlePlayed = 0, idleSeqPlayed = 0;
         };
         std::unordered_map<uint32_t, Want> g_want;   // local FormID -> wanted
 
@@ -131,7 +173,8 @@ namespace F4MP::Activity
         // A mirrored NPC drops the idles its own AI starts; this one is its owner's.
         GraphOverride::AllowIdles(a_actor->GetFormID(), 2000);
         GraphOverride::BeginOurs();
-        const bool ok = proc->PlayIdle(*a_actor, a_idle, nullptr);
+        // Conditions not tested: they were met in the game that runs it (an idle marker's, a package's...).
+        const bool ok = proc->SetupSpecialIdle(*a_actor, RE::DEFAULT_OBJECT::kActionIdle, a_idle, false, nullptr);
         GraphOverride::EndOurs();
         return ok;
     }
@@ -171,10 +214,25 @@ namespace F4MP::Activity
                 uint32_t marker = 0;
                 if (auto* furn = SeatOf(a, &marker); furn && Workshop::SeatKey(furn, s.seatOwner, s.seatRef)) s.marker = marker;
                 // Idles outside furniture (a seat plays its own). Runtime idles don't exist elsewhere.
-                auto* mh = a->currentProcess ? a->currentProcess->middleHigh : nullptr;
-                if (!s.seatRef && mh && mh->currentIdle && mh->currentIdle->GetFormID() < kRuntimeIdStart) s.idle = mh->currentIdle->GetFormID();
+                // The last one its game started counts until it walks off from where it started it, or for 30 s.
                 auto& last = g_sent[fid];
-                const bool same = last.seatOwner == s.seatOwner && last.seatRef == s.seatRef && last.marker == s.marker && last.idle == s.idle;
+                if (!s.seatRef) {
+                    Played p;
+                    {
+                        std::lock_guard l(g_playedLock);
+                        if (auto it = g_played.find(fid); it != g_played.end()) p = it->second;
+                    }
+                    if (p.idle && now - p.at < std::chrono::seconds(30)) {
+                        const auto pos = a->GetPosition();
+                        const bool started = p.seq != last.idleSeq;
+                        s.idleSeq = p.seq;
+                        s.idlePos = started ? pos : last.idlePos;
+                        const bool ended = !started && (!last.idle || pos.GetSquaredDistance(last.idlePos) > 60.0f * 60.0f);
+                        if (!ended) s.idle = p.idle;
+                    }
+                }
+                const bool same = last.seatOwner == s.seatOwner && last.seatRef == s.seatRef && last.marker == s.marker && last.idle == s.idle &&
+                                  last.idleSeq == s.idleSeq;
                 const bool busy = s.seatRef || s.idle;
                 // On change; again every 3 s while busy (someone arriving later sees it too).
                 if (same && (!busy || now - last.at < std::chrono::seconds(3))) continue;
@@ -184,6 +242,7 @@ namespace F4MP::Activity
                 msg.seatRefFormId = s.seatRef;
                 msg.marker = s.marker;
                 msg.idleFormId = s.idle;
+                msg.idleSeq = s.idleSeq;
                 Send(MessageType::CoopNpcActivity, msg);
                 static int s_logged = 0;
                 if (!same && s_logged++ < 80)
@@ -213,6 +272,7 @@ namespace F4MP::Activity
         w.seat = seat;
         w.marker = m.marker;
         w.idle = m.idleFormId;
+        w.idleSeq = m.idleSeq;
         w.at = Clock::now();
     }
 
@@ -249,14 +309,21 @@ namespace F4MP::Activity
                     w.seated = 0;   // got off again behind our back: retried
                 }
             } else if (w.seated || (cur && w.at != Clock::time_point{})) {
-                // Its owner's copy got up.
-                if (cur) Unseat(a);
-                REX::INFO("[Activity] NPC {:#x}: off its seat like its owner's copy", local);
+                // Its owner's copy got up. A copy that sits straight back down (its own AI picked the chair)
+                // is only asked a few times: every frame meant 900+ unseats in a row.
+                if (w.seated) { w.tries = 0; w.nextTry = {}; }
                 w.seated = 0;
+                if (cur && w.tries < 6 && now >= w.nextTry) {
+                    Unseat(a);
+                    ++w.tries;
+                    w.nextTry = now + std::chrono::milliseconds(1500);
+                    REX::INFO("[Activity] NPC {:#x}: off its seat like its owner's copy (try {})", local, w.tries);
+                }
             }
             // Idles outside furniture, as its owner's copy plays them.
+            // The same idle started again over there (a smoker's next drag) is played again here.
             const uint32_t wantIdle = (stale || w.seated) ? 0 : w.idle;
-            if (wantIdle != w.idlePlayed) {
+            if (wantIdle != w.idlePlayed || (wantIdle && w.idleSeq != w.idleSeqPlayed)) {
                 if (wantIdle) {
                     const bool ok = PlayIdle(a, Lookup<RE::TESIdleForm>(wantIdle));
                     static int s_logged = 0;
@@ -265,6 +332,7 @@ namespace F4MP::Activity
                     GraphOverride::SendEvent(a, "IdleStop");
                 }
                 w.idlePlayed = wantIdle;
+                w.idleSeqPlayed = w.idleSeq;
             }
             ++it;
         }
@@ -420,6 +488,8 @@ namespace F4MP::Activity
             ApplyPowerArmor();
         }
     }
+
+    void InstallHooks() { InstallIdleHook(); }
 
     void Reset()
     {

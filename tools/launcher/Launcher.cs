@@ -32,8 +32,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.24.2.0")]
-[assembly: AssemblyFileVersion("0.24.2.0")]
+[assembly: AssemblyVersion("0.25.0.0")]
+[assembly: AssemblyFileVersion("0.25.0.0")]
 
 namespace F4MPLauncher
 {
@@ -223,6 +223,9 @@ namespace F4MPLauncher
         readonly TermButton install = new TermButton("[ INSTALL / UPDATE FATHERSFALLOUT ]"), ipButton = new TermButton("[ MY IP FOR FRIENDS ]");
         readonly TermButton close = new TermButton("X"), minimize = new TermButton("_"), gameButton = new TermButton("[ GAME FOLDER ]");
         readonly TermButton shareLog = new TermButton("[ SHARE LOG ]");
+        // Game mode. Only the campaign in this build: Wasteland Wars (its own experimental mode) is shown locked,
+        // a teaser of what's coming.
+        readonly TermButton campaignOpt = new TermButton("[X] CAMPAIGN CO-OP"), warsOpt = new TermButton("[LOCKED] WASTELAND WARS");
         const string IssuesUrl = "https://github.com/FLHNM/FathersFallout/issues/new?template=bug_report.yml";
         readonly Label ipLabel = new Label(), portLabel = new Label(), hostInfo = new Label(), status = new Label();
         readonly ContextMenuStrip saveMenu = new ContextMenuStrip();
@@ -365,6 +368,13 @@ namespace F4MPLauncher
             close.Accent = Pip.Amber;
             minimize.Click += delegate { WindowState = FormWindowState.Minimized; };
             close.Click += delegate { Close(); };
+            Place(campaignOpt, LeftW + 20, 6, 176, 22);
+            Place(warsOpt, LeftW + 204, 6, 316, 22);
+            campaignOpt.Selected = true;
+            warsOpt.Accent = Pip.Amber;
+            warsOpt.Click += delegate {
+                Say("WASTELAND WARS - COMING SOON. NO STORY: FACTIONS, RAIDERS AND EACH OTHER.");
+            };
 
             Place(install, x, 236, 310, 30);
             install.Click += delegate { InstallMod(true); Refresh2(); };

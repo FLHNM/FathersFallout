@@ -15,6 +15,8 @@
 #include "sync/Range.h"
 #include "sync/Workshop.h"
 #include "sync/Activity.h"
+#include "sync/CallHooks.h"
+#include "sync/Voice.h"
 
 #include <algorithm>
 #include <atomic>
@@ -118,7 +120,7 @@ namespace F4MP::Coop
             if (localFid < kDynamicFormIdStart || GetPlayerIdForBody(localFid)) return false;
             if (DynamicActors::OwnerOf(localFid, owner, ref)) return true;
             // A chest built at a settlement: each game has its own copy, so it's named like the build
-            // (neither player saw what the other stored in settlement containers).
+            // (Update 21 test: neither player saw what the other stored in settlement containers).
             if (Workshop::BuildKey(LookupForm<RE::TESObjectREFR>(localFid), owner, ref)) return true;
             auto* a = LookupForm<RE::Actor>(localFid);   // one of OUR spawns (announced as ours)
             if (!a) return false;
@@ -1044,10 +1046,45 @@ namespace F4MP::Coop
 
         // ---------- quests ----------
 
+        std::deque<CoopQuestStageMsg> g_questBacklog;          // join catch-up, applied a few per tick
+        // Applied stages are checked a moment later (the console runs the command on its own time).
+        struct QuestCheck { uint32_t quest; uint16_t stage; Clock::time_point at; };
+        std::vector<QuestCheck> g_pendingQuestCheck;
         std::unordered_map<uint32_t, uint16_t> g_questStages;  // questFormId -> last seen stage
         bool g_questBaseline = false;
         bool g_snapshotRequested = false;
         Clock::time_point g_lastQuestPoll{};
+
+        // Every stage the game sets (quest scripts, dialogue, the console), in the order it sets them. The 2/s poll
+        // saw only the last of several stages set at once (10 -> 20 -> 30 in one go): the others' fragments (items,
+        // objectives, NPCs moved) never ran in the other games. SetStage runs on Papyrus threads too: queued here.
+        std::mutex g_stageLock;
+        std::vector<std::pair<uint32_t, uint16_t>> g_stagesSet;
+        // Stages done in this game this session (set by the game or applied from the network), by quest: never
+        // applied again (a stage set twice runs its fragment twice) and never echoed back.
+        std::unordered_map<uint32_t, std::unordered_set<uint16_t>> g_stagesDone;
+        // Stages we're applying from the network: their own SetStage (the console fallback goes through the
+        // hook) isn't this game's progress, not sent back.
+        std::unordered_map<uint32_t, std::unordered_set<uint16_t>> g_stagesApplying;
+
+        using SetStageFn = bool (*)(RE::TESQuest*, std::uint16_t);
+        REL::Relocation<SetStageFn> g_setStage{ RE::ID::TESQuest::SetStage };
+
+        bool SetStageHook(RE::TESQuest* a_quest, std::uint16_t a_stage)
+        {
+            const bool ok = g_setStage(a_quest, a_stage);
+            if (ok && a_quest) {
+                std::lock_guard l(g_stageLock);
+                if (g_stagesSet.size() < 4096) g_stagesSet.emplace_back(a_quest->GetFormID(), a_stage);
+            }
+            return ok;
+        }
+
+        bool StageDone(uint32_t a_quest, uint16_t a_stage)
+        {
+            auto it = g_stagesDone.find(a_quest);
+            return it != g_stagesDone.end() && it->second.count(a_stage);
+        }
 
         bool IsTrackedQuest(RE::TESQuest* q)
         {
@@ -1074,6 +1111,11 @@ namespace F4MP::Coop
             Send(MessageType::CoopQuestStage, msg);
         }
 
+        // A guest's own quest progress goes to the host when the guest plays the host's story (caught up on
+        // joining, the default) or opted in. Before, a guest who picked up the quest item or killed the target
+        // moved the quest in their own game only.
+        bool SendsQuestProgress(bool a_host);
+
         void PollQuests()
         {
             auto* dh = RE::TESDataHandler::GetSingleton();
@@ -1091,8 +1133,10 @@ namespace F4MP::Coop
                     continue;
                 }
                 if (it->second == stage) continue;
+                // A stage we applied from the network, still settling (the console's setstage runs later): not ours.
+                if (std::any_of(g_pendingQuestCheck.begin(), g_pendingQuestCheck.end(), [&](const auto& c) { return c.quest == fid; })) continue;
                 it->second = stage;
-                if (g_questBaseline && (host || g_settings.shareMyQuests)) {
+                if (g_questBaseline && SendsQuestProgress(host)) {
                     // Host announces; a client asks the host to make it official (opt-in: in own-save
                     // co-op a joiner's quests are their own world's, e.g. a new game's intro stages).
                     SendQuestStage(fid, stage, !host, false);
@@ -1113,9 +1157,33 @@ namespace F4MP::Coop
             g_questBaseline = true;
         }
 
+        bool SendsQuestProgress(bool a_host)
+        {
+            if (a_host || g_settings.shareMyQuests) return true;
+            return g_settings.questCatchUp && g_snapshotRequested && g_questBacklog.empty();
+        }
+
+        void DrainStagesSet()
+        {
+            std::vector<std::pair<uint32_t, uint16_t>> set;
+            {
+                std::lock_guard l(g_stageLock);
+                set.swap(g_stagesSet);
+            }
+            const bool host = IsHost();
+            for (auto [fid, stage] : set) {
+                g_stagesDone[fid].insert(stage);
+                if (auto it = g_stagesApplying.find(fid); it != g_stagesApplying.end() && it->second.erase(stage)) continue;
+                auto* q = LookupForm<RE::TESQuest>(fid);
+                if (!IsTrackedQuest(q)) continue;
+                g_questStages[fid] = q->currentStage;   // the poll doesn't send it again
+                if (!g_questBaseline || !SendsQuestProgress(host)) continue;
+                SendQuestStage(fid, stage, !host, false);
+                REX::INFO("[Coop] quest {:#x} ({}) stage {} set here: {}", fid, q->formEditorID.c_str(), stage, host ? "broadcast" : "request");
+            }
+        }
+
         // Applied stages are checked a moment later (the console runs the command on its own time).
-        struct QuestCheck { uint32_t quest; uint16_t stage; Clock::time_point at; };
-        std::vector<QuestCheck> g_pendingQuestCheck;
 
         void CheckAppliedQuests()
         {
@@ -1134,7 +1202,6 @@ namespace F4MP::Coop
         void ApplyQuestStage(const CoopQuestStageMsg& m);
         // The join catch-up brings the host's stage for every quest at once (hundreds): applied a few per
         // tick so the console and quest scripts aren't flooded in one frame.
-        std::deque<CoopQuestStageMsg> g_questBacklog;
 
         void OnQuestStage(const CoopQuestStageMsg& m)
         {
@@ -1164,8 +1231,15 @@ namespace F4MP::Coop
             if (m.isRequest && !host) return;   // only the host acts on requests
             if (!m.isRequest && host) return;   // the host is the source of truth
             if (q->currentStage == m.stage) return;
-            // Join snapshot: only move forward. Rewinding a stage re-runs its fragment.
-            if (m.isSnapshot && m.stage <= q->currentStage) return;
+            // Done here already (this game set it, or its own fragments did after an earlier stage we applied):
+            // setting it again re-runs its fragment. Behind this game's progress: not rewound either.
+            if (StageDone(m.questFormId, m.stage) || m.stage < q->currentStage) {
+                static int s_skipped = 0;
+                if (s_skipped++ < 40)
+                    REX::INFO("[Coop] quest {:#x} stage {} from player {}: already {} here (at {})", m.questFormId, m.stage, m.senderId,
+                        StageDone(m.questFormId, m.stage) ? "done" : "past", q->currentStage);
+                return;
+            }
 
             const uint16_t before = q->currentStage;
             bool ok = q->SetStage(m.stage);
@@ -1178,7 +1252,11 @@ namespace F4MP::Coop
                 RE::Console::ExecuteCommand(cmd);
                 how = "console setstage";
             }
-            g_questStages[m.questFormId] = q->currentStage;  // don't echo what we just applied
+            g_questStages[m.questFormId] = q->currentStage;  // don't echo what we just applied (checked again in 2 s)
+            g_stagesDone[m.questFormId].insert(m.stage);
+            if (!ok) g_stagesApplying[m.questFormId].insert(m.stage);
+            // A guest's progress, now the host's: everyone else gets it too (the guest who asked has it: done there).
+            if (host && m.isRequest) SendQuestStage(m.questFormId, m.stage, false, false);
             g_pendingQuestCheck.push_back({ m.questFormId, m.stage, Clock::now() });
             g_stats.questStagesApplied++;
             g_stats.applied++;
@@ -1392,7 +1470,7 @@ namespace F4MP::Coop
         // ---------- doors (everyone -> everyone, open only) ----------
         // Quest scripts open gates only on the game that ran the quest: the host's Diamond City gate
         // stood open while the joiner's stayed shut, and Covenant's opened only for whoever did the
-        // quiz. Every game asks about the doors around it; the host answers from its
+        // quiz (Update 20/21 test). Every game asks about the doors around it; the host answers from its
         // world, other players for doors they have loaded. Only opening and unlocking are copied: one
         // player's progress opens the way for both, and nobody gets shut out by someone else's world.
         struct DoorMismatch { int seen = 0; Clock::time_point at{}; };
@@ -2051,6 +2129,22 @@ namespace F4MP::Coop
             case MessageType::CoopBuildPlaced:   // refFormId: the build's key in the builder's game
                 if (auto* m = Mut<CoopBuildPlacedMsg>(item)) { tr(m->baseFormId); tr(m->workshopFormId); }
                 break;
+            case MessageType::CoopWirePlaced:   // wireRefFormId: the wire's key in the builder's game
+                if (auto* m = Mut<CoopWirePlacedMsg>(item)) {
+                    tr(m->baseFormId);
+                    if (m->aOwner == 0) tr(m->aRef);
+                    if (m->bOwner == 0) tr(m->bRef);
+                }
+                break;
+            case MessageType::CoopVoice:
+                if (auto* m = Mut<CoopVoiceMsg>(item)) tr(m->space);
+                break;
+            case MessageType::CoopWorkerAssigned:
+                if (auto* m = Mut<CoopWorkerAssignedMsg>(item)) {
+                    if (m->objOwner == 0) tr(m->objRef);
+                    tr(m->npcFormId);
+                }
+                break;
             case MessageType::CoopRefActivated:
                 if (auto* m = Mut<CoopRefActivatedMsg>(item); m && m->ownerId == 0) tr(m->ownerRefFormId);   // a plugin reference
                 break;
@@ -2124,6 +2218,11 @@ namespace F4MP::Coop
                 break;
             case MessageType::CoopExplosion:
                 if (auto* m = Mut<CoopExplosionMsg>(item)) return pos(m->x, m->y, m->z);
+                break;
+            case MessageType::CoopWirePlaced:
+                if (auto* m = Mut<CoopWirePlacedMsg>(item))
+                    return pos(m->x, m->y, m->z) && angles(m->hx, m->hy, m->hz) && std::fabs(m->hx) < 1.0e5f && std::fabs(m->hy) < 1.0e5f &&
+                           std::fabs(m->hz) < 1.0e5f && fin(m->slack) && fin(m->thickness);
                 break;
             case MessageType::CoopWorldReq:
                 if (auto* m = Mut<CoopWorldReqMsg>(item)) return pos(m->x, m->y, m->z);
@@ -2228,7 +2327,7 @@ namespace F4MP::Coop
                     const auto oldForms = want;
                     const auto oldKey = ModKey(wm.weapon, wm.mods, wm.count);
                     want.assign(m->forms, m->forms + n);
-                    // Power armor pieces (and the frame item) worn as plain armor drew a broken body:
+                    // Power armor pieces (and the frame item) worn as plain armor drew a broken body (a report):
                     // the body gets a frame of its own with them on it (sync/Activity, CoopPowerArmor).
                     std::erase_if(want, [](uint32_t f) { return IsPowerArmorItem(LookupForm<RE::TESForm>(f)); });
                     wm.weapon = m->weaponFormId;
@@ -2281,6 +2380,18 @@ namespace F4MP::Coop
                 break;
             case MessageType::CoopBuildPlaced:
                 if (auto* m = As<CoopBuildPlacedMsg>(item); m && g_settings.building) Workshop::OnPlaced(*m);
+                break;
+            case MessageType::CoopWirePlaced:
+                if (auto* m = As<CoopWirePlacedMsg>(item); m && g_settings.building) Workshop::OnWirePlaced(*m);
+                break;
+            case MessageType::CoopVoice:
+                Voice::OnPacket(item.payload);
+                break;
+            case MessageType::CoopWireRemoved:
+                if (auto* m = As<CoopWireRemovedMsg>(item); m && g_settings.building) Workshop::OnWireRemoved(*m);
+                break;
+            case MessageType::CoopWorkerAssigned:
+                if (auto* m = As<CoopWorkerAssignedMsg>(item); m && g_settings.building) Workshop::OnWorkerAssigned(*m);
                 break;
             case MessageType::CoopBuildMoved:
                 if (auto* m = As<CoopBuildMovedMsg>(item); m && g_settings.building) Workshop::OnMoved(*m);
@@ -2340,6 +2451,13 @@ namespace F4MP::Coop
     bool IsLoadOrderMismatch() { return g_hostMismatch && !LoadOrder::Known(Authority::HostId()); }
     size_t MismatchedPlayers() { return g_badSenders.size(); }
     const Stats& GetStats() { return g_stats; }
+
+    void InstallHooks()
+    {
+        std::size_t found = 0;
+        const auto n = HookAllCalls(g_setStage.address(), SetStageHook, 64, &found);
+        REX::INFO("[Coop] quest stages hooked at {} of {} call site(s)", n, found);
+    }
 
     void RegisterSinks()
     {
@@ -2426,6 +2544,7 @@ namespace F4MP::Coop
             PollQuests();
         }
         if (g_settings.quests) {
+            DrainStagesSet();
             DrainQuestBacklog();
         }
 
@@ -2533,7 +2652,17 @@ namespace F4MP::Coop
         g_npcOwners[local] = { ownerId, formId, Clock::now() };   // our hits on it go to the owner (HitSink)
 
         if (hostDead) {
-            if (!actor->IsDead(false)) actor->KillImpl(nullptr, 0.0f, true, false);
+            if (!actor->IsDead(false)) {
+                // Killed in its chair on the owner's side: the copy here
+                // stayed alive by the chair. Up first, then killed; said once per NPC whether it took.
+                const bool seated = Activity::SeatOf(actor) != nullptr;
+                if (seated) Activity::Unseat(actor);
+                actor->KillImpl(nullptr, 0.0f, true, false);
+                static std::unordered_set<uint32_t> s_told;
+                if (s_told.size() < 200 && s_told.insert(local).second)
+                    REX::INFO("[Coop] NPC {:#x} died in player {}'s game: killed here (was seated {}) -> dead {}", local, ownerId, seated,
+                        actor->IsDead(false));
+            }
             g_npcAppliedHealth.erase(local);
             return;
         }

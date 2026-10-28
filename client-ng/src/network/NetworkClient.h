@@ -74,6 +74,10 @@ enum class MessageType : uint16_t {
     CoopPowerArmor = 113,           // player -> all: in power armor or not, and the frame's pieces (sync/Activity)
     CoopDoorStateReq = 114,         // joiner -> host: doors around me, how are they in your world?
     CoopDoorState = 115,            // host -> joiner: open/closed and locked for those doors (quest scripts open gates)
+    CoopWirePlaced = 116,           // player -> all: a power wire built (or reshaped) in workshop mode, its two ends and shape
+    CoopWireRemoved = 117,          // player -> all: that wire scrapped
+    CoopWorkerAssigned = 118,       // player -> all: a settler given a job (a crop, a guard post, a shop) in workshop mode
+    CoopVoice = 119,                // player -> all: push-to-talk voice, played by distance (variable length, unreliable)
 };
 
 #pragma pack(push, 1)
@@ -355,7 +359,51 @@ struct CoopNpcActivityMsg {
     uint32_t seatRefFormId;
     uint32_t marker;
     uint32_t idleFormId;     // the idle it plays outside furniture (TESIdleForm), 0 = none
+    uint32_t idleSeq;        // goes up each time its game starts an idle, the same one again too (protocol 17)
 };
+
+// A power wire: named like a build (the builder's key + its FormID there); its ends named as in CoopSeatMsg (a shared
+// build, or owner 0 = a plugin reference). The shape is the game's own (middle, half extents, slack): copies match.
+struct CoopWirePlacedMsg {
+    uint32_t senderId;
+    uint32_t ownerKey;
+    uint32_t wireRefFormId;
+    uint32_t baseFormId;     // the spline (BGSBendableSpline)
+    uint32_t aOwner, aRef, aLink;
+    uint32_t bOwner, bRef, bLink;
+    float    x, y, z;        // the middle
+    float    hx, hy, hz;     // half extents
+    float    slack, thickness;
+};
+
+struct CoopWireRemovedMsg {
+    uint32_t senderId;
+    uint32_t ownerKey;
+    uint32_t wireRefFormId;
+};
+
+// A settler's job: the work object (named as in CoopSeatMsg) and the settler (the sender's FormID, mapped like NPCs).
+// Applied with the game's own WorkshopParent.AssignActorToObjectPUBLIC.
+struct CoopWorkerAssignedMsg {
+    uint32_t senderId;
+    uint32_t objOwner;
+    uint32_t objRef;
+    uint32_t npcFormId;
+};
+
+// Variable length: this header, then `bytes` of Opus frames ([u8 length][frame] each, 20 ms of 16 kHz mono).
+// Unreliable: a lost packet is a 40 ms gap, never a hold-up. (The same as Wasteland Wars' nearby voice.)
+constexpr int kVoiceMaxBytes = 600;
+struct CoopVoiceMsg {
+    uint32_t senderId;
+    uint8_t flags;          // kVoiceEnd: the last packet of a transmission
+    uint16_t seq;
+    uint32_t space;         // worldspace (outdoors) or interior cell FormID; voice carries only within one
+    float x, y, z;          // the speaker's mouth
+    uint8_t frames;
+    uint16_t bytes;
+};
+constexpr uint8_t kVoiceEnd = 2;
 
 // Power armor: in it (frame + pieces) or out. The pieces are also in CoopEquipmentMsg, but a body wearing
 // them as plain armor looked broken: it gets a frame of its own instead.
@@ -463,11 +511,11 @@ struct CoopInboxItem {
 // Positions and NPC states are sent many times a second and only the newest one matters: unreliable, so a
 // lost packet doesn't hold up everything behind it (over the internet / Steam relays). Everything else
 // (hits, items, builds, quests) stays reliable and in order.
-inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosition || t == MessageType::NpcState; }
+inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosition || t == MessageType::NpcState || t == MessageType::CoopVoice; }
 constexpr int kSendStream = 1;     // k_nSteamNetworkingSend_UnreliableNoNagle
 constexpr int kSendEvent = 8;      // k_nSteamNetworkingSend_Reliable
 
-constexpr uint32_t PROTOCOL_VERSION = 16;   // 16: companions shown to the others, join password (Update 23); 15: NPC furniture/idles, seat markers, power armor (Update 21); 14: player hits say whether an NPC did it (Update 19); 13: NPC equipment, item mods in containers (Update 18); 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
+constexpr uint32_t PROTOCOL_VERSION = 17;   // 17: NPC idle starts counted, power wires, settler jobs, voice chat (Update 25); 16: companions shown to the others, join password (Update 23); 15: NPC furniture/idles, seat markers, power armor (Update 21); 14: player hits say whether an NPC did it (Update 19); 13: NPC equipment, item mods in containers (Update 18); 12: unreliable positions/NPC states, NPC gait/weapon flags (Update 17); 11: Steam join, aimed shots/spine (Update 16); 10: aim pitch, NPC idle animations; 9: NPC combat animations; 8: live scrapping of world objects; 7: host world snapshots; 6: explosions; 5: item mods on drops; 4: workshop objects named by permanent player keys
 
 // Incoming data comes from another game (or anyone who reached the port): positions must be real
 // numbers inside the world, or a body/copy placed there can break the game.

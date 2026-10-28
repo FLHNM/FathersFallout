@@ -29,6 +29,7 @@ enum class MessageType : uint16_t {
     EntityState = 41,
     NpcState = 50,      // an NPC's state from its owner; the server relays it
     CoopFirst = 60,     // >= 60: co-op sync messages, relayed generically (see RelayCoop)
+    CoopVoice = 119,    // push-to-talk voice: relayed like the rest, but unreliable (late voice is useless voice)
 };
 
 #pragma pack(push, 1)
@@ -119,7 +120,7 @@ struct DamageDealtMsg {
 
 #pragma pack(pop)
 
-constexpr uint32_t PROTOCOL_VERSION = 16;   // must match client-ng/src/network/NetworkClient.h
+constexpr uint32_t PROTOCOL_VERSION = 17;   // must match client-ng/src/network/NetworkClient.h
 constexpr uint16_t DEFAULT_SERVER_PORT = 7779;
 constexpr uint32_t MAX_PLAYERS = 64;
 

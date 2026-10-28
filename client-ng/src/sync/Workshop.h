@@ -5,8 +5,9 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
-namespace RE { class TESObjectREFR; }
+namespace RE { class Actor; class TESObjectREFR; }
 namespace Network {
     struct CoopSeatMsg;
     struct CoopBuildPlacedMsg;
@@ -17,6 +18,9 @@ namespace Network {
     struct CoopWorldReqMsg;
     struct CoopWorldSnapshotMsg;
     struct CoopRefsHiddenMsg;
+    struct CoopWirePlacedMsg;
+    struct CoopWireRemovedMsg;
+    struct CoopWorkerAssignedMsg;
 }
 
 // Settlement building together. Objects built in workshop mode while connected are announced;
@@ -54,4 +58,14 @@ namespace F4MP::Workshop
     // Hide one of our references while connected (an NPC the host's world doesn't have here).
     void HideRef(RE::TESObjectREFR* ref);   // kPostLoadGame: show what a save made while connected had hidden
     void RegisterSerialization();   // once, at plugin load: build links in the co-save
+    // Power wires and settlers' jobs, made in workshop mode (scanned with the builds): the same here as in the
+    // builder's game. A wire is made like the workshop does (ends connected, the game's shape copied, rebuilt).
+    void OnWirePlaced(const Network::CoopWirePlacedMsg& m);
+    void OnWireRemoved(const Network::CoopWireRemovedMsg& m);
+    void OnWorkerAssigned(const Network::CoopWorkerAssignedMsg& m);
+    // Test (f4mp:ws): a wire between two references, shaped straight between their origins (0 = not made); a job.
+    uint32_t Wire(RE::TESObjectREFR* a, RE::TESObjectREFR* b, uint32_t splineBase = 0);
+    bool AssignWorker(RE::Actor* npc, RE::TESObjectREFR* workObject);
+    // The scripts attached to a reference besides plain ObjectReference ("" = none), comma-separated.
+    std::string ScriptsOn(RE::TESObjectREFR* ref);
 }

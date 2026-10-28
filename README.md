@@ -45,7 +45,8 @@ Movement and animations, weapons and armor (with their mods), power armor, sitti
 furniture (players and NPCs, including NPCs cooking or eating at a campfire), NPC idle animations,
 shooting and melee - aimed where each player really aims - damage (including between players),
 enemies and NPCs, deaths, explosions, doors and switches, dropped items, containers, building / moving / scrapping in
-workshops, quest progress, time of day and weather.
+workshops, power wires, settlers' jobs, quest progress (every stage, from the host and the guests), time of day and
+weather. Plus **proximity voice chat**: hold **N** to talk to the players around you.
 
 ## Building from source
 

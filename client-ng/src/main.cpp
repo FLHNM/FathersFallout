@@ -17,6 +17,7 @@
 #include "sync/Paths.h"
 #include "sync/Workshop.h"
 #include "sync/Activity.h"
+#include "sync/Voice.h"
 #include "sync/GraphOverride.h"
 #include "sync/AimHook.h"
 #include "sync/PlayerEvents.h"
@@ -604,7 +605,7 @@ namespace F4MP
                     REX::INFO("[Bridge]   drawn {} state {} equipped:{}", a->GetWeaponMagicDrawn(), static_cast<int>(a->weaponState) & 7, eq);
                     continue;
                 }
-                // Test helper: "f4mp:state <hex>" logs an actor's health and fight (Preston turning on the host, U24).
+                // Test helper: "f4mp:state <hex>" logs an actor's health and fight (Preston turning on the host).
                 if (cmd.rfind("f4mp:state ", 0) == 0) {
                     auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 11, nullptr, 16));
                     auto* a = f ? f->As<RE::Actor>() : nullptr;
@@ -730,6 +731,127 @@ namespace F4MP
                         if (list->scriptAddedTempForms)
                             for (auto id : *list->scriptAddedTempForms) added += std::format(" {:08X}", id);
                         REX::INFO("[FLST] {:08X}: {} forms [{} ] script-added [{} ]", list->GetFormID(), list->arrayOfForms.size(), line, added);
+                    }
+                    continue;
+                }
+                // Voice test: "f4mp:voice" logs its state, "f4mp:voice hear" toggles the mic test (hear myself).
+                if (cmd.rfind("f4mp:voice", 0) == 0) {
+                    Voice::Bridge(cmd.size() > 11 ? cmd.substr(11) : std::string());
+                    continue;
+                }
+                // Quest probe: "f4mp:qstage <quest> <stage>" sets a stage the way a quest script does (Papyrus Quest.SetStage).
+                if (cmd.rfind("f4mp:qstage ", 0) == 0) {
+                    unsigned qid = 0, stage = 0;
+                    std::sscanf(cmd.c_str() + 12, "%x %u", &qid, &stage);
+                    auto* q = RE::TESForm::GetFormByID(qid);
+                    auto* game = RE::GameVM::GetSingleton();
+                    auto vm = game ? game->GetVM() : nullptr;
+                    bool ok = false;
+                    if (q && vm) {
+                        const auto& handles = vm->GetObjectHandlePolicy();
+                        const auto handle = handles.GetHandleForObject(static_cast<std::uint32_t>(q->GetFormType()), static_cast<const void*>(q));
+                        RE::BSTSmartPointer<RE::BSScript::Object> object;
+                        if (handle != handles.EmptyHandle() && vm->FindBoundObject(handle, "Quest", false, object, false) && object)
+                            ok = vm->DispatchMethodCall(object, "SetStage", [&](RE::BSScrapArray<RE::BSScript::Variable>& a_out) {
+                                a_out = RE::BSScript::detail::PackVariables(static_cast<std::int32_t>(stage));
+                                return true;
+                            }, nullptr);
+                    }
+                    REX::INFO("[Bridge] qstage {:#x} {} (Papyrus): {}", qid, stage, ok);
+                    continue;
+                }
+                // Settlement probes: "f4mp:ws near" (built/powered refs around us), "f4mp:ws info <ref>",
+                // "f4mp:ws assign <actor> <object>" (WorkshopParent's own assignment), "f4mp:ws wire <a> <b>".
+                if (cmd.rfind("f4mp:ws ", 0) == 0) {
+                    std::istringstream in(cmd.substr(8));
+                    std::string what, h1, h2;
+                    in >> what >> h1 >> h2;
+                    auto look = [](const std::string& h) -> RE::TESObjectREFR* {
+                        auto* f = h.empty() ? nullptr : RE::TESForm::GetFormByID(std::strtoul(h.c_str(), nullptr, 16));
+                        return f ? f->As<RE::TESObjectREFR>() : nullptr;
+                    };
+                    auto kw = [](uint32_t id) { auto* f = RE::TESForm::GetFormByID(id); return f ? f->As<RE::BGSKeyword>() : nullptr; };
+                    auto describe = [&](RE::TESObjectREFR* r) {
+                        auto* base = r->GetObjectReference();
+                        auto* owner = r->GetOwner();
+                        std::string links;
+                        if (r->extraList)
+                            if (auto* pls = r->extraList->GetByType<RE::ExtraPowerLinks>())
+                                for (auto& e : pls->powerLinks) links += std::format(" {:08X}/{}", e.formID, e.linkType);
+                        if (r->extraList)
+                            if (auto* sp = r->extraList->GetByType<RE::ExtraBendableSplineParams>()) {
+                                const auto* f = reinterpret_cast<const float*>(&sp->data);
+                                const auto ang = r->data.angle;
+                                links += std::format(" | spline slack {:.2f} thick {:.2f} half {:.1f} {:.1f} {:.1f} detached {} | pos {:.0f} {:.0f} {:.0f} ang {:.2f} {:.2f} {:.2f}",
+                                    f[0], f[1], f[2], f[3], f[4], reinterpret_cast<const std::uint8_t*>(f)[0x14], r->GetPosition().x, r->GetPosition().y,
+                                    r->GetPosition().z, ang.x, ang.y, ang.z);
+                            }
+                        auto lr = [&](uint32_t k) { auto* t = kw(k) ? r->GetLinkedRef(kw(k)) : nullptr; return t ? t->GetFormID() : 0u; };
+                        links += std::format(" | at {:.0f} {:.0f} {:.0f}", r->GetPosition().x, r->GetPosition().y, r->GetPosition().z);
+                        REX::INFO("[Bridge] ws {:#x} 3D {} base {:08X} type {} owner {:08X} type {} | power links [{} ] | bench {:#x} work {:#x} workobj {:#x}",
+                            r->GetFormID(), r->Get3D() != nullptr, base ? base->GetFormID() : 0u, base ? static_cast<int>(base->GetFormType()) : -1,
+                            owner ? owner->GetFormID() : 0u, owner ? static_cast<int>(owner->GetFormType()) : -1, links,
+                            lr(0x54BA6), lr(0x20D60), lr(0x20592));
+                    };
+                    auto* pl = RE::PlayerCharacter::GetSingleton();
+                    if (what == "near") {
+                        if (auto* tes = RE::TES::GetSingleton(); tes && pl)
+                            tes->ForEachReferenceInRange(pl->GetPosition(), 3000.0f, [&](RE::TESObjectREFR* r) {
+                                const bool wsItem = r && kw(0x54BA6) && r->GetLinkedRef(kw(0x54BA6));
+                                const bool powered = r && r->extraList && r->extraList->GetByType<RE::ExtraPowerLinks>();
+                                const auto* rb = r ? r->GetObjectReference() : nullptr;
+                                if (r && r != pl && (wsItem || powered || r->As<RE::Actor>() || (rb && rb->GetFormType() == RE::ENUM_FORM_ID::kBNDS))) describe(r);
+                                return RE::BSContainer::ForEachResult::kContinue;
+                            });
+                    } else if (what == "acti" && pl) {
+                        // f4mp:ws acti: plugin activators around us and the scripts on them
+                        if (auto* tes = RE::TES::GetSingleton())
+                            tes->ForEachReferenceInRange(pl->GetPosition(), 3000.0f, [&](RE::TESObjectREFR* r) {
+                                auto* b = r ? r->GetObjectReference() : nullptr;
+                                if (b && b->GetFormType() == RE::ENUM_FORM_ID::kACTI && r->GetFormID() < 0xFF000000)
+                                    REX::INFO("[Bridge] acti {:#x} base {:08X} {} at {:.0f}: scripts [{}]", r->GetFormID(), b->GetFormID(),
+                                        b->GetFormEditorID() ? b->GetFormEditorID() : "", r->GetPosition().GetDistance(pl->GetPosition()),
+                                        Workshop::ScriptsOn(r));
+                                return RE::BSContainer::ForEachResult::kContinue;
+                            });
+                    } else if (what == "info") {
+                        if (auto* r = look(h1)) describe(r);
+                    } else if (what == "assign") {
+                        auto* a = look(h1) ? look(h1)->As<RE::Actor>() : nullptr;
+                        auto* o = look(h2);
+                        const bool ok = Workshop::AssignWorker(a, o);
+                        REX::INFO("[Bridge] ws assign {} -> {}: {}", h1, h2, ok);
+                    } else if (what == "wire") {
+                        REX::INFO("[Bridge] ws wire {} {}: {:#x}", h1, h2, Workshop::Wire(look(h1), look(h2)));
+                    } else if (what == "shape") {
+                        // f4mp:ws shape <wire> <hx> <hy> <hz>: the wire's half extents set and its shape rebuilt
+                        std::string hy, hz;
+                        in >> hy >> hz;
+                        if (auto* w = look(h1); w && w->extraList && !hz.empty()) {
+                            RE::NiPoint3 half{ std::stof(h2), std::stof(hy), std::stof(hz) };
+                            float thick = 1.5f, slack = 0.0f;
+                            w->extraList->SetBendableSplineInfo(&thick, &slack, &half);
+                            if (auto* tq = RE::TaskQueueInterface::GetSingleton()) tq->QueueRebuildBendableSpline(*w, true, nullptr);
+                            REX::INFO("[Bridge] ws shape {}: {} {} {}", h1, half.x, half.y, half.z);
+                        }
+                    } else if (what == "place" && pl) {
+                        // f4mp:ws place <base> [bench] [dx]: a workshop object in front of us, linked to the bench.
+                        auto* base = RE::TESForm::GetFormByID(std::strtoul(h1.c_str(), nullptr, 16));
+                        auto* dh = RE::TESDataHandler::GetSingleton();
+                        auto* cell = pl->GetParentCell();
+                        std::string dxs;
+                        in >> dxs;
+                        if (base && base->As<RE::TESBoundObject>() && dh && cell) {
+                            const float h = pl->GetHeading(), dx = dxs.empty() ? 0.0f : std::stof(dxs);
+                            RE::NEW_REFR_DATA data;
+                            const auto p = pl->GetPosition();
+                            data.location = { p.x + std::sin(h) * 250.0f + std::cos(h) * dx, p.y + std::cos(h) * 250.0f - std::sin(h) * dx, p.z };
+                            data.object = base->As<RE::TESBoundObject>();
+                            if (cell->IsInterior()) data.interior = cell; else data.world = cell->worldSpace;
+                            auto r = dh->CreateReferenceAtLocation(data).get();
+                            if (r && look(h2) && kw(0x54BA6)) r->SetLinkedRef(reinterpret_cast<RE::Actor*>(look(h2)), kw(0x54BA6));
+                            REX::INFO("[Bridge] ws placed {} -> {:#x}", h1, r ? r->GetFormID() : 0u);
+                        }
                     }
                     continue;
                 }
@@ -1558,7 +1680,9 @@ namespace F4MP
             float bestD = dist2(npc.get(), best);
             for (auto* p : players) {
                 const float d = dist2(npc.get(), p);
-                if (d < bestD * 0.36f) { best = p; bestD = d; }   // at least 40% closer
+                // Only onto a player it is hostile to: a settler squabbling with a body (a stray replayed shot) was
+                // handed to the host, who then stayed "in combat" with a friendly and couldn't sit.
+                if (d < bestD * 0.36f && npc->GetHostileToActor(p)) { best = p; bestD = d; }   // at least 40% closer
             }
             if (best == tgt.get()) continue;
             char cmd[64];
@@ -2157,6 +2281,9 @@ namespace F4MP
                             rp.isSneaking ? "sneaking" : "standing", off ? " resent" : " already right", ok);
                 }
                 if (ok) st.moveRefused = 0;
+                // A fresh start is the walk: the jog goes out again after it. After a resync (aim, equip, landing)
+                // the old gait stayed "jog" while the graph walked, and a jogging player's body walked at jog speed.
+                if (ok && wantMoving) st.gait = 0;
                 if (ok || !wantMoving) st.moving = wantMoving;
                 if (g_bodyTrace && ok) REX::INFO("[Trace] p{} {} accepted", pid, wantMoving ? "moveStart" : "moveStop");
             }
@@ -2439,7 +2566,7 @@ namespace F4MP
             if (!actor)                                // actors only (NPCs/creatures)
                 continue;
             // Disabled = not in our world (yet): story NPCs placed for later quests. Sending them made
-            // a guest enable and pull them, which hung her game's load.
+            // a guest enable and pull them, which hung their game's load.
             if (actor->IsDisabled())
                 continue;
             // Runtime actor: FormIDs differ per machine, so clients get a spawn announcement and
@@ -2676,7 +2803,7 @@ namespace F4MP
             }
             g_drivenOwner[local] = owner;
             // Its own AI must never fight: it went for a body or the player on sight (testing: a mirrored radroach
-            // bit the bot's body nonstop; : a copy shot the guest). The owner's attacks are replayed.
+            // bit a player's body nonstop; a copy shot the guest). The owner's attacks are replayed.
             if (actor->IsInCombat()) {
                 actor->StopCombat();
                 actor->InitiateDoNothingPackage();
@@ -3351,6 +3478,7 @@ namespace F4MP
         ImGuiMCP::TextDisabled("FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb");
         RenderPlayTogether();
         RenderCharacters();
+        Voice::RenderMenu();
 
         ImGuiMCP::SeparatorText("Sync");
         ImGuiMCP::Text("FPS: %.0f (capped at %d for sync)", FrameLimiter::GetMeasuredFps(), FrameLimiter::kTargetFps);
@@ -3408,6 +3536,7 @@ namespace F4MP
     // ---- HUD: a floating tag over each remote player (world -> screen) ----
     static void __stdcall RenderHud()
     {
+        Voice::Frame();   // every frame: where I am for voice, can I talk now
         auto& net = Network::NetworkClient::GetInstance();
         if (!net.IsConnected()) return;
 
@@ -3418,6 +3547,7 @@ namespace F4MP
         // Not over a loading screen, the F1 menu
         // (tags were drawn over its text) or the game's full-screen menus.
         if (F4SEMenuFramework::IsAnyBlockingWindowOpened()) return;
+        Voice::RenderHud();
         if (auto* ui = RE::UI::GetSingleton()) {
             static constexpr const char* kCovering[] = { "LoadingMenu", "PipboyMenu", "PauseMenu", "MainMenu", "LooksMenu",
                 "ContainerMenu", "BarterMenu", "TerminalMenu", "LevelUpMenu", "SPECIALMenu", "CookingMenu", "ExamineMenu",
@@ -3621,11 +3751,14 @@ namespace F4MP
 F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4MP::CrashLog::KeepPreviousLog();
-    F4SE::Init(a_f4se, { .trampoline = true, .trampolineSize = 128 });
+    F4SE::Init(a_f4se, { .trampoline = true, .trampolineSize = 2048 });
     REX::INFO("[FathersFallout] FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb (GPL v3 + NOTICE)");
     REX::INFO("[FathersFallout] plugin loaded (CommonLibF4)");
     F4MP::CrashLog::Install();
+    F4MP::Voice::Init(F4MP::IniPath());
     F4MP::InstallFastTravelHook();
+    F4MP::Activity::InstallHooks();
+    F4MP::Coop::InstallHooks();
 
     F4SE::GetMessagingInterface()->RegisterListener(F4MP::OnMessage);
     F4MP::Workshop::RegisterSerialization();

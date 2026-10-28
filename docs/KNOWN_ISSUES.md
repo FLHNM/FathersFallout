@@ -1,6 +1,6 @@
 # Known issues & what's being worked on
 
-Update 24.2 (alpha). Already known - no need to report these unless you have new details.
+Update 25 (alpha). Already known - no need to report these unless you have new details.
 
 ## Known issues
 
@@ -15,7 +15,9 @@ Update 24.2 (alpha). Already known - no need to report these unless you have new
 | Sliding | Since Update 21 a body whose walk stops playing restarts it by itself, usually within a second. A short slide can still happen now and then. |
 | Companions | Shared since Update 23: the other players see a copy of your companion. If the other player's world has that same NPC standing nearby (their Piper in Diamond City while your Piper follows you), you only see your own Piper there. |
 | Far-away NPCs | Guests with a lower view distance (`uGridsToLoad`) see fewer of the host's NPCs far away. Close by, everyone sees the same people. |
-| Quest catch-up | A guest's quests are moved up to the host's progress, but one-time things from steps the guest skipped (items handed out, NPCs moved) don't happen in the guest's game. Gates and doors those steps opened do open for everyone since Update 22. |
+| Quest catch-up | When a guest joins, their quests are moved up to the host's current stage of each quest, but one-time things from steps the guest skipped (items handed out, NPCs moved) don't happen in the guest's game. Gates and doors those steps opened do open for everyone since Update 22. Once you play together, every stage reaches everyone in order (Update 25). |
+| New in Update 25 | Voice chat, power wires, settler jobs, guests' quest progress and quest buttons pressed by a guest have been tested with a simulated second player, not yet across two PCs. |
+| Voice chat | Uses the Windows default microphone. If nobody hears you: F1 → Voice chat → **hear myself** and the mic meter, then your default recording device in Windows Sound settings. |
 | Random encounters | The small radiant quests that pop up on the road belong to the host's game; guests see the creatures and people, but not those quests in their log. |
 | Mods | Different plugin lists work since Update 20, but things from a mod only one player has don't show for the others (a message on connect names those mods). Overhaul mods can still make the games disagree. |
 | GOG | Not tested yet. IP join only. |
@@ -27,7 +29,7 @@ Update 24.2 (alpha). Already known - no need to report these unless you have new
 
 - Exact faces for other players (not just a close match).
 - Smoother aiming animation (full aim pose instead of bending at the waist).
-- Power wires and settler jobs in shared settlements.
+- Wasteland Wars: a separate experimental mode (no story - factions, raiders and each other). Coming soon.
 - More than 2 players tested.
 - GOG tested.
 

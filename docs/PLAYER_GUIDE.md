@@ -87,7 +87,13 @@ about a minute.
   (including to each other - switch **Friendly fire** off in the menu if you don't want that),
   enemies and NPCs, deaths, explosions, doors and switches (gates a quest opened for one player
   open for everyone), items you drop for each other, containers (including the ones you build at
-  settlements), building / moving / scrapping in workshops, quest progress, time of day and weather.
+  settlements), building / moving / scrapping in workshops, power wires, settlers' jobs, quest progress,
+  time of day and weather.
+- **Voice chat:** hold **N** to talk to the players around you (push to talk). Voices fade with distance
+  (silent by about 45 m), come from the side the speaker is on, and only carry where you are (the same
+  building, or outdoors together). **F1 → Voice chat:** change the talk key (any key or mouse button),
+  mic and voice volume, switch it off, or tick **hear myself** to test your mic (with a level meter).
+  It uses your Windows default microphone.
 
 ## 6. Something went wrong?
 

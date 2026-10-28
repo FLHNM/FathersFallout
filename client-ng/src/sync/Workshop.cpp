@@ -10,8 +10,10 @@
 #include "sync/Paths.h"
 #include "sync/Authority.h"
 #include "sync/Activity.h"
+#include "sync/DynamicActors.h"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -112,6 +114,7 @@ namespace F4MP::Workshop
         }
 
         bool Gone(RE::TESObjectREFR* ref) { return !ref || ref->IsDeleted() || ref->IsDisabled(); }
+        bool IsWire(RE::TESObjectREFR* r);   // a power wire (below)
 
         bool Moved(const Tracked& t, const RE::TESObjectREFR* ref)
         {
@@ -148,7 +151,7 @@ namespace F4MP::Workshop
             auto* kw = ItemKeyword();
             if (!tes || !pl || !kw) return;
             tes->ForEachReferenceInRange(pl->GetPosition(), kScanRadius, [&](RE::TESObjectREFR* ref) {
-                if (ref && ref->GetFormID() >= kDynamicFormIdStart && !Gone(ref) && ref->GetLinkedRef(kw))
+                if (ref && ref->GetFormID() >= kDynamicFormIdStart && !Gone(ref) && !IsWire(ref) && ref->GetLinkedRef(kw))
                     fn(ref);
                 return RE::BSContainer::ForEachResult::kContinue;
             });
@@ -156,9 +159,54 @@ namespace F4MP::Workshop
 
         void ScanPluginRefs(bool baseline);   // below, next to the host's-world state
 
+        // ---- power wires: splines (BNDS) whose ExtraPowerLinks hold their two ends; not linked to a workbench ----
+        struct WireState {
+            Key key{};
+            bool shared = false;
+            RE::NiPoint3 pos{}, half{};
+        };
+        std::unordered_map<uint32_t, WireState> g_wires;            // our FormID -> wire
+        std::unordered_map<Key, uint32_t, KeyHash> g_wireByKey;
+        std::deque<std::pair<CoopWirePlacedMsg, std::chrono::steady_clock::time_point>> g_wireRetry;   // ends not here yet
+
+        // ---- settlers' jobs: a work object's owner is the NPC working it (crops: owner = Marcy's base) ----
+        std::unordered_map<uint32_t, uint32_t> g_workOwner;          // work object FormID -> owner FormID last seen
+
+        bool WireEnds(RE::TESObjectREFR* w, RE::ExtraPowerLinks::Element& a, RE::ExtraPowerLinks::Element& b)
+        {
+            auto* pl = w && w->extraList ? w->extraList->GetByType<RE::ExtraPowerLinks>() : nullptr;
+            if (!pl || pl->powerLinks.size() != 2) return false;
+            a = pl->powerLinks[0];
+            b = pl->powerLinks[1];
+            return true;
+        }
+
+        bool WireShape(RE::TESObjectREFR* w, RE::NiPoint3& half, float& slack, float& thickness)
+        {
+            auto* sp = w && w->extraList ? w->extraList->GetByType<RE::ExtraBendableSplineParams>() : nullptr;
+            if (!sp) return false;
+            const auto* f = reinterpret_cast<const float*>(&sp->data);   // slack, thickness, half extents
+            slack = f[0];
+            thickness = f[1];
+            half = { f[2], f[3], f[4] };
+            return true;
+        }
+
+        bool IsWire(RE::TESObjectREFR* r)
+        {
+            auto* b = r ? r->GetObjectReference() : nullptr;
+            return b && b->GetFormType() == RE::ENUM_FORM_ID::kBNDS;
+        }
+
+        void ScanWires(bool baseline);
+        void ScanWorkers(bool baseline);
+        bool ApplyWire(const CoopWirePlacedMsg& m);
+
         void Scan(bool baseline)
         {
             ScanPluginRefs(baseline);
+            ScanWires(baseline);
+            ScanWorkers(baseline);
             auto* kw = ItemKeyword();
             if (!kw) return;
             // New objects: built just now (menu open) or simply loaded (baseline, not shared).
@@ -468,6 +516,15 @@ namespace F4MP::Workshop
             g_toPlace.pop_front();
         }
         ResolvePending();
+        // Wires whose ends were copies still being placed.
+        if (!g_wireRetry.empty()) {
+            const auto t = std::chrono::steady_clock::now();
+            for (size_t i = 0, n = g_wireRetry.size(); i < n; ++i) {
+                auto [m, since] = g_wireRetry.front();
+                g_wireRetry.pop_front();
+                if (!ApplyWire(m) && t - since < std::chrono::seconds(10)) g_wireRetry.emplace_back(m, since);
+            }
+        }
         WorldTick();
         FurnitureTick();
         // Scraps of objects that weren't loaded here: apply once their cell is.
@@ -508,6 +565,241 @@ namespace F4MP::Workshop
     {
         if (g_byKey.count({ m.ownerKey, m.refFormId })) return;
         g_toPlace.push_back(m);
+    }
+
+    // ---------- power wires ----------
+
+    // A wire made as the workshop makes one: placed in the middle, its look and shape set, its ends connected
+    // (that's the power grid too), then its mesh rebuilt from the shape.
+    static RE::TESObjectREFR* MakeWire(RE::TESObjectREFR* a, uint32_t aLink, RE::TESObjectREFR* b, uint32_t bLink, uint32_t base,
+        const RE::NiPoint3& mid, RE::NiPoint3 half, float slack, float thickness)
+    {
+        auto* spline = Lookup<RE::TESBoundObject>(base ? base : 0x1D971);   // BlackWireSpline01
+        auto* dh = RE::TESDataHandler::GetSingleton();
+        auto* cell = a ? a->GetParentCell() : nullptr;
+        if (!a || !b || !spline || !dh || !cell) return nullptr;
+        RE::NEW_REFR_DATA data;
+        data.location = mid;
+        data.object = spline;
+        if (cell->IsInterior()) data.interior = cell;
+        else data.world = cell->worldSpace;
+        auto wire = dh->CreateReferenceAtLocation(data).get();
+        if (!wire) return nullptr;
+        if (wire->extraList) wire->extraList->SetBendableSplineInfo(&thickness, &slack, &half);
+        RE::SplineUtils::ConnectSpline(a, static_cast<int32_t>(aLink), b, static_cast<int32_t>(bLink), wire.get());
+        if (auto* tq = RE::TaskQueueInterface::GetSingleton()) tq->QueueRebuildBendableSpline(*wire, true, nullptr);
+        return wire.get();
+    }
+
+    uint32_t Wire(RE::TESObjectREFR* a, RE::TESObjectREFR* b, uint32_t splineBase)
+    {
+        if (!a || !b) return 0;
+        const auto pa = a->GetPosition(), pb = b->GetPosition();
+        const RE::NiPoint3 mid{ (pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f, (pa.z + pb.z) * 0.5f };
+        const RE::NiPoint3 half{ (pb.x - pa.x) * 0.5f, (pb.y - pa.y) * 0.5f, (pb.z - pa.z) * 0.5f };
+        auto* w = MakeWire(a, 0, b, 0, splineBase, mid, half, 0.05f, 1.5f);
+        return w ? w->GetFormID() : 0;
+    }
+
+    static void RemoveWire(uint32_t fid)
+    {
+        auto* w = Lookup<RE::TESObjectREFR>(fid);
+        if (!w || Gone(w)) return;
+        RE::SplineUtils::DisconnectSpline(*w);
+        w->Disable();
+        w->SetDelete(true);
+    }
+
+    namespace
+    {
+        void SendWire(uint32_t fid, RE::TESObjectREFR* w, const WireState& st)
+        {
+            RE::ExtraPowerLinks::Element ea{}, eb{};
+            CoopWirePlacedMsg msg{};
+            auto* ra = WireEnds(w, ea, eb) ? Lookup<RE::TESObjectREFR>(ea.formID) : nullptr;
+            auto* rb = ra ? Lookup<RE::TESObjectREFR>(eb.formID) : nullptr;
+            // Both ends must mean the same thing in every game (shared builds or plugin references).
+            if (!rb || !SeatKey(ra, msg.aOwner, msg.aRef) || !SeatKey(rb, msg.bOwner, msg.bRef)) {
+                REX::INFO("[Workshop] wire {:#x}: its ends ({:#x}, {:#x}) aren't shared, not sent", fid, ea.formID, eb.formID);
+                return;
+            }
+            RE::NiPoint3 half;
+            if (!WireShape(w, half, msg.slack, msg.thickness)) return;
+            msg.ownerKey = st.key.owner;
+            msg.wireRefFormId = st.key.ref;
+            msg.baseFormId = w->GetObjectReference()->GetFormID();
+            msg.aLink = ea.linkType;
+            msg.bLink = eb.linkType;
+            const auto p = w->GetPosition();
+            msg.x = p.x; msg.y = p.y; msg.z = p.z;
+            msg.hx = half.x; msg.hy = half.y; msg.hz = half.z;
+            Send(MessageType::CoopWirePlaced, msg);
+            REX::INFO("[Workshop] wire {:#x} ({:08X}/{:#x} -> {:08X}/{:#x}) sent", fid, msg.aOwner, msg.aRef, msg.bOwner, msg.bRef);
+        }
+
+        void ScanWires(bool baseline)
+        {
+            auto* tes = RE::TES::GetSingleton();
+            auto* pl = RE::PlayerCharacter::GetSingleton();
+            if (!tes || !pl) return;
+            std::unordered_set<uint32_t> seen;
+            tes->ForEachReferenceInRange(pl->GetPosition(), kScanRadius, [&](RE::TESObjectREFR* w) {
+                if (!w || w->GetFormID() < kDynamicFormIdStart || Gone(w) || !IsWire(w)) return RE::BSContainer::ForEachResult::kContinue;
+                RE::ExtraPowerLinks::Element ea{}, eb{};
+                if (!WireEnds(w, ea, eb)) return RE::BSContainer::ForEachResult::kContinue;   // still being dragged out
+                const uint32_t fid = w->GetFormID();
+                seen.insert(fid);
+                RE::NiPoint3 half;
+                float slack = 0, thick = 0;
+                WireShape(w, half, slack, thick);
+                auto it = g_wires.find(fid);
+                if (it == g_wires.end()) {
+                    WireState st{ { MyKey(), fid }, !baseline, w->GetPosition(), half };
+                    g_wires[fid] = st;
+                    if (st.shared) { g_wireByKey[st.key] = fid; SendWire(fid, w, st); }
+                } else if (it->second.shared) {
+                    // An end moved: the game reshaped the wire. Sent again (the copies are made again).
+                    const auto p = w->GetPosition();
+                    const auto& o = it->second;
+                    const float d = std::fabs(p.x - o.pos.x) + std::fabs(p.y - o.pos.y) + std::fabs(p.z - o.pos.z) +
+                                    std::fabs(half.x - o.half.x) + std::fabs(half.y - o.half.y) + std::fabs(half.z - o.half.z);
+                    if (d > 1.0f) {
+                        it->second.pos = p;
+                        it->second.half = half;
+                        SendWire(fid, w, it->second);
+                    }
+                }
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+            // Shared wires scrapped here (ours, or a copy of someone else's): everyone scraps theirs.
+            for (auto it = g_wires.begin(); it != g_wires.end();) {
+                auto* w = Lookup<RE::TESObjectREFR>(it->first);
+                if (seen.count(it->first) || (w && !Gone(w))) { ++it; continue; }
+                if (it->second.shared && !baseline) {
+                    CoopWireRemovedMsg msg{};
+                    msg.ownerKey = it->second.key.owner;
+                    msg.wireRefFormId = it->second.key.ref;
+                    Send(MessageType::CoopWireRemoved, msg);
+                    REX::INFO("[Workshop] wire {:#x} scrapped: sent", it->first);
+                }
+                g_wireByKey.erase(it->second.key);
+                it = g_wires.erase(it);
+            }
+        }
+
+        bool ApplyWire(const CoopWirePlacedMsg& m)
+        {
+            const Key key{ m.ownerKey, m.wireRefFormId };
+            auto* a = Lookup<RE::TESObjectREFR>(LocalSeat(m.aOwner, m.aRef));
+            auto* b = Lookup<RE::TESObjectREFR>(LocalSeat(m.bOwner, m.bRef));
+            if (!a || !b || Gone(a) || Gone(b)) return false;
+            // Reshaped over there (an end moved): made again with the new shape.
+            if (auto it = g_wireByKey.find(key); it != g_wireByKey.end()) {
+                RemoveWire(it->second);
+                g_wires.erase(it->second);
+                g_wireByKey.erase(it);
+            }
+            const RE::NiPoint3 mid{ m.x, m.y, m.z }, half{ m.hx, m.hy, m.hz };
+            auto* w = MakeWire(a, m.aLink, b, m.bLink, m.baseFormId, mid, half, m.slack, m.thickness);
+            if (!w) return false;
+            g_wires[w->GetFormID()] = WireState{ key, true, mid, half };
+            g_wireByKey[key] = w->GetFormID();
+            REX::INFO("[Workshop] player {}'s wire {:#x} -> ours {:#x} between {:#x} and {:#x}", m.senderId, m.wireRefFormId,
+                w->GetFormID(), a->GetFormID(), b->GetFormID());
+            return true;
+        }
+
+        // ---------- settlers' jobs ----------
+
+        RE::Actor* WorkerFor(RE::TESForm* owner, const RE::NiPoint3& at)
+        {
+            if (!owner) return nullptr;
+            if (auto* a = owner->As<RE::Actor>()) return a;
+            if (owner->GetFormType() != RE::ENUM_FORM_ID::kNPC_) return nullptr;
+            RE::Actor* found = nullptr;
+            if (auto* tes = RE::TES::GetSingleton())
+                tes->ForEachReferenceInRange(at, kScanRadius, [&](RE::TESObjectREFR* r) {
+                    auto* a = r ? r->As<RE::Actor>() : nullptr;
+                    if (a && !a->IsDead(false) && a->GetNPC() == owner) { found = a; return RE::BSContainer::ForEachResult::kStop; }
+                    return RE::BSContainer::ForEachResult::kContinue;
+                });
+            return found;
+        }
+
+        void ScanWorkers(bool baseline)
+        {
+            auto* tes = RE::TES::GetSingleton();
+            auto* pl = RE::PlayerCharacter::GetSingleton();
+            auto* kw = ItemKeyword();
+            if (!tes || !pl || !kw) return;
+            tes->ForEachReferenceInRange(pl->GetPosition(), kScanRadius, [&](RE::TESObjectREFR* r) {
+                if (!r || Gone(r) || r->As<RE::Actor>() || IsWire(r) || !r->GetLinkedRef(kw)) return RE::BSContainer::ForEachResult::kContinue;
+                auto* owner = r->GetOwner();
+                const uint32_t ownerId = owner ? owner->GetFormID() : 0;
+                auto [it, inserted] = g_workOwner.try_emplace(r->GetFormID(), ownerId);
+                if (inserted || it->second == ownerId) return RE::BSContainer::ForEachResult::kContinue;
+                it->second = ownerId;
+                if (baseline) return RE::BSContainer::ForEachResult::kContinue;
+                CoopWorkerAssignedMsg msg{};
+                auto* npc = WorkerFor(owner, r->GetPosition());
+                if (!npc || !SeatKey(r, msg.objOwner, msg.objRef)) return RE::BSContainer::ForEachResult::kContinue;
+                msg.npcFormId = npc->GetFormID();
+                Send(MessageType::CoopWorkerAssigned, msg);
+                REX::INFO("[Workshop] {:#x} now works {:#x}: sent", msg.npcFormId, r->GetFormID());
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+            if (g_workOwner.size() > 8192) g_workOwner.clear();
+        }
+    }
+
+    void OnWirePlaced(const CoopWirePlacedMsg& m)
+    {
+        if (!ApplyWire(m)) {
+            g_wireRetry.emplace_back(m, std::chrono::steady_clock::now());   // its ends are copies still being placed
+            if (g_wireRetry.size() > 256) g_wireRetry.pop_front();
+        }
+    }
+
+    void OnWireRemoved(const CoopWireRemovedMsg& m)
+    {
+        const Key key{ m.ownerKey, m.wireRefFormId };
+        uint32_t fid = 0;
+        if (auto it = g_wireByKey.find(key); it != g_wireByKey.end()) { fid = it->second; g_wireByKey.erase(it); }
+        if (!fid) return;
+        g_wires.erase(fid);
+        RemoveWire(fid);
+        REX::INFO("[Workshop] player {} scrapped wire {:#x}", m.senderId, fid);
+    }
+
+    bool AssignWorker(RE::Actor* a_npc, RE::TESObjectREFR* a_obj)
+    {
+        // The game's own job assignment (WorkshopParent's script): ownership, packages, the settlement's numbers.
+        auto* quest = RE::TESForm::GetFormByID(0x2058E);   // WorkshopParent
+        auto* game = RE::GameVM::GetSingleton();
+        auto vm = game ? game->GetVM() : nullptr;
+        if (!vm || !quest || !a_npc || !a_obj) return false;
+        const auto& handles = vm->GetObjectHandlePolicy();
+        const auto handle = handles.GetHandleForObject(static_cast<std::uint32_t>(quest->GetFormType()), static_cast<const void*>(quest));
+        RE::BSTSmartPointer<RE::BSScript::Object> object;
+        if (handle == handles.EmptyHandle() || !vm->FindBoundObject(handle, "WorkshopParentScript", false, object, false) || !object) return false;
+        return vm->DispatchMethodCall(object, "AssignActorToObjectPUBLIC", [&](RE::BSScrapArray<RE::BSScript::Variable>& a_out) {
+            a_out = RE::BSScript::detail::PackVariables(a_npc, a_obj, false);
+            return true;
+        }, nullptr);
+    }
+
+    void OnWorkerAssigned(const CoopWorkerAssignedMsg& m)
+    {
+        auto* obj = Lookup<RE::TESObjectREFR>(LocalSeat(m.objOwner, m.objRef));
+        auto* npc = DynamicActors::ResolveNpc(m.senderId, m.npcFormId);
+        if (!obj || !npc) {
+            REX::INFO("[Workshop] player {}: {:#x} works {:08X}/{:#x} - not here", m.senderId, m.npcFormId, m.objOwner, m.objRef);
+            return;
+        }
+        // Known as this owner already: our own scan doesn't send it back.
+        if (auto* base = npc->GetNPC()) g_workOwner[obj->GetFormID()] = base->GetFormID();
+        const bool ok = AssignWorker(npc, obj);
+        REX::INFO("[Workshop] player {}: {:#x} now works {:#x} -> {}", m.senderId, npc->GetFormID(), obj->GetFormID(), ok);
     }
 
     static void PlaceCopy(const CoopBuildPlacedMsg& m)
@@ -554,6 +846,25 @@ namespace F4MP::Workshop
         REX::INFO("[Workshop] player {} scrapped {:#x}", m.senderId, fid);
     }
 
+    // The scripts attached to a reference (not the plain ObjectReference type): a quest's button, switch or lever
+    // listens with OnActivate and usually checks that the player did it.
+    std::string ScriptsOn(RE::TESObjectREFR* a_ref)
+    {
+        std::string names;
+        auto* game = RE::GameVM::GetSingleton();
+        auto vm = game ? game->GetVM() : nullptr;
+        if (!vm || !a_ref) return names;
+        const auto& handles = vm->GetObjectHandlePolicy();
+        const auto handle = handles.GetHandleForObject(static_cast<std::uint32_t>(a_ref->GetFormType()), static_cast<const void*>(a_ref));
+        if (handle == handles.EmptyHandle()) return names;
+        vm->ForEachBoundObject(handle, [&](RE::BSScript::Object* a_obj) {
+            const auto* info = a_obj ? a_obj->GetTypeInfo() : nullptr;
+            if (info && info->name != "ObjectReference") names += std::string(names.empty() ? "" : ", ") + info->name.c_str();
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        return names;
+    }
+
     void OnActivated(const CoopRefActivatedMsg& m)
     {
         const uint32_t fid = LocalFor(m.ownerId, m.ownerRefFormId);
@@ -566,11 +877,34 @@ namespace F4MP::Workshop
             if (pid == m.senderId) by = Lookup<RE::TESObjectREFR>(bodyId);
         auto* base = ref->GetObjectReference();
         if (!by && base && base->GetFormType() == RE::ENUM_FORM_ID::kDOOR) by = RE::PlayerCharacter::GetSingleton();
+        // A scripted button/switch/lever pressed by a guest: in the host's game (the story's) the host's player
+        // presses it, or a script checking "was it the player?" ignored the guest's body and the vault door,
+        // generator or quest stage it drives never moved for anyone. Guests' games only show the body doing it:
+        // the host's game runs the script once and its stages come back through quest sync.
+        // Only with the host nearby: a script that moves whoever pressed it (an elevator, a lift) mustn't pull the
+        // host away from across the map.
+        std::string scripts;
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        const bool hostNear = pl && pl->GetParentCell() && ref->GetParentCell() &&
+                              pl->GetParentCell()->IsInterior() == ref->GetParentCell()->IsInterior() &&
+                              pl->GetPosition().GetDistance(ref->GetPosition()) < 3000.0f;
+        // Not for scripts that hand out items.
+        auto givesItems = [](const std::string& a_names) {
+            static const char* kGivers[] = { "bobbypin", "loot", "item", "give", "pickup", "container", "reward", "vendor" };
+            std::string low(a_names);
+            for (auto& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return std::any_of(std::begin(kGivers), std::end(kGivers), [&](const char* k) { return low.find(k) != std::string::npos; });
+        };
+        if (F4MP::IsHost() && hostNear && base && base->GetFormType() == RE::ENUM_FORM_ID::kACTI && !(scripts = ScriptsOn(ref)).empty() &&
+            !givesItems(scripts))
+            by = pl;
+        else
+            scripts.clear();
         if (!by) return;
         g_applying = true;
         ref->ActivateRef(by, nullptr, 1, false, false, false);
         g_applying = false;
-        REX::INFO("[Workshop] player {} activated {:#x}", m.senderId, fid);
+        REX::INFO("[Workshop] player {} activated {:#x}{}{}", m.senderId, fid, scripts.empty() ? "" : " as our player, scripts: ", scripts);
     }
 
     void OnLocalActivate(RE::TESObjectREFR* target)
@@ -722,6 +1056,7 @@ namespace F4MP::Workshop
         g_worldReqSent = false;
         g_connectedAt = {};
         g_pending.clear();
+        g_wireRetry.clear();
         g_carried = 0;
         g_remoteHeld.clear();
         g_menuWasOpen = false;

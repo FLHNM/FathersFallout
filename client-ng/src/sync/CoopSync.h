@@ -54,6 +54,7 @@ namespace F4MP::Coop
     size_t MismatchedPlayers();   // host: connected clients with a different plugin list
     const Stats& GetStats();
 
+    void InstallHooks();    // at plugin load: every quest stage the game sets
     void RegisterSinks();   // once, at kGameDataReady
     void Tick();            // ~10/s while connected
     bool SyncTimeWithHost();   // guest: the host's clock and weather now (menu); false before the host sent one

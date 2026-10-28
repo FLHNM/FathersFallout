@@ -18,6 +18,7 @@ namespace Network { struct CoopNpcActivityMsg; struct CoopPowerArmorMsg; }
 //   player wears power armor (CoopPowerArmor). Main thread only.
 namespace F4MP::Activity
 {
+    void InstallHooks();   // at plugin load: idles the game starts (what an NPC plays is sent from them)
     void Tick();   // ~10/s while connected
     void OnNpcActivity(const Network::CoopNpcActivityMsg& m);
     void OnPowerArmor(const Network::CoopPowerArmorMsg& m);

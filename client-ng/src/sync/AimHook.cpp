@@ -86,6 +86,9 @@ namespace F4MP::AimHook
                 a_proj->data.angle.x = p;
                 a_proj->data.angle.z = h;
                 a_proj->desiredTarget.reset();
+                // Its blast is the owner's, replayed where it really went off (Explosions.cpp). The body's own
+                // molotov/grenade/missile blew up a second time where the body aimed.
+                a_proj->explosion = nullptr;
             }
             if (g_trace.load(std::memory_order_relaxed) && (s || (shooter && shooter.get() == RE::PlayerCharacter::GetSingleton())) &&
                 g_logged.fetch_add(1, std::memory_order_relaxed) < 400) {
