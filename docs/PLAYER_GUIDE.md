@@ -95,6 +95,16 @@ about a minute.
   mic and voice volume, switch it off, or tick **hear myself** to test your mic (with a level meter).
   It uses your Windows default microphone.
 
+## Wasteland Wars (experimental)
+
+A separate game mode: Rust, in Fallout 4's Commonwealth, with no story. It never touches your campaign: it has its own characters, saves, server and port (UDP 7790).
+
+- In the launcher click **WASTELAND WARS (EXPERIMENTAL)** at the top, pick **+ START A NEW WAR**, then **PLAY**. Press NEW in the game and make your character at the mirror.
+- You start at a random settlement. Read the note and press OK.
+- It's played in the game's **Survival** mode: eat, drink and sleep. **Sleeping in a bed saves your game**, and so does quitting from the menu. There's no fast travel.
+- Press **F1** to start a crew or pick a side. Clear a settlement and hold its workbench for 30 seconds to take it.
+- If you die, your gear stays in a bag where you fell.
+
 ## 6. Something went wrong?
 
 See [Known issues](KNOWN_ISSUES.md) and the [FAQ](FAQ.md). Found a new bug? Press

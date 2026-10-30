@@ -78,6 +78,23 @@ enum class MessageType : uint16_t {
     CoopWireRemoved = 117,          // player -> all: that wire scrapped
     CoopWorkerAssigned = 118,       // player -> all: a settler given a job (a crop, a guard post, a shop) in workshop mode
     CoopVoice = 119,                // player -> all: push-to-talk voice, played by distance (variable length, unreliable)
+    CoopNpcSay = 120,               // owner -> all: an NPC it runs started saying a dialogue line (Update 26)
+    WarsPresence = 130,             // Wars, player -> server: where I am (outdoors in the Commonwealth or not)
+    WarsSquadOnline = 131,          // Wars, server -> one player: an A-Life squad near you, run it in your game
+    WarsSquadReport = 132,          // Wars, player -> server: how that squad is doing (final = handed back)
+    WarsSquadOffline = 133,         // Wars, server -> its player: hand the squad back (remove its NPCs)
+    WarsSquadGoal = 134,            // Wars, server -> its player: what the squad does now (camp at a spot / walk to a place)
+    WarsChatter = 135,              // Wars, server -> players: A-Life radio chatter (who says what, where)
+    WarsCamp = 136,                 // Wars, server -> players near it: an A-Life camp and what its people built there
+    WarsCampGone = 137,             // Wars, server -> a player: that camp is out of their range now (its things go)
+    WarsRadioTune = 138,            // Wars, player -> server: my radio (on/off, frequency, A-Life chatter on/off)
+    WarsVoice = 139,                // Wars, player -> server -> players: push-to-talk voice, nearby or on a radio frequency
+    WarsCapture = 140,              // Wars, server -> a player: capturing a cleared place (seconds held / interrupted / done)
+    WarsClaim = 141,                // Wars, server -> players: a place's workbench and who holds it (yours or not)
+    WarsTeamAction = 142,         // Wars, player -> server: pick a side (solo / faction / make, join, leave a crew; leader: answer, open)
+    WarsTeamInfo = 143,           // Wars, server -> players: one player's side (crew, tag, colour; cooldown for themselves)
+    WarsCrew = 144,                // Wars, server -> players: a crew (name, tag, colour, open, members; its leader also gets requests)
+    WarsNotice = 145,              // Wars, server -> a player: a line for them (why a pick was refused, a request sent...)
 };
 
 #pragma pack(push, 1)
@@ -129,6 +146,7 @@ struct PlayerPositionMsg {
 static_assert(sizeof(PlayerPositionMsg) == 50, "PlayerPositionMsg must keep its size: older games read it");
 constexpr uint32_t kPosLightOn = 1u << 0;   // Pip-Boy light / power armor headlamp on
 constexpr uint32_t kPosLightColorShift = 8; // bits 8-31: that Pip-Boy's color 0xRRGGBB (0 = not sent)
+constexpr uint32_t kPosPaused = 1u << 1;    // in a menu that pauses their game (Pip-Boy, containers, VATS...): Update 26
 
 // Player appearance (old format, still relayed): sent once on connect.
 struct PlayerAppearanceMsg {
@@ -488,6 +506,15 @@ struct CoopNpcAnimMsg {
     char     name[44];       // graph event the owner's engine sent the NPC
 };
 
+struct CoopNpcSayMsg {
+    uint32_t senderId;
+    uint32_t npcFormId;      // the owner's FormID (runtime actors: mapped by sync/DynamicActors)
+    uint32_t topicFormId;    // DIAL
+    uint32_t infoFormId;     // INFO: the line itself
+    uint8_t  hasFragment;    // the line runs a script in the owner's game: not said again elsewhere
+    uint8_t  pad[3];
+};
+
 struct CoopHelloMsg {
     uint32_t senderId;
     uint32_t loadOrderHash;  // FNV-1a over lowercase file names, full plugins then light (.esl)
@@ -498,6 +525,131 @@ struct CoopHelloMsg {
     uint8_t  _pad[2];
     float    loadedRadius;   // area this game always has loaded (game units), for ownership
 };
+
+// Wasteland Wars A-Life (server/src/Wars/ALife). Never relayed to other players: the server answers them.
+constexpr int kWarsSquadMax = 8;
+struct WarsPresenceMsg {
+    uint32_t sender;        // filled in by the server
+    uint8_t outside;        // 1 = in the Commonwealth's exterior (x/y/z valid), 0 = inside somewhere / not in a world
+    float x, y, z;
+};
+struct WarsSquadMsg {
+    uint32_t sender;
+    uint32_t squad;         // A-Life squad id
+    uint8_t faction;        // Wars::Faction
+    uint8_t count;          // members (online: to spawn; report: still alive)
+    float hp[kWarsSquadMax];   // each member's health, 0..1
+    float x, y, z;          // online: where to spawn (its place's map marker); report: where they are
+    uint32_t anchorRef;     // online: that map marker's reference
+    uint32_t goalRef;       // online: the map marker of the place it's heading for (0 = staying)
+    uint8_t final;          // report: 1 = the last one (squad handed back)
+    float gx, gy, gz;       // online: where it lives while it camps (its camp's middle; 0 = x/y/z)
+};
+struct WarsSquadGoalMsg {
+    uint32_t sender;
+    uint32_t squad;
+    uint8_t travel;         // 1 = walk to goalRef (a place's map marker), 0 = camp at x/y/z
+    uint32_t goalRef;
+    float x, y, z;          // camp: the spot (where the game put NPCs there, on the ground)
+};
+struct WarsChatterMsg {
+    uint32_t sender;
+    uint8_t faction;        // Wars::Faction of the speaker (0xFF = the server / news)
+    float x, y;             // where it was said
+    char who[48];           // "Raider, Corvega gang"
+    char text[200];
+};
+
+// Squads build up camps where they live (server/src/Wars/ALife: Camp); the games near one place its things.
+constexpr int kWarsCampMax = 16;
+struct WarsCampItem {
+    uint32_t form;          // a vanilla base object: cooking fire, bedroll, tent, weapons workbench...
+    float x, y, z;          // z = the camp's ground height there (the game drops it onto the ground)
+    float rz;               // facing, radians
+};
+struct WarsCampMsg {
+    uint32_t sender;
+    uint32_t camp;          // the place's map marker reference (one camp per place)
+    uint8_t faction;        // Wars::Faction of the people who live there
+    uint8_t level;          // how far they've built it up (= items in use)
+    uint8_t count;
+    WarsCampItem items[kWarsCampMax];
+};
+struct WarsCampGoneMsg {
+    uint32_t sender;
+    uint32_t camp;
+};
+// The player's radio: A-Life chatter and radio voice only reach a radio that's on; voice only on the same frequency.
+struct WarsRadioTuneMsg {
+    uint32_t sender;
+    uint16_t freq;          // tenths of MHz: 1015 = 101.5
+    uint8_t on;
+    uint8_t chatter;        // A-Life chatter on this radio too
+};
+// Variable length: this header, then `bytes` of Opus frames ([u8 length][frame] each, 20 ms of 16 kHz mono).
+// Unreliable: a lost packet is a 40 ms gap, never a hold-up.
+struct WarsTeamActionMsg {
+    uint32_t sender;
+    uint8_t action;         // 1 solo, 2 faction (arg), 3 make a crew (name, tag, arg = colour, open), 4 join (crew),
+                            // 5 leave, 6 accept (who), 7 turn away (who), 8 set open (open)
+    uint8_t arg;
+    uint8_t open;
+    uint32_t crew;
+    char name[32];
+    char tag[6];
+    char who[48];
+};
+struct WarsTeamInfoMsg {
+    uint32_t sender;
+    uint32_t player;        // whose side this is
+    uint8_t kind;           // 0 not picked yet, 1 solo, 2 crew, 3 faction
+    uint8_t faction;        // 0 Brotherhood, 1 Minutemen, 2 Railroad, 3 Institute
+    uint8_t colour;         // crew colour 0-7
+    uint32_t crew;
+    uint32_t cooldown;      // seconds before they may change again (theirs only)
+    char tag[6];
+    char crewName[32];
+};
+struct WarsCrewMsg {
+    uint32_t sender;
+    uint32_t crew;
+    uint8_t colour, open, members, gone;   // gone = 1: disbanded
+    char name[32];
+    char tag[6];
+    char leader[48];
+    char requests[4][48];   // asking to join: sent to its leader only
+};
+struct WarsNoticeMsg {
+    uint32_t sender;
+    char text[160];
+};
+struct WarsCaptureMsg {
+    uint32_t sender;
+    uint32_t place;         // the place's map marker
+    uint8_t state;          // 0 holding, 1 interrupted (left / enemies near), 2 captured
+    uint8_t held, need;     // seconds
+    char name[48];          // the place's name
+};
+struct WarsClaimMsg {
+    uint32_t sender;
+    uint32_t workbench;     // the place's settlement workbench (WorkshopWorkbench reference)
+    uint8_t mine;           // 1 = this player holds it
+    char owner[48];         // who does ("" = nobody)
+    uint32_t place;         // the place's map marker (where its holders get up after dying: fast travel there)
+    char name[48];          // the place's name
+};
+constexpr int kWarsVoiceMaxBytes = 600;
+struct WarsVoiceMsg {
+    uint32_t sender;
+    uint8_t flags;          // kVoiceRadio: on the radio (else nearby), kVoiceEnd: the last packet of a transmission
+    uint16_t freq;          // radio: the frequency it went out on
+    uint16_t seq;
+    uint32_t space;         // nearby: worldspace (outdoors) or interior cell FormID; voice carries only within one
+    float x, y, z;          // the speaker
+    uint8_t frames;
+    uint16_t bytes;
+};
+constexpr uint8_t kVoiceRadio = 1;   // kVoiceEnd (2) is shared with CoopVoiceMsg above
 
 #pragma pack(pop)
 
@@ -511,7 +663,7 @@ struct CoopInboxItem {
 // Positions and NPC states are sent many times a second and only the newest one matters: unreliable, so a
 // lost packet doesn't hold up everything behind it (over the internet / Steam relays). Everything else
 // (hits, items, builds, quests) stays reliable and in order.
-inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosition || t == MessageType::NpcState || t == MessageType::CoopVoice; }
+inline bool IsStreamMessage(MessageType t) { return t == MessageType::PlayerPosition || t == MessageType::NpcState || t == MessageType::CoopVoice || t == MessageType::WarsVoice; }
 constexpr int kSendStream = 1;     // k_nSteamNetworkingSend_UnreliableNoNagle
 constexpr int kSendEvent = 8;      // k_nSteamNetworkingSend_Reliable
 
@@ -533,6 +685,9 @@ public:
     static NetworkClient& GetInstance();
 
     bool Initialize();
+    // testing only ([Debug] FakeLagMs / FakeLossPct / FakeJitterMs): makes this PC's link behave like the internet
+    // (each way: lag, a share of packets lost, random extra delay) to see how bodies and NPCs hold up.
+    void SimulateBadNetwork(int a_lagMs, float a_lossPct, int a_jitterMs);
     void Shutdown();
 
     bool Connect(const std::string& address, uint16_t port = DEFAULT_SERVER_PORT);
@@ -548,6 +703,7 @@ public:
     bool LastCloseWasAttempt() const { return m_lastCloseWasAttempt; }
 
     void SetPlayerName(const std::string& name) { m_playerName = name; }
+    const std::string& GetPlayerName() const { return m_playerName; }
     void SetPassword(const std::string& pw) { m_password = pw; }   // sent in the handshake
     bool IsSteam() const { return m_steam; }
     ISteamNetworkingSockets* Sockets() const { return m_sockets; }

@@ -28,7 +28,8 @@ namespace F4MP::Authority
     void Refresh();
 
     uint32_t MyId();
-    bool HostAreaKnown();   // we are the host, or the host's position has arrived
+    bool HostAreaKnown();
+    bool IsPaused(uint32_t playerId);   // in a pausing menu (or just out of one): runs nothing for now   // we are the host, or the host's position has arrived
     uint32_t OwnerOf(uint32_t space, const RE::NiPoint3& pos);
     // Whether our game runs this reference. Runtime actors (random encounters...) stay with the game
     // that made them wherever the players go: our copies of another player's are never ours.

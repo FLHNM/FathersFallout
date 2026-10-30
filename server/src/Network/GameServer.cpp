@@ -88,6 +88,11 @@ bool GameServer::Initialize(uint16_t port) {
     m_startTime = std::chrono::steady_clock::now();
     m_lastStatus = m_startTime;
     m_initialized = true;
+    if (m_wars) {
+        m_teams = std::make_unique<Wars::Teams>();
+        m_teams->Load(Wars::kTeamsPath);
+        StartALife();
+    }
     m_running = true;
 
     // Heartbeat thread to the master server (when one is set).
@@ -122,6 +127,10 @@ bool GameServer::Initialize(uint16_t port) {
 
 void GameServer::Shutdown() {
     m_running = false;
+    if (m_alife) {
+        m_alife->SaveState(Wars::kStatePath);
+        spdlog::info("[ALife] world state saved");
+    }
 
     {
         std::lock_guard<std::mutex> lock(m_clientsMutex);
@@ -160,6 +169,8 @@ void GameServer::Run() {
             Update();
             lastTick = now;
         }
+
+        TickALife();
 
         // Status line every 30 s.
         if (std::chrono::duration<float>(now - m_lastStatus).count() >= 30.0f) {
@@ -244,10 +255,15 @@ void GameServer::HandleConnectionRequest(HSteamNetConnection conn, const Connect
     const std::string name = CleanName(msg.playerName, sizeof(msg.playerName));
     const auto now = std::chrono::steady_clock::now();
 
-    if (msg.protocolVersion != PROTOCOL_VERSION) {
-        spdlog::warn("[Server] Connection rejected: protocol {} (server {})", msg.protocolVersion, PROTOCOL_VERSION);
-        const std::string why = "Different FathersFallout version (host protocol " + std::to_string(PROTOCOL_VERSION) +
-                                ", yours " + std::to_string(msg.protocolVersion) + ") - everyone needs the same update";
+    const uint32_t expected = PROTOCOL_VERSION + (m_wars ? kWarsProtocolOffset : 0);
+    if (msg.protocolVersion != expected) {
+        spdlog::warn("[Server] Connection rejected: protocol {} (server {})", msg.protocolVersion, expected);
+        const bool theyWar = msg.protocolVersion >= kWarsProtocolOffset;
+        const std::string why = theyWar != m_wars
+            ? std::string(m_wars ? "This host is playing Wasteland Wars - choose WASTELAND WARS in the launcher"
+                                 : "This host is playing the campaign - choose CAMPAIGN CO-OP in the launcher")
+            : "Different FathersFallout version (host protocol " + std::to_string(expected) +
+                  ", yours " + std::to_string(msg.protocolVersion) + ") - everyone needs the same update";
         Refuse(conn, kEndProtocol, why.c_str());
         return;
     }
@@ -484,6 +500,33 @@ void GameServer::ProcessMessages() {
                     HandleConnectionRequest(msg->m_conn, req, got >= sizeof(req));
                     break;
                 }
+                case MessageType::WarsPresence:
+                    if (auto* m = PayloadAs<WarsPresenceMsg>(msg)) HandleWarsPresence(msg->m_conn, m);
+                    break;
+                case MessageType::WarsSquadReport:
+                    if (auto* m = PayloadAs<WarsSquadMsg>(msg)) HandleWarsReport(msg->m_conn, m);
+                    break;
+                case MessageType::WarsTeamAction:
+                    if (auto* m = PayloadAs<WarsTeamActionMsg>(msg); m && m_teams) HandleWarsTeam(msg->m_conn, m);
+                    break;
+                case MessageType::WarsRadioTune:
+                    if (auto* m = PayloadAs<WarsRadioTuneMsg>(msg); m && m_wars) HandleWarsTune(msg->m_conn, m);
+                    break;
+                case MessageType::WarsVoice:
+                    if (m_wars) HandleWarsVoice(msg->m_conn, static_cast<const uint8_t*>(payload), (uint32_t)(msg->m_cbSize - sizeof(MessageHeader)));
+                    break;
+                case MessageType::WarsSquadOnline:
+                case MessageType::WarsSquadOffline:
+                case MessageType::WarsSquadGoal:
+                case MessageType::WarsChatter:
+                case MessageType::WarsCamp:
+                case MessageType::WarsCampGone:
+                case MessageType::WarsCapture:
+                case MessageType::WarsClaim:
+                case MessageType::WarsTeamInfo:
+                case MessageType::WarsCrew:
+                case MessageType::WarsNotice:
+                    break;   // the server's own word: never taken from (or relayed for) a player
                 case MessageType::PlayerPosition:
                     if (auto* m = PayloadAs<PlayerPositionMsg>(msg)) HandlePlayerPosition(msg->m_conn, m);
                     break;
@@ -623,6 +666,34 @@ void GameServer::HandleCommand(const std::string& line) {
         spdlog::info("  say <message> - send a message to every player");
         spdlog::info("  kick <id>     - kick a player by ID");
         spdlog::info("  stop / quit   - shut the server down");
+        if (m_alife) {
+            spdlog::info("  alife                 - Wasteland Wars world: squads by faction");
+            spdlog::info("  alife near <place>    - squads around a place (e.g. alife near Concord)");
+            spdlog::info("  alife events [n]      - the latest n world events");
+            spdlog::info("  alife speed <x>       - run the world x times faster (1 = normal)");
+            spdlog::info("  alife spawn <f> <place> - a new squad of faction f at a place");
+            spdlog::info("  alife go <id> <place> - send a squad somewhere now");
+            spdlog::info("  alife build <n> <place> - build a place's camp up by n things (negative wrecks)");
+            spdlog::info("  alife save            - save the world state now");
+            spdlog::info("  alife clear|unclear|attack|unclaim <place> - cleared places, attacks, claims");
+            spdlog::info("  teams                 - crews and who plays which side");
+            spdlog::info("  teams reset <name>    - let a player change side again now (no cooldown)");
+        }
+    } else if (cmd == "alife") {
+        CmdALife(iss);
+    } else if (cmd == "teams") {
+        if (!m_teams) { spdlog::warn("[Teams] only on a Wasteland Wars server"); return; }
+        std::string sub, who;
+        iss >> sub;
+        std::getline(iss, who);
+        if (!who.empty() && who.front() == ' ') who.erase(0, 1);
+        if (sub == "reset") {
+            if (m_teams->ResetCooldown(who)) spdlog::info("[Teams] {} may change side again now", who);
+            else spdlog::warn("Usage: teams reset <player name> (a player the server knows)");
+        } else {
+            for (const auto& [id, c] : m_teams->Crews())
+                spdlog::info("[Teams] crew #{} [{}] {} - leader {}, {} member(s), {}", id, c.tag, c.name, c.leader, c.members.size(), c.open ? "open" : "invite only");
+        }
     } else if (cmd == "status" || cmd == "list") {
         CmdList();
     } else if (cmd == "say") {
@@ -680,4 +751,521 @@ void GameServer::CmdSay(const std::string& msg) {
         BroadcastMessage(MessageType::ChatMessage, &m, sizeof(m), 0);
     }
     spdlog::info("[Server] {}", msg);
+}
+
+// --- Wasteland Wars A-Life ---
+
+void GameServer::StartALife() {
+    auto alife = std::make_unique<Wars::ALife>();
+    if (!alife->LoadWorld(Wars::kWorldPath)) {
+        spdlog::warn("[ALife] {} not found: the world has no NPC simulation (run tools/wars/make_world.py)", Wars::kWorldPath);
+        return;
+    }
+    alife->LoadState(Wars::kStatePath);
+    m_alife = std::move(alife);
+    m_alifeTick = m_alifeSaved = std::chrono::steady_clock::now();
+}
+
+// Once a second; saved every minute.
+void GameServer::TickALife() {
+    if (!m_alife) return;
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - m_alifeTick).count();
+    if (dt < 1.0) return;
+    m_alifeTick = now;
+    m_alife->Tick(std::min(dt, 10.0));
+    WarsOnlineOffline();
+    WarsChatter();
+    WarsCamps();
+    WarsCapture();
+    WarsTeamsSend();
+    if (std::chrono::duration<double>(now - m_alifeSaved).count() >= 60.0) {
+        m_alife->SaveState(Wars::kStatePath);
+        m_alifeSaved = now;
+    }
+}
+
+void GameServer::CmdALife(std::istringstream& args) {
+    if (!m_alife) { spdlog::warn("[ALife] not running (Wasteland Wars server with wars_world.json only)"); return; }
+    std::string sub;
+    args >> sub;
+    if (sub.empty()) {
+        m_alife->PrintSummary();
+    } else if (sub == "near") {
+        std::string place;
+        std::getline(args, place);
+        if (!place.empty() && place.front() == ' ') place.erase(0, 1);
+        m_alife->PrintNear(place);
+    } else if (sub == "events") {
+        size_t n = 20;
+        args >> n;
+        m_alife->PrintEvents(n);
+    } else if (sub == "speed") {
+        double x = 1.0;
+        args >> x;
+        m_alife->SetSpeed(x);
+        spdlog::info("[ALife] speed x{}", x);
+    } else if (sub == "spawn") {
+        std::string faction, place;
+        args >> faction;
+        std::getline(args, place);
+        if (!place.empty() && place.front() == ' ') place.erase(0, 1);
+        if (!m_alife->SpawnAt(faction, place))
+            spdlog::warn("Usage: alife spawn <raider|gunner|mutant|feral|mirelurk|deathclaw|creature|synth|robot|trader> <place>");
+    } else if (sub == "go") {
+        uint32_t id = 0;
+        std::string place;
+        args >> id;
+        std::getline(args, place);
+        if (!place.empty() && place.front() == ' ') place.erase(0, 1);
+        if (!m_alife->SendTo(id, place)) spdlog::warn("Usage: alife go <squad id> <place>");
+    } else if (sub == "build") {
+        int n = 1;
+        std::string place;
+        args >> n;
+        std::getline(args, place);
+        if (!place.empty() && place.front() == ' ') place.erase(0, 1);
+        if (!m_alife->BuildAt(place, n)) spdlog::warn("Usage: alife build <things, -n wrecks> <place> (a place with camp spots)");
+    } else if (sub == "unclaim") {
+        std::string place;
+        std::getline(args, place);
+        if (!place.empty() && place.front() == ' ') place.erase(0, 1);
+        if (!m_alife->Unclaim(place)) spdlog::warn("Usage: alife unclaim <place>");
+    } else if (sub == "clear" || sub == "unclear" || sub == "attack") {
+        std::string place;
+        std::getline(args, place);
+        if (!place.empty() && place.front() == ' ') place.erase(0, 1);
+        const bool ok = sub == "attack" ? m_alife->AttackAt(place) : m_alife->SetCleared(place, sub == "clear");
+        if (!ok) spdlog::warn("Usage: alife clear|unclear|attack <place> (attack: needs a hostile squad camping within reach)");
+    } else if (sub == "save") {
+        m_alife->SaveState(Wars::kStatePath);
+        spdlog::info("[ALife] saved to {}", Wars::kStatePath);
+    } else {
+        spdlog::warn("Usage: alife [near <place> | events [n] | speed <x> | save]");
+    }
+}
+
+void GameServer::HandleWarsPresence(HSteamNetConnection conn, const WarsPresenceMsg* msg) {
+    if (!m_alife) return;
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    auto it = m_clients.find(conn);
+    if (it == m_clients.end()) return;
+    auto& p = m_warsPresence[it->second.id];
+    p.outside = msg->outside != 0;
+    p.x = msg->x;
+    p.y = msg->y;
+    p.z = msg->z;
+    p.seen = std::chrono::steady_clock::now();
+}
+
+void GameServer::HandleWarsReport(HSteamNetConnection conn, const WarsSquadMsg* msg) {
+    if (!m_alife) return;
+    uint32_t sender = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        auto it = m_clients.find(conn);
+        if (it == m_clients.end()) return;
+        sender = it->second.id;
+    }
+    Wars::Squad* s = m_alife->Get(msg->squad);
+    // Only from the game running it (a last report may come in just after the server took it back).
+    if (!s || (s->owner != sender && !(msg->final && s->owner == 0))) return;
+    m_alife->Report(msg->squad, std::min<int>(msg->count, Wars::kWarsSquadMaxMembers), msg->hp, msg->x, msg->y, msg->final != 0);
+}
+
+// Squads within kOnline of a player who is outdoors go to that player's game (up to kPerPlayer each); a squad
+// with no outdoor player within kOffline any more goes back to the simulation. Loaded range is ~8200 units.
+void GameServer::WarsOnlineOffline() {
+    constexpr float kOnline = 7000.0f, kOffline = 10000.0f;
+    constexpr int kPerPlayer = 6;
+    const auto now = std::chrono::steady_clock::now();
+    std::unordered_map<uint32_t, WarsPresence> present;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::unordered_map<uint32_t, bool> connected;
+        for (auto& [c, cl] : m_clients) if (cl.isConnected) connected[cl.id] = true;
+        for (auto it = m_warsPresence.begin(); it != m_warsPresence.end();) {
+            if (!connected.count(it->first)) { it = m_warsPresence.erase(it); continue; }
+            if (it->second.outside && now - it->second.seen < std::chrono::seconds(10)) present[it->first] = it->second;
+            ++it;
+        }
+    }
+    std::vector<std::pair<float, float>> players;
+    for (auto& [id, p] : present) players.emplace_back(p.x, p.y);
+    auto send = [&](uint32_t a_client, MessageType a_type, Wars::Squad& a_s) {
+        WarsSquadMsg m{};
+        m.squad = a_s.id;
+        m.faction = static_cast<uint8_t>(a_s.faction);
+        m.count = static_cast<uint8_t>(std::min<size_t>(a_s.members.size(), kWarsSquadMax));
+        for (int i = 0; i < m.count; ++i) m.hp[i] = a_s.members[i].hp;
+        const auto& place = m_alife->PlaceOf(a_s);
+        const auto spot = m_alife->CampSpot(a_s, players);   // on the ground, away from players
+        m.x = spot.x;
+        m.y = spot.y;
+        m.z = spot.z;
+        m.anchorRef = place.ref;
+        if (const auto* goal = m_alife->GoalOf(a_s)) m.goalRef = goal->ref;
+        const auto home = WarsLiveSpot(a_s, players);   // where it lives there: its camp, if it has one
+        m.gx = home.x;
+        m.gy = home.y;
+        m.gz = home.z;
+        a_s.sentGoal = m_alife->GoalKey(a_s);
+        SendMessageToClient(a_client, a_type, &m, sizeof(m));
+    };
+    // What a squad in a player's game does changed (camp is over: walk on; arrived: camp there).
+    auto sendGoal = [&](Wars::Squad& a_s) {
+        WarsSquadGoalMsg g{};
+        g.squad = a_s.id;
+        const auto* goal = m_alife->GoalOf(a_s);
+        g.travel = goal ? 1 : 0;
+        g.goalRef = goal ? goal->ref : 0;
+        const auto spot = WarsLiveSpot(a_s, players);
+        g.x = spot.x;
+        g.y = spot.y;
+        g.z = spot.z;
+        a_s.sentGoal = m_alife->GoalKey(a_s);
+        SendMessageToClient(a_s.owner, MessageType::WarsSquadGoal, &g, sizeof(g));
+        spdlog::info("[ALife] squad #{} in player {}'s game: {}", a_s.id, a_s.owner,
+            goal ? fmt::format("walk to {}", goal->name) : fmt::format("camp at {}", m_alife->PlaceOf(a_s).name));
+    };
+    std::unordered_map<uint32_t, int> owned;
+    for (const auto& s : m_alife->Squads()) {
+        if (!s.owner) continue;
+        auto* sq = m_alife->Get(s.id);
+        bool keep = present.count(s.owner) != 0;
+        if (keep) {
+            keep = false;
+            for (auto& [id, p] : present)
+                if (std::hypot(p.x - s.x, p.y - s.y) < kOffline) { keep = true; break; }
+        }
+        if (keep) {
+            owned[s.owner]++;
+            if (m_alife->GoalKey(s) != s.sentGoal) sendGoal(*sq);
+            continue;
+        }
+        send(s.owner, MessageType::WarsSquadOffline, *sq);
+        spdlog::info("[ALife] squad #{} back from player {}'s game", s.id, s.owner);
+        m_alife->Release(*sq);
+    }
+    for (auto& [id, p] : present) {
+        for (Wars::Squad* s : m_alife->OfflineNear(p.x, p.y, kOnline)) {
+            if (owned[id] >= kPerPlayer) break;
+            // Its game spawns it at its place's spot, not where it is on the road: that spot too must be well
+            // inside the hand-back range, or it goes straight back.
+            if (const auto spot = m_alife->CampSpot(*s, players); std::hypot(spot.x - p.x, spot.y - p.y) > kOnline + 1000.0f) continue;
+            // Only its living members go online (their order is the report's order).
+            s->members.erase(std::remove_if(s->members.begin(), s->members.end(), [](const Wars::Member& m) { return m.hp <= 0.0f; }), s->members.end());
+            if (s->members.size() > static_cast<size_t>(kWarsSquadMax)) s->members.resize(kWarsSquadMax);
+            s->owner = id;
+            owned[id]++;
+            send(id, MessageType::WarsSquadOnline, *s);
+            spdlog::info("[ALife] squad #{} ({} {}) -> player {}'s game near {}", s->id, s->Alive(), Wars::FactionName(s->faction), id, m_alife->PlaceOf(*s).name);
+        }
+    }
+}
+
+// Radio chatter to the Wars players: one line per player at most every 12 s - trouble near them first, then events,
+// then camp talk; anything older than a minute is dropped. Every line is also in the server log.
+void GameServer::WarsChatter() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& c : m_alife->TakeChatter()) {
+        spdlog::info("[Radio] {}: {}", c.who, c.text);
+        for (auto& [id, p] : m_warsPresence) {
+            if (auto t = m_radioTune.find(id); t != m_radioTune.end() && (!t->second.on || !t->second.chatter)) continue;   // radio off
+            auto& box = m_radio[id];
+            box.pending.push_back({ c, now });
+            if (box.pending.size() > 12) box.pending.erase(box.pending.begin());
+        }
+    }
+    for (auto it = m_radio.begin(); it != m_radio.end();) {
+        auto pres = m_warsPresence.find(it->first);
+        if (pres == m_warsPresence.end()) { it = m_radio.erase(it); continue; }
+        auto& box = it->second;
+        box.pending.erase(std::remove_if(box.pending.begin(), box.pending.end(), [&](const auto& e) { return now - e.second > std::chrono::seconds(60); }), box.pending.end());
+        if (!box.pending.empty() && now - box.last >= std::chrono::seconds(12)) {
+            const auto& p = pres->second;
+            auto score = [&](const Wars::ALife::Chatter& c) {
+                const float d = std::hypot(c.x - p.x, c.y - p.y);
+                return c.priority * 100000.0f - d;
+            };
+            auto best = std::max_element(box.pending.begin(), box.pending.end(), [&](const auto& a, const auto& b) { return score(a.first) < score(b.first); });
+            WarsChatterMsg m{};
+            m.faction = static_cast<uint8_t>(best->first.faction);
+            m.x = best->first.x;
+            m.y = best->first.y;
+            std::snprintf(m.who, sizeof(m.who), "%s", best->first.who.c_str());
+            std::snprintf(m.text, sizeof(m.text), "%s", best->first.text.c_str());
+            SendMessageToClient(it->first, MessageType::WarsChatter, &m, sizeof(m));
+            box.pending.erase(best);
+            box.last = now;
+        }
+        ++it;
+    }
+}
+
+// Capturing: a player standing at a cleared place's settlement workbench for kHold seconds with no living enemy
+// squad near it takes the place. Their game gets the countdown; every player gets who holds which workbench.
+void GameServer::WarsCapture() {
+    constexpr float kAt = 450.0f, kEnemies = 2500.0f;
+    constexpr int kHold = 30;
+    std::unordered_map<uint32_t, WarsPresence> present;
+    std::unordered_map<uint32_t, std::string> names;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        for (auto& [id, p] : m_warsPresence) present[id] = p;
+        for (auto& [conn, cl] : m_clients) names[cl.id] = cl.name;
+    }
+    const auto& nodes = m_alife->Nodes();
+    auto send = [&](uint32_t a_id, int a_node, uint8_t a_state, int a_held) {
+        WarsCaptureMsg m{};
+        m.place = nodes[a_node].ref;
+        m.state = a_state;
+        m.held = static_cast<uint8_t>(a_held);
+        m.need = kHold;
+        std::snprintf(m.name, sizeof(m.name), "%s", nodes[a_node].name.c_str());
+        SendMessageToClient(a_id, MessageType::WarsCapture, &m, sizeof(m));
+    };
+    for (auto& [id, p] : present) {
+        auto& hold = m_warsHold[id];
+        int at = -1;
+        if (p.outside)
+            for (int i = 0; i < static_cast<int>(nodes.size()); ++i)
+                if (nodes[i].workbench && m_alife->Cleared(i) && m_alife->ClaimOf(i).empty() &&
+                    std::hypot(nodes[i].workbenchAt.x - p.x, nodes[i].workbenchAt.y - p.y) < kAt) { at = i; break; }
+        bool enemies = false;
+        if (at >= 0)
+            for (const auto& s : m_alife->Squads())
+                if (s.Alive() > 0 && s.faction != Wars::Faction::Trader &&
+                    std::hypot(s.x - nodes[at].workbenchAt.x, s.y - nodes[at].workbenchAt.y) < kEnemies) { enemies = true; break; }
+        if (at < 0 || enemies) {
+            if (hold.node >= 0 && hold.held > 0) send(id, hold.node, 1, hold.held);
+            hold = {};
+            continue;
+        }
+        if (hold.node != at) hold = { at, 0 };
+        if (++hold.held < kHold) { send(id, at, 0, hold.held); continue; }
+        const auto who = names.count(id) ? names[id] : std::string("A wastelander");
+        m_alife->SetClaim(at, m_teams ? m_teams->ClaimKey(who) : who);
+        send(id, at, 2, kHold);
+        spdlog::info("[ALife] {} captured {}", who, nodes[at].name);
+        hold = {};
+    }
+    // Who holds which workbench, to every player (again whenever a claim changes).
+    for (auto it = m_claimsSent.begin(); it != m_claimsSent.end();)
+        it = present.count(it->first) ? std::next(it) : m_claimsSent.erase(it);
+    for (auto& [id, p] : present) {
+        auto& had = m_claimsSent[id];
+        const uint32_t version = m_alife->ClaimsVersion() * 7919u + (m_teams ? m_teams->Version() : 0u);   // crews change who "we" are
+        if (had == version) continue;
+        had = version;
+        const auto myName = names.count(id) ? names[id] : std::string();
+        const auto me = m_teams ? m_teams->ClaimKey(myName) : myName;
+        for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
+            if (!nodes[i].workbench) continue;
+            WarsClaimMsg c{};
+            c.workbench = nodes[i].workbench;
+            c.place = nodes[i].ref;
+            std::snprintf(c.name, sizeof(c.name), "%s", nodes[i].name.c_str());
+            const auto& owner = m_alife->ClaimOf(i);
+            c.mine = !owner.empty() && (owner == me || owner == myName) ? 1 : 0;   // a claim taken before joining a crew stays ours
+            std::snprintf(c.owner, sizeof(c.owner), "%s", (m_teams ? m_teams->ClaimName(owner) : owner).c_str());
+            SendMessageToClient(id, MessageType::WarsClaim, &c, sizeof(c));
+        }
+    }
+}
+
+void GameServer::WarsNotice(uint32_t a_client, const std::string& a_text) {
+    WarsNoticeMsg n{};
+    std::snprintf(n.text, sizeof(n.text), "%s", a_text.c_str());
+    SendMessageToClient(a_client, MessageType::WarsNotice, &n, sizeof(n));
+}
+
+// A player picks a side. The name is the server's own record of them, never what the message says.
+void GameServer::HandleWarsTeam(HSteamNetConnection conn, const WarsTeamActionMsg* msg) {
+    std::string who;
+    uint32_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        auto it = m_clients.find(conn);
+        if (it == m_clients.end() || !it->second.isConnected) return;
+        who = it->second.name;
+        id = it->second.id;
+    }
+    auto text = [](const char* a_s, size_t a_n) { return std::string(a_s, strnlen(a_s, a_n)); };
+    std::string why;
+    bool ok = false;
+    switch (msg->action) {
+    case 1: ok = m_teams->PickSolo(who, why); break;
+    case 2: ok = m_teams->PickFaction(who, static_cast<Wars::Allegiance>(msg->arg), why); break;
+    case 3: ok = m_teams->Create(who, text(msg->name, sizeof(msg->name)), text(msg->tag, sizeof(msg->tag)), msg->arg, msg->open != 0, why); break;
+    case 4: ok = m_teams->Join(who, msg->crew, why); break;
+    case 5: ok = m_teams->Leave(who, why); break;
+    case 6: ok = m_teams->Answer(who, text(msg->who, sizeof(msg->who)), true, why); break;
+    case 7: ok = m_teams->Answer(who, text(msg->who, sizeof(msg->who)), false, why); break;
+    case 8: ok = m_teams->SetOpen(who, msg->open != 0, why); break;
+    default: return;
+    }
+    if (!why.empty()) WarsNotice(id, why);
+    spdlog::info("[Teams] {}: action {} -> {}{}", who, static_cast<int>(msg->action), ok ? "done" : "refused", why.empty() ? "" : ": " + why);
+}
+
+// Everyone's side and every crew, to each player (again whenever anything changes).
+void GameServer::WarsTeamsSend() {
+    if (!m_teams) return;
+    std::vector<std::pair<uint32_t, std::string>> players;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        for (auto& [conn, cl] : m_clients) if (cl.isConnected && !cl.name.empty()) players.emplace_back(cl.id, cl.name);
+    }
+    std::unordered_map<uint32_t, bool> here;
+    for (auto& [id, n] : players) here[id] = true;
+    for (auto it = m_teamsSent.begin(); it != m_teamsSent.end();) it = here.count(it->first) ? std::next(it) : m_teamsSent.erase(it);
+    // A player who came or went changes the list too.
+    static size_t s_count = 0;
+    const uint32_t version = m_teams->Version() * 131u + static_cast<uint32_t>(players.size());
+    for (auto& [to, toName] : players) {
+        auto& had = m_teamsSent[to];
+        if (had == version) continue;
+        had = version;
+        for (const auto& [cid, c] : m_teams->Crews()) {
+            WarsCrewMsg m{};
+            m.crew = cid;
+            m.colour = c.colour;
+            m.open = c.open ? 1 : 0;
+            m.members = static_cast<uint8_t>(std::min<size_t>(c.members.size(), 255));
+            std::snprintf(m.name, sizeof(m.name), "%s", c.name.c_str());
+            std::snprintf(m.tag, sizeof(m.tag), "%s", c.tag.c_str());
+            std::snprintf(m.leader, sizeof(m.leader), "%s", c.leader.c_str());
+            if (c.leader == toName)
+                for (size_t i = 0; i < c.requests.size() && i < 4; ++i) std::snprintf(m.requests[i], sizeof(m.requests[i]), "%s", c.requests[i].c_str());
+            SendMessageToClient(to, MessageType::WarsCrew, &m, sizeof(m));
+        }
+        for (auto& [pid, name] : players) {
+            const auto& s = m_teams->SideOf(name);
+            WarsTeamInfoMsg m{};
+            m.player = pid;
+            m.kind = static_cast<uint8_t>(s.kind);
+            m.faction = static_cast<uint8_t>(s.faction);
+            m.crew = s.kind == Wars::SideKind::Crew ? s.crew : 0;
+            if (const auto* c = m.crew ? m_teams->CrewById(m.crew) : nullptr) {
+                m.colour = c->colour;
+                std::snprintf(m.tag, sizeof(m.tag), "%s", c->tag.c_str());
+                std::snprintf(m.crewName, sizeof(m.crewName), "%s", c->name.c_str());
+            }
+            if (pid == to) m.cooldown = static_cast<uint32_t>(m_teams->CooldownLeft(name));
+            SendMessageToClient(to, MessageType::WarsTeamInfo, &m, sizeof(m));
+        }
+    }
+    (void)s_count;
+}
+
+Wars::Node::Spot GameServer::WarsLiveSpot(Wars::Squad& a_s, const std::vector<std::pair<float, float>>& a_players) {
+    const int node = m_alife->NodeOf(a_s);
+    Wars::Node::Spot mid;
+    // Where the game's own furniture is (their sandbox uses it), else their own camp, else an NPC spot.
+    if (const auto& n = m_alife->Nodes()[node]; n.hasHub) return n.hub;
+    if (const auto* c = m_alife->CampAt(node); c && c->faction == a_s.faction && c->level > 0 && m_alife->CampMiddle(node, mid)) return mid;
+    return m_alife->CampSpot(a_s, a_players);
+}
+
+// Camps to the players near them: within kSee of an outdoor player it's sent (again whenever it changes); past
+// kForget it's taken back. Players indoors keep what they have (they'll be back out).
+void GameServer::WarsCamps() {
+    constexpr float kSee = 9000.0f, kForget = 11500.0f;
+    std::unordered_map<uint32_t, WarsPresence> present;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        for (auto it = m_campsSent.begin(); it != m_campsSent.end();)
+            it = m_warsPresence.count(it->first) ? std::next(it) : m_campsSent.erase(it);   // gone
+        for (auto& [id, p] : m_warsPresence) if (p.outside) present[id] = p;
+    }
+    const auto& nodes = m_alife->Nodes();
+    for (auto& [id, p] : present) {
+        auto& sent = m_campsSent[id];
+        for (const auto& c : m_alife->Camps()) {
+            Wars::Node::Spot mid;
+            if (!m_alife->CampMiddle(c.node, mid)) continue;
+            const float d = std::hypot(mid.x - p.x, mid.y - p.y);
+            auto was = sent.find(c.node);
+            if (d < kSee && (was == sent.end() || was->second != c.version)) {
+                WarsCampMsg m{};
+                m.camp = nodes[c.node].ref;
+                m.faction = static_cast<uint8_t>(c.faction);
+                m.level = static_cast<uint8_t>(std::max(0, c.level));
+                const auto items = m_alife->CampItems(c);
+                m.count = static_cast<uint8_t>(std::min<size_t>(items.size(), kWarsCampMax));
+                for (int i = 0; i < m.count; ++i) m.items[i] = { items[i].form, items[i].x, items[i].y, items[i].z, items[i].rz };
+                SendMessageToClient(id, MessageType::WarsCamp, &m, sizeof(m));
+                sent[c.node] = c.version;
+            } else if (d > kForget && was != sent.end()) {
+                WarsCampGoneMsg g{};
+                g.camp = nodes[c.node].ref;
+                SendMessageToClient(id, MessageType::WarsCampGone, &g, sizeof(g));
+                sent.erase(was);
+            }
+        }
+        // Camps that are no more.
+        for (auto it = sent.begin(); it != sent.end();) {
+            if (m_alife->CampAt(it->first)) { ++it; continue; }
+            WarsCampGoneMsg g{};
+            g.camp = nodes[it->first].ref;
+            SendMessageToClient(id, MessageType::WarsCampGone, &g, sizeof(g));
+            it = sent.erase(it);
+        }
+    }
+}
+
+void GameServer::HandleWarsTune(HSteamNetConnection conn, const WarsRadioTuneMsg* msg) {
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    auto it = m_clients.find(conn);
+    if (it == m_clients.end()) return;
+    auto& t = m_radioTune[it->second.id];
+    t.freq = msg->freq;
+    t.on = msg->on != 0;
+    t.chatter = msg->chatter != 0;
+    if (!t.on || !t.chatter) m_radio.erase(it->second.id);
+    spdlog::info("[Radio] {} (ID {}): radio {}, {:.1f} MHz, A-Life chatter {}", it->second.name, it->second.id, t.on ? "on" : "off",
+        t.freq / 10.0, t.chatter ? "on" : "off");
+}
+
+// Push-to-talk voice. On the radio: to everyone whose radio is on and on that frequency, wherever they are. Nearby: to
+// everyone else, each game plays it by distance (when both are outdoors and far apart it isn't sent at all).
+// Unreliable: late voice is useless voice.
+void GameServer::HandleWarsVoice(HSteamNetConnection conn, const uint8_t* payload, uint32_t size) {
+    if (size < sizeof(WarsVoiceMsg)) return;
+    WarsVoiceMsg head;
+    memcpy(&head, payload, sizeof(head));
+    if (head.bytes > kWarsVoiceMaxBytes || sizeof(head) + head.bytes > size) return;
+    if (!std::isfinite(head.x) || !std::isfinite(head.y) || !std::isfinite(head.z)) return;
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    auto it = m_clients.find(conn);
+    if (it == m_clients.end() || !it->second.isConnected) return;
+    const uint32_t sender = it->second.id;
+    const bool radio = (head.flags & kVoiceRadio) != 0;
+    if (radio) {
+        auto t = m_radioTune.find(sender);
+        if (t != m_radioTune.end() && !t->second.on) return;   // its radio is off
+    }
+    const auto from = m_warsPresence.find(sender);
+    MessageHeader header;
+    header.type = MessageType::WarsVoice;
+    header.size = static_cast<uint32_t>(sizeof(MessageHeader) + sizeof(head) + head.bytes);
+    header.timestamp = 0;
+    std::vector<uint8_t> buffer(header.size);
+    head.sender = sender;
+    memcpy(buffer.data(), &header, sizeof(header));
+    memcpy(buffer.data() + sizeof(header), &head, sizeof(head));
+    memcpy(buffer.data() + sizeof(header) + sizeof(head), payload + sizeof(head), head.bytes);
+    for (const auto& [c, cl] : m_clients) {
+        if (!cl.isConnected || cl.id == sender) continue;
+        if (radio) {
+            auto t = m_radioTune.find(cl.id);
+            if (t == m_radioTune.end() || !t->second.on || t->second.freq != head.freq) continue;
+        } else if (auto to = m_warsPresence.find(cl.id); from != m_warsPresence.end() && to != m_warsPresence.end() &&
+                   from->second.outside && to->second.outside &&
+                   std::hypot(from->second.x - to->second.x, from->second.y - to->second.y) > 8000.0f) {
+            continue;
+        }
+        m_sockets->SendMessageToConnection(c, buffer.data(), (uint32_t)buffer.size(), k_nSteamNetworkingSend_UnreliableNoNagle, nullptr);
+    }
 }

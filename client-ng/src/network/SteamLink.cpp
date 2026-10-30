@@ -83,6 +83,45 @@ namespace Network::SteamLink
         };
         Api g_api;
         bool g_ready = false;
+
+        // ---- "Join Game" in the Steam friends list / accepted Steam invites ----
+        // The host's rich presence "connect" makes Steam offer Join Game (and the overlay's Invite to Game). A click
+        // reaches the friend's running game as GameRichPresenceJoinRequested_t; a game Steam starts for it gets the
+        // same text on its command line. Same declaration order as Steam's CCallbackBase: the vtable must match.
+        class CCallbackBase
+        {
+        public:
+            virtual void Run(void* a_param) = 0;
+            virtual void Run(void* a_param, bool a_ioFailure, uint64_t a_call) = 0;
+            virtual int GetCallbackSizeBytes() = 0;
+            uint8_t m_nCallbackFlags = 0;
+            int m_iCallback = 0;
+        };
+        constexpr int kJoinRequested = 337;   // k_iSteamFriendsCallbacks + 37: GameRichPresenceJoinRequested_t
+        struct JoinRequested { uint64_t friendId; char connect[256]; };
+        std::atomic<uint64_t> g_joinRequest{ 0 };
+
+        uint64_t ParseJoin(const char* a_text)
+        {
+            const char* p = a_text ? std::strstr(a_text, "+ffjoin ") : nullptr;
+            return p ? std::strtoull(p + 8, nullptr, 10) : 0;
+        }
+
+        class JoinCallback : public CCallbackBase
+        {
+        public:
+            JoinCallback() { m_iCallback = kJoinRequested; }
+            void Run(void* a_param) override
+            {
+                const auto* r = static_cast<const JoinRequested*>(a_param);
+                const uint64_t host = r ? ParseJoin(r->connect) : 0;
+                REX::INFO("[Steam] Join Game from the friends list: '{}' -> host {}", r ? r->connect : "", host);
+                if (host) g_joinRequest = host;
+            }
+            void Run(void* a_param, bool, uint64_t) override { Run(a_param); }
+            int GetCallbackSizeBytes() override { return static_cast<int>(sizeof(JoinRequested)); }
+        };
+        JoinCallback g_joinCallback;
         std::once_flag g_initOnce;
 
         template <class T>
@@ -240,6 +279,7 @@ namespace Network::SteamLink
             g_api.setPresence(g_api.friends, kPresenceKey, "host");
             g_api.setPresence(g_api.friends, "ffhost", a_hostName.c_str());
             g_api.setPresence(g_api.friends, "status", "Hosting FathersFallout co-op");
+            g_api.setPresence(g_api.friends, "connect", ("+ffjoin " + std::to_string(MySteamId())).c_str());
         }
     }
 
@@ -288,12 +328,30 @@ namespace Network::SteamLink
             }
             g_api.initRelay(g_api.utils);   // start finding Valve's relays now: the first join is faster
             g_ready = true;
+            using Register_t = void (*)(CCallbackBase*, int);
+            if (auto reg = reinterpret_cast<Register_t>(GetProcAddress(dll, "SteamAPI_RegisterCallback"))) {
+                reg(&g_joinCallback, kJoinRequested);
+                REX::INFO("[Steam] Join Game / invites handled");
+            }
+            // Steam started this game for a Join Game click: the host is on our command line.
+            if (const uint64_t host = ParseJoin(GetCommandLineA())) {
+                g_joinRequest = host;
+                REX::INFO("[Steam] started to join host {}", host);
+            }
             REX::INFO("[Steam] ready: {} ({})", MyName(), MySteamId());
         });
         return g_ready;
     }
 
     bool Available() { return g_ready; }
+
+    uint64_t TakeJoinRequest() { return g_joinRequest.exchange(0); }
+
+    void SetGuestPresence(const std::string& a_hostName)
+    {
+        if (!g_ready || !g_api.setPresence) return;
+        g_api.setPresence(g_api.friends, "status", a_hostName.empty() ? "" : ("Playing FathersFallout co-op with " + a_hostName).c_str());
+    }
 
     uint64_t MySteamId() { return g_ready ? g_api.getSteamID(g_api.user) : 0; }
 

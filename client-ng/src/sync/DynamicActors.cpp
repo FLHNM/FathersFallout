@@ -235,6 +235,8 @@ namespace F4MP::DynamicActors
 
     bool IsCompanionKey(uint32_t ownerId, uint32_t ownerFormId) { return g_companionKeys.contains(Key(ownerId, ownerFormId)); }
 
+    void BlockActivationOf(RE::TESObjectREFR* ref) { BlockActivation(ref); }
+
     RE::Actor* ResolveNpc(uint32_t ownerId, uint32_t ownerFormId)
     {
         if (auto* copy = Resolve(ownerId, ownerFormId)) return copy;

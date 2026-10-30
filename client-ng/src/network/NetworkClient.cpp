@@ -3,6 +3,7 @@
 // GPL v3 with additional terms: see LICENSE and NOTICE.
 
 #include "network/NetworkClient.h"
+#include "sync/Wars.h"
 #include "network/SteamLink.h"
 #include "sync/LoadOrder.h"
 
@@ -43,6 +44,20 @@ bool NetworkClient::Initialize() {
     REX::INFO("[Network] GameNetworkingSockets initialized");
     SteamLink::Init();   // Steam join, if this copy of the game runs on Steam
     return true;
+}
+
+void NetworkClient::SimulateBadNetwork(int a_lagMs, float a_lossPct, int a_jitterMs) {
+    if (!m_utils) return;
+    m_utils->SetGlobalConfigValueInt32(k_ESteamNetworkingConfig_FakePacketLag_Send, a_lagMs);
+    m_utils->SetGlobalConfigValueInt32(k_ESteamNetworkingConfig_FakePacketLag_Recv, a_lagMs);
+    m_utils->SetGlobalConfigValueFloat(k_ESteamNetworkingConfig_FakePacketLoss_Send, a_lossPct);
+    m_utils->SetGlobalConfigValueFloat(k_ESteamNetworkingConfig_FakePacketLoss_Recv, a_lossPct);
+    if (a_jitterMs > 0) {
+        m_utils->SetGlobalConfigValueFloat(k_ESteamNetworkingConfig_FakePacketJitter_Send_Avg, a_jitterMs * 0.5f);
+        m_utils->SetGlobalConfigValueFloat(k_ESteamNetworkingConfig_FakePacketJitter_Send_Max, static_cast<float>(a_jitterMs));
+        m_utils->SetGlobalConfigValueFloat(k_ESteamNetworkingConfig_FakePacketJitter_Send_Pct, 50.0f);
+    }
+    REX::WARN("[Network] SIMULATED BAD NETWORK: {} ms lag each way, {:.1f}% loss, jitter up to {} ms", a_lagMs, a_lossPct, a_jitterMs);
 }
 
 void NetworkClient::Shutdown() {
@@ -165,7 +180,7 @@ void NetworkClient::SendPacket(MessageType type, const void* data, uint32_t size
 void NetworkClient::SendConnectionRequest() {
     ConnectionRequestMsg req{};
     strncpy(req.playerName, m_playerName.c_str(), sizeof(req.playerName) - 1);
-    req.protocolVersion = PROTOCOL_VERSION;
+    req.protocolVersion = PROTOCOL_VERSION + F4MP::Wars::ProtocolOffset();   // Wasteland Wars: a different game
     strncpy(req.password, m_password.c_str(), sizeof(req.password) - 1);
     SendPacket(MessageType::ConnectionRequest, &req, sizeof(req));
     REX::INFO("[Network] handshake sent as '{}'", m_playerName);

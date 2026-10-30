@@ -52,4 +52,6 @@ namespace F4MP::DynamicActors
     uint32_t MappedCount();
     uint32_t SuppressedCount();
     void Reset();
+    // ObjectReference.BlockActivation(true, true): no prompt, E does nothing (copies of other players' things).
+    void BlockActivationOf(RE::TESObjectREFR* ref);
 }

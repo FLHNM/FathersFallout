@@ -4,6 +4,7 @@
 
 #include "pch.h"
 #include "sync/Workshop.h"
+#include "sync/Wars.h"
 #include "sync/GraphOverride.h"
 #include "sync/CoopSync.h"
 #include "network/NetworkClient.h"
@@ -171,6 +172,11 @@ namespace F4MP::Workshop
 
         // ---- settlers' jobs: a work object's owner is the NPC working it (crops: owner = Marcy's base) ----
         std::unordered_map<uint32_t, uint32_t> g_workOwner;          // work object FormID -> owner FormID last seen
+        // The job script changes an object's owner more than once while it assigns (seen twice per job): a change
+        // goes out once it has held for a moment, and only if it differs from what was last sent for that object.
+        struct PendingJob { uint32_t owner; std::chrono::steady_clock::time_point since; };
+        std::unordered_map<uint32_t, PendingJob> g_jobPending;      // work object FormID -> owner waiting to settle
+        std::unordered_map<uint32_t, uint32_t> g_jobSent;           // work object FormID -> owner last sent / applied
 
         bool WireEnds(RE::TESObjectREFR* w, RE::ExtraPowerLinks::Element& a, RE::ExtraPowerLinks::Element& b)
         {
@@ -739,16 +745,29 @@ namespace F4MP::Workshop
                 auto [it, inserted] = g_workOwner.try_emplace(r->GetFormID(), ownerId);
                 if (inserted || it->second == ownerId) return RE::BSContainer::ForEachResult::kContinue;
                 it->second = ownerId;
-                if (baseline) return RE::BSContainer::ForEachResult::kContinue;
-                CoopWorkerAssignedMsg msg{};
-                auto* npc = WorkerFor(owner, r->GetPosition());
-                if (!npc || !SeatKey(r, msg.objOwner, msg.objRef)) return RE::BSContainer::ForEachResult::kContinue;
-                msg.npcFormId = npc->GetFormID();
-                Send(MessageType::CoopWorkerAssigned, msg);
-                REX::INFO("[Workshop] {:#x} now works {:#x}: sent", msg.npcFormId, r->GetFormID());
+                if (baseline) { g_jobSent[r->GetFormID()] = ownerId; return RE::BSContainer::ForEachResult::kContinue; }
+                g_jobPending[r->GetFormID()] = { ownerId, std::chrono::steady_clock::now() };
                 return RE::BSContainer::ForEachResult::kContinue;
             });
-            if (g_workOwner.size() > 8192) g_workOwner.clear();
+            const auto now = std::chrono::steady_clock::now();
+            const bool closing = !WorkshopMenuOpen();   // the last pass when the menu closes sends what is left
+            for (auto it = g_jobPending.begin(); it != g_jobPending.end();) {
+                if (!closing && now - it->second.since < std::chrono::milliseconds(800)) { ++it; continue; }
+                const uint32_t objFid = it->first, ownerId = it->second.owner;
+                it = g_jobPending.erase(it);
+                auto* r = Lookup<RE::TESObjectREFR>(objFid);
+                if (!r || Gone(r)) continue;
+                auto& sent = g_jobSent[objFid];
+                if (sent == ownerId) continue;
+                CoopWorkerAssignedMsg msg{};
+                auto* npc = WorkerFor(RE::TESForm::GetFormByID(ownerId), r->GetPosition());
+                if (!npc || !SeatKey(r, msg.objOwner, msg.objRef)) continue;
+                sent = ownerId;
+                msg.npcFormId = npc->GetFormID();
+                Send(MessageType::CoopWorkerAssigned, msg);
+                REX::INFO("[Workshop] {:#x} now works {:#x}: sent", msg.npcFormId, objFid);
+            }
+            if (g_workOwner.size() > 8192) { g_workOwner.clear(); g_jobSent.clear(); }
         }
     }
 
@@ -797,7 +816,8 @@ namespace F4MP::Workshop
             return;
         }
         // Known as this owner already: our own scan doesn't send it back.
-        if (auto* base = npc->GetNPC()) g_workOwner[obj->GetFormID()] = base->GetFormID();
+        if (auto* base = npc->GetNPC()) g_workOwner[obj->GetFormID()] = g_jobSent[obj->GetFormID()] = base->GetFormID();
+        g_jobPending.erase(obj->GetFormID());
         const bool ok = AssignWorker(npc, obj);
         REX::INFO("[Workshop] player {}: {:#x} now works {:#x} -> {}", m.senderId, npc->GetFormID(), obj->GetFormID(), ok);
     }
@@ -1205,6 +1225,7 @@ namespace F4MP::Workshop
             std::vector<std::array<uint32_t, 3>> rows;
             for (auto& [fid, t] : g_tracked)
                 if (t.shared && t.key.owner && t.key.ref) rows.push_back({ fid, t.key.owner, t.key.ref });
+            Wars::OnSave(a_intfc);   // nothing unless this is a Wasteland Wars world
             if (!a_intfc->OpenRecord(kRecordBuilds, 1)) return;
             const uint32_t n = static_cast<uint32_t>(rows.size());
             a_intfc->WriteRecordData(n);
@@ -1220,6 +1241,7 @@ namespace F4MP::Workshop
 
         void OnRevert(const F4SE::SerializationInterface*)
         {
+            Wars::OnRevert();
             g_hidden.clear();
             g_tracked.clear();
             g_byKey.clear();
@@ -1231,6 +1253,7 @@ namespace F4MP::Workshop
             uint32_t type = 0, version = 0, length = 0;
             size_t loaded = 0;
             while (a_intfc->GetNextRecordInfo(type, version, length)) {
+                if (type == Wars::kRecord) { Wars::OnLoadRecord(a_intfc, version, length); continue; }
                 if (type == kRecordHidden && version == 1) {
                     uint32_t n = 0;
                     a_intfc->ReadRecordData(n);

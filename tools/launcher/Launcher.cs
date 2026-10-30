@@ -32,8 +32,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.25.0.0")]
-[assembly: AssemblyFileVersion("0.25.0.0")]
+[assembly: AssemblyVersion("0.26.0.0")]
+[assembly: AssemblyFileVersion("0.26.0.0")]
 
 namespace F4MPLauncher
 {
@@ -54,6 +54,10 @@ namespace F4MPLauncher
         {
             WritePrivateProfileString(section, key, value, file);
         }
+        public static void Remove(string file, string section, string key)
+        {
+            WritePrivateProfileString(section, key, null, file);
+        }
     }
 
     class SaveInfo
@@ -64,8 +68,10 @@ namespace F4MPLauncher
         public int Level;
         public string Location = "";
         public DateTime When;
+        public bool NewWar;      // Wasteland Wars: not a save, a fresh world
         public override string ToString()
         {
+            if (NewWar) return "+ START A NEW WAR  (FRESH CHARACTER IN SANCTUARY)";
             return string.Format("{0}  LV {1}  {2}  {3:g}", Player.ToUpper(), Level, Location.ToUpper(), When);
         }
     }
@@ -223,9 +229,11 @@ namespace F4MPLauncher
         readonly TermButton install = new TermButton("[ INSTALL / UPDATE FATHERSFALLOUT ]"), ipButton = new TermButton("[ MY IP FOR FRIENDS ]");
         readonly TermButton close = new TermButton("X"), minimize = new TermButton("_"), gameButton = new TermButton("[ GAME FOLDER ]");
         readonly TermButton shareLog = new TermButton("[ SHARE LOG ]");
-        // Game mode. Only the campaign in this build: Wasteland Wars (its own experimental mode) is shown locked,
-        // a teaser of what's coming.
-        readonly TermButton campaignOpt = new TermButton("[X] CAMPAIGN CO-OP"), warsOpt = new TermButton("[LOCKED] WASTELAND WARS");
+        // Game mode. Wasteland Wars is a separate, experimental mode: its own saves, its own server and port, its own
+        // settings section. The launcher always opens on the campaign.
+        readonly TermButton campaignOpt = new TermButton("[X] CAMPAIGN CO-OP"), warsOpt = new TermButton("[ ] WASTELAND WARS (EXPERIMENTAL)");
+        bool wars;
+        Label saveHint;
         const string IssuesUrl = "https://github.com/FLHNM/FathersFallout/issues/new?template=bug_report.yml";
         readonly Label ipLabel = new Label(), portLabel = new Label(), hostInfo = new Label(), status = new Label();
         readonly ContextMenuStrip saveMenu = new ContextMenuStrip();
@@ -371,10 +379,8 @@ namespace F4MPLauncher
             Place(campaignOpt, LeftW + 20, 6, 176, 22);
             Place(warsOpt, LeftW + 204, 6, 316, 22);
             campaignOpt.Selected = true;
-            warsOpt.Accent = Pip.Amber;
-            warsOpt.Click += delegate {
-                Say("WASTELAND WARS - COMING SOON. NO STORY: FACTIONS, RAIDERS AND EACH OTHER.");
-            };
+            campaignOpt.Click += delegate { SetGame(false); };
+            warsOpt.Click += delegate { SetGame(true); };
 
             Place(install, x, 236, 310, 30);
             install.Click += delegate { InstallMod(true); Refresh2(); };
@@ -437,7 +443,7 @@ namespace F4MPLauncher
                 saveMenu.MaximumSize = new Size(saveButton.Width, 330);   // longer lists scroll
                 saveMenu.Show(saveButton, new Point(0, saveButton.Height));
             };
-            AddText("NO SAVE OF YOUR OWN YET? START FALLOUT 4, CHOOSE NEW, LEAVE VAULT 111, SAVE.", x, 510, Pip.Dim, 8.5f);
+            saveHint = AddText(CampaignHint, x, 510, Pip.Dim, 8.5f);
 
             Place(play, right - 220, 540, 220, 52);
             play.Big = true;
@@ -450,6 +456,43 @@ namespace F4MPLauncher
         }
 
         bool viaSteam = true;
+
+        const string CampaignHint = "NO SAVE OF YOUR OWN YET? START FALLOUT 4, CHOOSE NEW, LEAVE VAULT 111, SAVE.";
+        const string WarsHint = "WARS HAS ITS OWN CHARACTERS AND SAVES. FIRST TIME: + START A NEW WAR.";
+
+        // Campaign co-op or Wasteland Wars. Each has its own port and its own saves in the list.
+        void SetGame(bool w)
+        {
+            if (w == wars) return;
+            Ini.Set(settings, "Launcher", wars ? "WarsPort" : "Port", port.Box.Text.Trim());
+            wars = w;
+            port.Box.Text = Ini.Get(settings, "Launcher", wars ? "WarsPort" : "Port", wars ? "7790" : "7779");
+            campaignOpt.Selected = !wars; warsOpt.Selected = wars;
+            campaignOpt.Text = wars ? "[ ] CAMPAIGN CO-OP" : "[X] CAMPAIGN CO-OP";
+            warsOpt.Text = wars ? "[X] WASTELAND WARS (EXPERIMENTAL)" : "[ ] WASTELAND WARS (EXPERIMENTAL)";
+            campaignOpt.Invalidate(); warsOpt.Invalidate();
+            saveHint.Text = wars ? WarsHint : CampaignHint;
+            saveHint.ForeColor = wars ? Pip.Amber : Pip.Dim;
+            LoadSaves();
+            Say(wars ? "WASTELAND WARS: NO STORY. FACTIONS, RAIDERS AND EACH OTHER." : "CAMPAIGN CO-OP: THE FULL STORY TOGETHER.");
+        }
+
+        // A save made in Wasteland Wars carries the Wars mark in its .f4se (written by the mod).
+        static readonly byte[] WarsMark = Encoding.ASCII.GetBytes("FATHERSFALLOUT-WASTELAND-WARS-1");
+        static bool IsWarsSave(string fos)
+        {
+            try {
+                string cosave = Path.ChangeExtension(fos, ".f4se");
+                if (!File.Exists(cosave) || new FileInfo(cosave).Length > 64 * 1024 * 1024) return false;
+                byte[] b = File.ReadAllBytes(cosave);
+                for (int i = 0; i + WarsMark.Length <= b.Length; i++) {
+                    int j = 0;
+                    while (j < WarsMark.Length && b[i + j] == WarsMark[j]) j++;
+                    if (j == WarsMark.Length) return true;
+                }
+            } catch { }
+            return false;
+        }
 
         void SetMode(bool host)
         {
@@ -542,7 +585,7 @@ namespace F4MPLauncher
         {
             Ini.Set(settings, "Launcher", "GameDir", gameDir);
             Ini.Set(settings, "Launcher", "Server", ip.Box.Text.Trim());
-            Ini.Set(settings, "Launcher", "Port", port.Box.Text.Trim());
+            Ini.Set(settings, "Launcher", wars ? "WarsPort" : "Port", port.Box.Text.Trim());
             Ini.Set(settings, "Launcher", "Name", name.Box.Text.Trim());
             Ini.Set(settings, "Launcher", "Mode", hostOpt.Selected ? "Host" : "Join");
             Ini.Set(settings, "Launcher", "JoinVia", viaSteam ? "Steam" : "IP");
@@ -716,9 +759,12 @@ namespace F4MPLauncher
             saves = new List<SaveInfo>();
             saveMenu.Items.Clear();
             var dir = SavesDir();
+            // Each mode lists its own saves only: Wasteland Wars saves never show up for the campaign, nor the other way round.
             if (Directory.Exists(dir))
-                saves = new DirectoryInfo(dir).GetFiles("*.fos").OrderByDescending(f => f.LastWriteTime).Take(40)
+                saves = new DirectoryInfo(dir).GetFiles("*.fos").OrderByDescending(f => f.LastWriteTime)
+                    .Where(f => IsWarsSave(f.FullName) == wars).Take(40)
                     .Select(f => ReadSave(f.FullName)).ToList();
+            if (wars) saves.Insert(saves.Count > 0 ? 1 : 0, new SaveInfo { NewWar = true, Player = "NEW WAR" });
             foreach (var s in saves) {
                 var item = new ToolStripMenuItem(s.ToString()) { ForeColor = Pip.Green, Tag = s };
                 item.Click += delegate(object o, EventArgs e) { PickSave((SaveInfo)((ToolStripItem)o).Tag); };
@@ -807,20 +853,25 @@ namespace F4MPLauncher
         // Windows Firewall approves a program by its path. Every update came in a new folder, so the
         // server was a "new" program each time and one cancelled prompt blocked all friends.
         // The server always runs from the same folder; updates are copied over it.
-        string StableServerExe()
+        // Wasteland Wars: the same server program as FathersFalloutWarsServer.exe in its own folder (own config.json and
+        // port), so it never shares a server with the campaign; the program knows the mode by its name.
+        string StableServerExe(bool a_wars = false)
         {
             string src = Path.GetDirectoryName(ServerExe());
-            string dst = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FathersFallout", "server");
+            string dst = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FathersFallout", a_wars ? "server-wars" : "server");
             try {
                 Directory.CreateDirectory(dst);
                 foreach (string f in Directory.GetFiles(src)) {
                     if (Path.GetFileName(f).ToLowerInvariant() == "logs.log") continue;
-                    string to = Path.Combine(dst, Path.GetFileName(f));
+                    string fname = Path.GetFileName(f);
+                    if (a_wars && fname.Equals("config.json", StringComparison.OrdinalIgnoreCase)) continue;   // its own (port 7790)
+                    if (a_wars && fname.Equals(Path.GetFileName(ServerExe()), StringComparison.OrdinalIgnoreCase)) fname = "FathersFalloutWarsServer.exe";
+                    string to = Path.Combine(dst, fname);
                     var a = new FileInfo(f);
                     var b = new FileInfo(to);
                     if (!b.Exists || a.Length != b.Length || a.LastWriteTimeUtc != b.LastWriteTimeUtc) File.Copy(f, to, true);
                 }
-                return Path.Combine(dst, Path.GetFileName(ServerExe()));
+                return Path.Combine(dst, a_wars ? "FathersFalloutWarsServer.exe" : Path.GetFileName(ServerExe()));
             } catch (Exception) {
                 return ServerExe();   // the copy failed (server still running?): use the package's own
             }
@@ -891,24 +942,36 @@ namespace F4MPLauncher
             string ini = Path.Combine(PluginsDir(), "FathersFallout.ini");
             string legacyIni = Path.Combine(PluginsDir(), "F4MP.ini");
             try { if (!File.Exists(ini) && File.Exists(legacyIni)) File.Move(legacyIni, ini); } catch { }
-            Ini.Set(ini, "Connect", "AutoConnect", "1");
-            Ini.Set(ini, "Connect", "Host", host ? "1" : "0");
+            // Wasteland Wars keeps its connection settings in [Wars]: [Connect] stays the campaign's, untouched.
+            string sec = wars ? "Wars" : "Connect";
+            Ini.Set(ini, sec, "AutoConnect", "1");
+            Ini.Set(ini, sec, "Host", host ? "1" : "0");
             string who = steamWho.Box.Text.Trim();
-            Ini.Set(ini, "Connect", "Server", host ? "127.0.0.1" : viaSteam ? (who == "" ? "steam" : "steam:" + who) : ip.Box.Text.Trim());
-            Ini.Set(ini, "Connect", "Steam", "1");   // a host also takes Steam friends
-            Ini.Set(ini, "Connect", "Port", port.Box.Text.Trim());
-            Ini.Set(ini, "Connect", "Name", name.Box.Text.Trim());
-            Ini.Set(ini, "Connect", "Password", password.Box.Text);
-            Ini.Set(ini, "Connect", "SteamFriendsOnly", friendsOnly ? "1" : "0");
-            if (host && File.Exists(ServerExe())) Ini.Set(ini, "Connect", "ServerExe", StableServerExe());
-            Ini.Set(ini, "Launch", "LoadSave", save.Name);
+            Ini.Set(ini, sec, "Server", host ? "127.0.0.1" : viaSteam ? (who == "" ? "steam" : "steam:" + who) : ip.Box.Text.Trim());
+            Ini.Set(ini, sec, "Steam", "1");   // a host also takes Steam friends
+            Ini.Set(ini, sec, "Port", port.Box.Text.Trim());
+            Ini.Set(ini, sec, "Name", name.Box.Text.Trim());
+            Ini.Set(ini, sec, "Password", password.Box.Text);
+            Ini.Set(ini, sec, "SteamFriendsOnly", friendsOnly ? "1" : "0");
+            if (host && File.Exists(ServerExe())) Ini.Set(ini, sec, "ServerExe", wars ? StableServerExe(true) : StableServerExe());
+            // [Mode] Game and [Launch] NewWar are read once by the mod and cleared: the next start is the campaign again.
+            if (wars) {
+                Ini.Set(ini, "Mode", "Game", "wars");
+                if (save.NewWar) { Ini.Set(ini, "Launch", "NewWar", "1"); Ini.Remove(ini, "Launch", "LoadSave"); }
+                else { Ini.Remove(ini, "Launch", "NewWar"); Ini.Set(ini, "Launch", "LoadSave", save.Name); }
+            } else {
+                Ini.Remove(ini, "Mode", "Game");
+                Ini.Remove(ini, "Launch", "NewWar");
+                Ini.Set(ini, "Launch", "LoadSave", save.Name);
+            }
 
             string exe = Ini.Get(settings, "Launcher", "LaunchExe", Path.Combine(gameDir, "f4se_loader.exe"));
             string args = Ini.Get(settings, "Launcher", "LaunchArgs", "");
             try {
                 var psi = new ProcessStartInfo(exe, args) { WorkingDirectory = Path.GetDirectoryName(exe), UseShellExecute = true };
                 Process.Start(psi);
-                Say("STARTING FALLOUT 4... LOADING " + save.Player.ToUpper() + " AND " + (host ? "HOSTING." : viaSteam ? "JOINING THROUGH STEAM." : "JOINING.") + " GOOD LUCK OUT THERE.");
+                if (wars && save.NewWar) Say("STARTING FALLOUT 4... A NEW WAR BEGINS. YOU COULD START ANYWHERE.");
+                else Say("STARTING FALLOUT 4... LOADING " + save.Player.ToUpper() + " AND " + (host ? "HOSTING." : viaSteam ? "JOINING THROUGH STEAM." : "JOINING.") + " GOOD LUCK OUT THERE.");
             } catch (Exception e) {
                 Say("COULDN'T START THE GAME: " + e.Message.ToUpper());
             }

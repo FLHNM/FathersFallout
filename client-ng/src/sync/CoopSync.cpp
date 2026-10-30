@@ -3,6 +3,12 @@
 // and NOTICE ("FathersFallout" and "FatherLamb" are reserved names; modified versions must be renamed).
 
 #include "pch.h"
+#include "sync/Wars.h"
+#include "sync/WarsCamps.h"
+#include "sync/WarsClaims.h"
+#include "sync/WarsTeams.h"
+#include "sync/WarsVoice.h"
+#include "sync/WarsSquads.h"
 #include "sync/CoopSync.h"
 #include "sync/GraphOverride.h"
 #include "sync/PlayerEvents.h"
@@ -17,6 +23,8 @@
 #include "sync/Activity.h"
 #include "sync/CallHooks.h"
 #include "sync/Voice.h"
+#include "sync/WorldPause.h"
+#include "sync/Dialogue.h"
 
 #include <algorithm>
 #include <atomic>
@@ -266,7 +274,7 @@ namespace F4MP::Coop
         struct WantMods { uint32_t weapon = 0; uint8_t count = 0; CoopModEntry mods[kMaxItemMods]{}; };
         std::unordered_map<uint32_t, WantMods> g_wantMods;                   // playerId -> weapon mods
         std::unordered_map<uint32_t, std::vector<uint32_t>> g_appliedMods;   // body FormID -> ModKey applied
-        // Quick weapon swaps (a guest went 10mm, shotgun, 10mm, laser musket within seconds in a
+        // Quick weapon swaps (the guest went 10mm, shotgun, 10mm, laser musket within seconds in a
         // museum fight, and the host's game crashed during the next one). Every change drops a modded copy,
         // picks it up and rebuilds the body's 3D, so a change is only applied once it has held for a moment
         // and at most every kEquipMinGap per body: a run of swaps ends up as one rebuild with the last weapon.
@@ -498,7 +506,7 @@ namespace F4MP::Coop
         // test saw only the host's name tag after spawning it right at the end of a fast-travel
         // load. Log each body's render state now and then, undo a stuck fade-in or cull, and
         // replace a body whose 3D never shows up.
-        struct BodyVis { Clock::time_point firstSeen{}, no3DSince{}, lastLog{}, lastFadeLog{}; bool no3D = false; };
+        struct BodyVis { Clock::time_point firstSeen{}, no3DSince{}, lastLog{}, lastFadeLog{}, shownAt{}; bool no3D = false; };
         std::unordered_map<uint32_t, BodyVis> g_bodyVis;
 
         void WatchBodyVisibility(uint32_t pid, RE::Actor* body)
@@ -526,11 +534,14 @@ namespace F4MP::Coop
                 return;
             }
             v.no3D = false;
+            if (v.shownAt == Clock::time_point{}) v.shownAt = now;
             if (root->GetAppCulled()) {
                 root->SetAppCulled(false);
                 REX::WARN("[Body] player {}: body 3D was culled, shown again", pid);
             }
-            if (fade && fade->currentFade < 0.5f && now - v.firstSeen > std::chrono::seconds(4)) {
+            // A new body's fade-in stalls at ~0.09 every time (its AI is held): it stayed invisible for 4-5 s after
+            // each spawn or rebuild. A real fade-in is over in well under a second.
+            if (fade && fade->currentFade < 0.5f && now - v.shownAt > std::chrono::milliseconds(1200)) {
                 // Some fades come back every frame (seen 10/s after a body rebuild): log the first few.
                 if (now - v.lastFadeLog > std::chrono::seconds(5)) {
                     v.lastFadeLog = now;
@@ -562,6 +573,12 @@ namespace F4MP::Coop
             auto* pl = RE::PlayerCharacter::GetSingleton();
             auto* hp = HealthAV();
             if (!pl || !hp || m.damage <= 0.0f || m.damage > 100000.0f) return;
+            // Wasteland Wars: crewmates (and players of the same faction) can't hurt each other.
+            if (!m.byNpc && Wars::Mode() && Wars::Teams::Friendly(m.senderId)) {
+                static int s_crew = 0;
+                if (s_crew++ < 20) REX::INFO("[Coop] player {}'s hit for {:.1f} ignored: same side", m.senderId, m.damage);
+                return;
+            }
             if (!m.byNpc && !g_settings.friendlyFire) {
                 static int s_ff = 0;
                 if (s_ff++ < 20) REX::INFO("[Coop] player {}'s hit for {:.1f} ignored: friendly fire is off", m.senderId, m.damage);
@@ -595,6 +612,8 @@ namespace F4MP::Coop
             if (m.byNpc) REX::INFO("[Coop] an NPC in player {}'s game hit us for {:.1f} ({:.0f} health left)", m.senderId, m.damage, left);
             else REX::INFO("[Coop] player {} hit us for {:.1f} ({:.0f} health left)", m.senderId, m.damage, left);
             // Health alone can sit at 0 without the player dying; the real hit would have killed.
+            // Wasteland Wars: no game death - the Wars death (loot bag, respawn) takes it from here.
+            if (left <= 0.0f && Wars::Live()) return;
             if (left <= 0.0f && !pl->IsDead(false)) {
                 // Only a real PvP shot names the other player's body as the killer (an NPC's kill credited to
                 // the friend's body: 's "killed by player 1").
@@ -1328,8 +1347,8 @@ namespace F4MP::Coop
             auto* body = BodyOfPlayer(m.senderId);
             if (!body) return;
             // Draw-and-shoot in one press: WeapEquip and attackStart come before the position packet that says the
-            // weapon is out, and the body's own draw was dropped as its AI "drawing against its player"
-            // (a quarter of the host's shots refused, the first shot of each fight 0.7 s late or lost).
+            // weapon is out, and the body's own draw was dropped as its AI "drawing against its player" (real
+            // test U24: a quarter of the host's shots refused, the first shot of each fight 0.7 s late or lost).
             const bool out = _stricmp(name, "WeapEquip") == 0 || WorthRetry(name);
             if (out || _stricmp(name, "Unequip") == 0) GraphOverride::HoldWantDrawn(body, out);
             // Shots still waiting stay queued (a newer one used to replace them: lost shots); aims are replaced.
@@ -1600,14 +1619,119 @@ namespace F4MP::Coop
         // The host's latest clock (every 2 s): the menu's "Sync time with host" applies it at once.
         CoopWorldTimeMsg g_hostTime{};
         Clock::time_point g_hostTimeAt{};
+        Clock::time_point g_waitAskedAt{};   // a guest's Wait/Sleep went to the host: its old clock isn't applied for a moment
 
         void ApplyWorldTime(const CoopWorldTimeMsg& m, bool a_force);
 
+        constexpr int kDays[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+        // Back by a_hours (< 24), for a Wars host's own sleep: the same fields as AdvanceClock.
+        void RewindClock(float a_hours)
+        {
+            auto* cal = RE::Calendar::GetSingleton();
+            if (!cal || !cal->gameHour || !cal->gameDay || !cal->gameMonth || !cal->gameYear || a_hours <= 0.0f || a_hours >= 24.0f) return;
+            if (cal->gameDaysPassed) cal->gameDaysPassed->value -= a_hours / 24.0f;
+            float hour = cal->gameHour->value - a_hours;
+            if (hour < 0.0f) {
+                hour += 24.0f;
+                float day = cal->gameDay->value - 1.0f, month = cal->gameMonth->value, year = cal->gameYear->value;
+                if (day < 1.0f) {
+                    if (--month < 0.0f) { month = 11.0f; --year; }
+                    day = static_cast<float>(kDays[std::clamp(static_cast<int>(month), 0, 11)]);
+                }
+                cal->gameDay->value = day;
+                cal->gameMonth->value = month;
+                cal->gameYear->value = year;
+            }
+            cal->gameHour->value = hour;
+        }
+
+        // Moves the calendar on by a_hours (< 24): hour, day, month, year and the days-passed counter together.
+        void AdvanceClock(float a_hours)
+        {
+            auto* cal = RE::Calendar::GetSingleton();
+            if (!cal || !cal->gameHour || !cal->gameDay || !cal->gameMonth || !cal->gameYear || a_hours <= 0.0f || a_hours >= 24.0f) return;
+            if (cal->gameDaysPassed) cal->gameDaysPassed->value += a_hours / 24.0f;
+            float hour = cal->gameHour->value + a_hours;
+            if (hour >= 24.0f) {
+                hour -= 24.0f;
+                float day = cal->gameDay->value + 1.0f, month = cal->gameMonth->value, year = cal->gameYear->value;
+                if (day > kDays[std::clamp(static_cast<int>(month), 0, 11)]) {
+                    day = 1.0f;
+                    if (++month > 11.0f) { month = 0.0f; ++year; }
+                }
+                cal->gameDay->value = day;
+                cal->gameMonth->value = month;
+                cal->gameYear->value = year;
+            }
+            cal->gameHour->value = hour;
+        }
+
+        // A shared world's clock never stops: the host's game stood still in its Pip-Boy, so the time it missed is
+        // added afterwards (the guests' clocks ran on meanwhile and aren't pulled back). A guest's Wait/Sleep asks
+        // the host to move everyone's clock (it was undone by the next correction before, Update 26).
+        void SyncPausesAndWaits()
+        {
+            // Ticks run under the Pip-Boy too: the pause is added up and applied once, when the menu closes.
+            static double s_paused = 0.0;
+            s_paused += WorldPause::TakePausedSeconds();
+            const float waited = WorldPause::TakeWaitedHours();
+            auto* cal = RE::Calendar::GetSingleton();
+            if (!cal || !cal->timeScale || !g_settings.worldTime) return;
+            const bool others = !NetworkClient::GetInstance().GetRemotePlayers().empty();
+            // Wars runs in survival, whose hunger and thirst count every game hour that passes: one player's sleep
+            // moving everyone's clock would starve the others (and each extra player would speed it up). A sleeper
+            // keeps what the game gave them on waking, and their clock goes back to everyone's: a guest's by the next
+            // correction from the host, the host's here, before its next clock goes out.
+            if (Wars::Live() && waited > 0.0f) {
+                if (others) {
+                    if (IsHost()) RewindClock(waited);
+                    REX::INFO("[Wars] we slept {:.1f} h: the others' clock stays where it is", waited);
+                }
+                return;
+            }
+            if (IsHost()) {
+                if (WorldPause::LocalPaused()) return;
+                const double paused = std::exchange(s_paused, 0.0);
+                const float hours = static_cast<float>(paused) * cal->timeScale->value / 3600.0f;
+                if (others && hours > 0.005f) {
+                    AdvanceClock(hours);
+                    REX::INFO("[Coop] our game was paused {:.1f} s: clock moved on {:.0f} game min for everyone", paused, hours * 60.0f);
+                    SendWorldTime();
+                }
+            } else if (others && waited > 0.0f) {
+                CoopWorldTimeMsg msg{};
+                msg.gameHour = cal->gameHour->value;
+                msg.gameDay = cal->gameDay->value;
+                msg.gameMonth = cal->gameMonth->value;
+                msg.gameYear = cal->gameYear->value;
+                msg.timeScale = cal->timeScale->value;
+                Send(MessageType::CoopWorldTime, msg);
+                g_waitAskedAt = Clock::now();
+                REX::INFO("[Coop] we waited {:.1f} h: asked the host to move the clock for everyone", waited);
+            }
+        }
+
         void OnWorldTime(const CoopWorldTimeMsg& m)
         {
-            if (IsHost() || m.senderId == Authority::MyId()) return;
+            if (m.senderId == Authority::MyId()) return;
+            if (IsHost()) {
+                // Only guests' Wait/Sleep sends a clock to the host: move ours on to it (forward only, within a day).
+                auto* cal = RE::Calendar::GetSingleton();
+                if (!g_settings.worldTime || !cal || !cal->gameHour) return;
+                float dh = std::fmod(m.gameHour - cal->gameHour->value + 48.0f, 24.0f);
+                if (dh < 0.2f || dh > 23.5f) return;
+                AdvanceClock(dh);
+                REX::INFO("[Coop] player {} waited/slept: clock moved on {:.1f} h for everyone", m.senderId, dh);
+                SendWorldTime();
+                return;
+            }
             g_hostTime = m;
             g_hostTimeAt = Clock::now();
+            // Mid-sleep in Wars: the correction waits until we're up, or it would undo the sleep as it runs.
+            if (auto* ui = RE::UI::GetSingleton(); Wars::Live() && ui && ui->GetMenuOpen("SleepWaitMenu")) return;
+            // Not while the host's game stands still in a menu (it catches up after) or our Wait is on its way.
+            if (Authority::IsPaused(Authority::HostId()) || Clock::now() - g_waitAskedAt < std::chrono::seconds(4)) return;
             ApplyWorldTime(m, false);
         }
 
@@ -1629,8 +1753,8 @@ namespace F4MP::Coop
                     REX::INFO("[Coop] clock {:.2f}h -> host {:.2f}h (day {}/{}/{})", cal->gameHour->value, m.gameHour,
                         m.gameMonth + 1, m.gameDay, m.gameYear);
                 }
-                // GameDaysPassed moves with the hour: a guest joined at midnight, the clock said
-                // the host's 6 am, and their sky stayed night all session. Only the time of day (+-12 h): the two
+                // GameDaysPassed moves with the hour: the guest joined at midnight, the clock said
+                // the host's 6 am, and the sky stayed night all session. Only the time of day (+-12 h): the two
                 // saves' dates differ by weeks, and moving by that sent the counter below zero.
                 float dh = m.gameHour - cal->gameHour->value;
                 if (dh > 12.0f) dh -= 24.0f;
@@ -1908,7 +2032,7 @@ namespace F4MP::Coop
         }
 
         // A body's replayed shot (0 damage, for show) that hit an NPC who isn't against us: in Fallout 4 even
-        // that counts as an attack by the player's side. Preston once turned on the host in the
+        // that counts as an attack by the player's side. Preston turned on the host in the
         // museum, and the quest couldn't go on. Calmed in Tick if it picked a fight with one of us.
         std::vector<std::pair<uint32_t, Clock::time_point>> g_bodyHitNpcs;
 
@@ -2095,6 +2219,9 @@ namespace F4MP::Coop
                 break;
             case MessageType::CoopNpcAnim:
                 if (auto* m = Mut<CoopNpcAnimMsg>(item)) tr(m->npcFormId);
+                break;
+            case MessageType::CoopNpcSay:
+                if (auto* m = Mut<CoopNpcSayMsg>(item)) { tr(m->npcFormId); tr(m->topicFormId); tr(m->infoFormId); }
                 break;
             case MessageType::CoopNpcDamage:
                 if (auto* m = Mut<CoopNpcDamageMsg>(item)) tr(m->npcFormId);   // the hitter's copy, by its own FormID
@@ -2351,6 +2478,9 @@ namespace F4MP::Coop
             case MessageType::CoopNpcAnim:
                 if (auto* m = As<CoopNpcAnimMsg>(item); m && g_settings.combatAnims) OnNpcAnim(*m);
                 break;
+            case MessageType::CoopNpcSay:
+                if (auto* m = As<CoopNpcSayMsg>(item)) Dialogue::OnSay(*m);
+                break;
             case MessageType::CoopFurniture:
                 if (auto* m = As<CoopSeatMsg>(item)) Workshop::OnFurniture(*m);
                 break;
@@ -2441,6 +2571,28 @@ namespace F4MP::Coop
             case MessageType::CoopWorldTime:
                 if (auto* m = As<CoopWorldTimeMsg>(item); m && g_settings.worldTime) OnWorldTime(*m);
                 break;
+            case MessageType::WarsSquadOnline:
+            case MessageType::WarsSquadOffline:
+            case MessageType::WarsSquadGoal:
+            case MessageType::WarsChatter:
+                Wars::Squads::OnMessage(static_cast<uint16_t>(item.type), item.payload);   // only acts in a Wars world
+                break;
+            case MessageType::WarsCamp:
+            case MessageType::WarsCampGone:
+                Wars::Camps::OnMessage(static_cast<uint16_t>(item.type), item.payload);
+                break;
+            case MessageType::WarsCapture:
+            case MessageType::WarsClaim:
+                Wars::Claims::OnMessage(static_cast<uint16_t>(item.type), item.payload);
+                break;
+            case MessageType::WarsTeamInfo:
+            case MessageType::WarsCrew:
+            case MessageType::WarsNotice:
+                Wars::Teams::OnMessage(static_cast<uint16_t>(item.type), item.payload);
+                break;
+            case MessageType::WarsVoice:
+                Wars::Voice::OnPacket(item.payload);
+                break;
             default:
                 break;
             }
@@ -2481,6 +2633,20 @@ namespace F4MP::Coop
         return true;
     }
 
+    // A part of the tick that took over 2 ms (a hitch you can feel at 60 FPS) is named in the log, 40 times at most.
+    struct SlowWatch {
+        const char* part;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        explicit SlowWatch(const char* a_part) : part(a_part) {}
+        ~SlowWatch()
+        {
+            static int s_lines = 0;
+            if (s_lines >= 40) return;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (ms > 2.0) { ++s_lines; REX::INFO("[Perf] slow tick part: {} {:.1f} ms", part, ms); }
+        }
+    };
+
     void Tick()
     {
         auto& net = NetworkClient::GetInstance();
@@ -2493,10 +2659,16 @@ namespace F4MP::Coop
             SendPluginList();
         }
         // Our own character, on connect and every 10 s (late joiners; receivers ignore repeats).
-        static Clock::time_point s_lastLook{};
+        static Clock::time_point s_lastLook{}, s_lastRead{};
+        static std::vector<uint8_t> s_look;
         if (Clock::now() - s_lastLook >= std::chrono::seconds(10)) {
+            SlowWatch w("appearance");
             s_lastLook = Clock::now();
-            auto blob = Appearance::LookToSend();   // saved "co-op look" if any, else this character
+            if (s_look.empty() || Appearance::TakeLookDirty() || s_lastLook - s_lastRead >= std::chrono::seconds(60)) {
+                s_look = Appearance::LookToSend();   // saved "co-op look" if any, else this character
+                s_lastRead = s_lastLook;
+            }
+            const auto& blob = s_look;
             if (!blob.empty()) {
                 net.SendPacket(MessageType::CoopAppearance, blob.data(), static_cast<uint32_t>(blob.size()));
                 g_stats.sent++;
@@ -2512,12 +2684,13 @@ namespace F4MP::Coop
             }
         }
         Authority::Refresh();
-        for (auto& item : net.DrainCoopInbox()) Dispatch(item);
+        { SlowWatch w("inbox"); for (auto& item : net.DrainCoopInbox()) Dispatch(item); }
         SendOwnVitals();   // health on name tags works whatever the plugin lists
         if (IsLoadOrderMismatch()) return;
-        if (g_settings.building) Workshop::Tick();
+        if (g_settings.building) { SlowWatch w("workshop"); Workshop::Tick(); }
 
         if (g_settings.equipment) {
+            SlowWatch w("equipment");
             PollLocalEquipment();
             ApplyEquipmentToBodies();
             SendNpcEquipment();
@@ -2534,12 +2707,14 @@ namespace F4MP::Coop
             WatchBodyDamage();
             Explosions::Tick();
         }
-        DynamicActors::ClientTick();
-        Activity::Tick();
+        { SlowWatch w("dynamic actors"); DynamicActors::ClientTick(); }
+        { SlowWatch w("activity"); Activity::Tick(); }
+        { SlowWatch w("dialogue"); Dialogue::Tick(); }
 
         const auto now = Clock::now();
         if (g_settings.quests && now - g_lastQuestPoll >= std::chrono::milliseconds(500)) {
             g_lastQuestPoll = now;
+            SlowWatch w("quests");
             CheckAppliedQuests();
             PollQuests();
         }
@@ -2555,6 +2730,8 @@ namespace F4MP::Coop
         GraphOverride::CaptureNpcEvents(g_settings.combatAnims);
         SendNpcCombatEvents();
 
+        SyncPausesAndWaits();
+        WorldPause::SetRealTimeVats(g_settings.realTimeVats && !NetworkClient::GetInstance().GetRemotePlayers().empty());
         static Clock::time_point s_lastTime{};
         if (IsHost() && g_settings.worldTime && now - s_lastTime >= std::chrono::seconds(2)) {
             s_lastTime = now;
@@ -2570,6 +2747,7 @@ namespace F4MP::Coop
     void OnDisconnected()
     {
         LoadOrder::Reset();
+        WorldPause::SetRealTimeVats(false);   // single player again: VATS as the game made it
         g_lastSentEquip.clear();
         g_lastSentMods.clear();
         g_wantEquip.clear();

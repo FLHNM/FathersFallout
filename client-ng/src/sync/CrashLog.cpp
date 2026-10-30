@@ -20,6 +20,18 @@ namespace F4MP::CrashLog
         std::atomic<bool> g_inside{ false };
         DWORD g_mainThread = 0;
         void* volatile g_lastReported = nullptr;   // where the last exception OnException wrote out happened
+        std::atomic<bool> g_closing{ false };      // the game was seen quitting (Main::quitGame)
+
+        // Quitting to the desktop faults inside the game's own teardown on many PCs (Fallout4.exe+0x4CB273 on the
+        // main thread right after the exit save, or in the CRT exit path): every player's log ended in GAME CRASHED.
+        // Main::quitGame is set when the player picks Quit and stays set through the teardown.
+        bool GameClosing()
+        {
+            if (g_closing.load()) return true;
+            auto* main = RE::Main::GetSingleton();
+            if (!main || IsBadReadPtr(main, sizeof(RE::Main))) return false;
+            return main->quitGame;
+        }
 
         // No allocation, no logger locks (the crash may have happened inside either): plain WriteFile.
         void Write(HANDLE f, const char* text)
@@ -90,7 +102,8 @@ namespace F4MP::CrashLog
                 DWORD64 frame = 0;
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &handlerData, &frame, nullptr);
             }
-            Write(f, "[CRASH] ===== please send this log (launcher: SHARE LOG) =====\r\n");
+            Write(f, GameClosing() ? "[CRASH] ===== no need to report this one =====\r\n"
+                                   : "[CRASH] ===== please send this log (launcher: SHARE LOG) =====\r\n");
             FlushFileBuffers(f);
             CloseHandle(f);
         }
@@ -104,12 +117,13 @@ namespace F4MP::CrashLog
                 HANDLE f = CreateFileW(g_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (f != INVALID_HANDLE_VALUE) {
-                    Write(f, "[CRASH] ===== GAME CRASHED (the exception above) =====\r\n");
+                    Write(f, GameClosing() ? "[CRASH] ===== GAME CLOSED (the error above happened while quitting, not during play) =====\r\n"
+                                           : "[CRASH] ===== GAME CRASHED (the exception above) =====\r\n");
                     FlushFileBuffers(f);
                     CloseHandle(f);
                 }
             } else {
-                Report(ep, "GAME CRASHED");
+                Report(ep, GameClosing() ? "GAME CLOSED (error while quitting, not during play)" : "GAME CRASHED");
             }
             return g_previous ? g_previous(ep) : EXCEPTION_CONTINUE_SEARCH;
         }
@@ -137,7 +151,8 @@ namespace F4MP::CrashLog
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             if (g_firstChance.fetch_add(1) < 3) {
-                Report(ep, "EXCEPTION (the game may still handle it)");
+                Report(ep, GameClosing() ? "ERROR WHILE QUITTING (harmless: the game was already closing)"
+                                         : "EXCEPTION (the game may still handle it)");
                 g_lastReported = ep->ExceptionRecord->ExceptionAddress;
             }
             return EXCEPTION_CONTINUE_SEARCH;
@@ -171,6 +186,15 @@ namespace F4MP::CrashLog
         g_previous = SetUnhandledExceptionFilter(OnCrash);
         AddVectoredExceptionHandler(1, OnException);
         REX::INFO("[FathersFallout] crash logger installed{}", g_previous ? " (chained to an earlier crash handler)" : "");
+    }
+
+    void NoteFrame()
+    {
+        if (g_closing.load()) return;
+        if (auto* main = RE::Main::GetSingleton(); main && main->quitGame) {
+            g_closing = true;
+            REX::INFO("[FathersFallout] game is closing (quit)");
+        }
     }
 
     void Reassert()

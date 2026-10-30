@@ -7,9 +7,11 @@
 #include "sync/DynamicActors.h"
 #include "sync/CoopSync.h"
 #include "sync/Range.h"
+#include "sync/WorldPause.h"
 #include "network/NetworkClient.h"
 
 #include <atomic>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -17,7 +19,12 @@ namespace F4MP::Authority
 {
     namespace
     {
-        struct PlayerArea { uint32_t id; uint32_t space; RE::NiPoint3 pos; float radius; };
+        // paused: that game is stopped in a menu (Pip-Boy, a container, VATS, Esc): it can't run NPCs, so the areas it
+        // owned go to the next player who has them loaded until it has been back a moment (Update 26: the world went
+        // still on the other screen whenever someone opened their Pip-Boy).
+        struct PlayerArea { uint32_t id; uint32_t space; RE::NiPoint3 pos; float radius; bool paused = false; };
+        std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> g_pausedUntil;   // player -> paused till
+        constexpr auto kResumeGrace = std::chrono::milliseconds(2000);   // its game catches up as a mirror first
 
         std::vector<PlayerArea> g_players;                    // refreshed every tick, includes us
         std::unordered_map<uint32_t, float> g_radius;          // remote loaded radius (from hello)
@@ -44,6 +51,7 @@ namespace F4MP::Authority
 
         bool Covers(const PlayerArea& p, uint32_t space, const RE::NiPoint3& pos, float fraction)
         {
+            if (p.paused) return false;
             // Space 0 = unknown (e.g. the test simulator): assume the same space.
             if (p.space && space && p.space != space) return false;
             const float r = p.radius * fraction;
@@ -77,12 +85,25 @@ namespace F4MP::Authority
     void Refresh()
     {
         g_players.clear();
+        const auto now = std::chrono::steady_clock::now();
+        auto paused = [&](uint32_t id, bool flag) {
+            if (flag) g_pausedUntil[id] = now + kResumeGrace;
+            auto it = g_pausedUntil.find(id);
+            return it != g_pausedUntil.end() && now < it->second;
+        };
         auto* pl = RE::PlayerCharacter::GetSingleton();
-        if (pl) g_players.push_back({ MyId(), LocalSpace(), pl->GetPosition(), Range::Loaded() });
+        if (pl) g_players.push_back({ MyId(), LocalSpace(), pl->GetPosition(), Range::Loaded(), paused(MyId(), WorldPause::LocalPaused()) });
         for (auto& [id, m] : Network::NetworkClient::GetInstance().GetRemotePlayers()) {
             auto r = g_radius.find(id);
-            g_players.push_back({ id, m.cellId, { m.x, m.y, m.z }, r != g_radius.end() ? r->second : 2.0f * Range::kCellSize });
+            g_players.push_back({ id, m.cellId, { m.x, m.y, m.z }, r != g_radius.end() ? r->second : 2.0f * Range::kCellSize,
+                paused(id, (m.extraFlags & Network::kPosPaused) != 0) });
         }
+    }
+
+    bool IsPaused(uint32_t playerId)
+    {
+        const auto* p = Find(playerId);
+        return p && p->paused;
     }
 
     uint32_t OwnerOf(uint32_t space, const RE::NiPoint3& pos)
@@ -135,6 +156,7 @@ namespace F4MP::Authority
         g_players.clear();
         g_radius.clear();
         g_lastOwner.clear();
+        g_pausedUntil.clear();
         g_hostId = 0;
     }
 }

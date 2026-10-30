@@ -17,5 +17,8 @@ namespace F4MP::CrashLog
     // The game's log is rewritten on every start: the session before (the one that crashed, when a
     // player relaunches to send it) is kept as FathersFallout-previous.log. Call before F4SE::Init.
     void KeepPreviousLog();
+    // Once a frame: notices the player quitting, so a fault in the game's own teardown is logged as
+    // "closed while quitting" instead of a crash.
+    void NoteFrame();
     std::wstring LogPath();
 }

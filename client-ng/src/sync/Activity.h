@@ -12,8 +12,8 @@ namespace Network { struct CoopNpcActivityMsg; struct CoopPowerArmorMsg; }
 // What actors are busy with, beyond walking about: furniture (chairs, beds, campfires, workbenches),
 // idles (smoking, leaning, eating) and power armor.
 // - NPCs: the game that runs one sends its seat and idle (CoopNpcActivity); copies elsewhere are put
-//   on the same seat / play the same idle. A copy used to stand on the seat doing nothing (an NPC
-//   cooking at a campfire on the host stood through the seat on the guest's screen).
+//   on the same seat / play the same idle. A copy used to stand on the seat doing nothing (
+//   an NPC cooking at a campfire on the host stood through the seat on the guest's laptop).
 // - Player bodies: put on their player's seat (CoopFurniture) and into a frame of their own when their
 //   player wears power armor (CoopPowerArmor). Main thread only.
 namespace F4MP::Activity

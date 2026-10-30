@@ -5,6 +5,7 @@
 #include "pch.h"
 #include "sync/FrameLimiter.h"
 #include "sync/CrashLog.h"
+#include "sync/WorldPause.h"
 
 #include <Windows.h>
 
@@ -40,6 +41,8 @@ namespace F4MP::FrameLimiter
 
     void OnFrame()
     {
+        CrashLog::NoteFrame();
+        WorldPause::OnFrame();
         if (!g_freq.QuadPart) {
             QueryPerformanceFrequency(&g_freq);
             QueryPerformanceCounter(&g_last);

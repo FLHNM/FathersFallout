@@ -49,6 +49,10 @@ namespace F4MP::Appearance
 
     bool SaveMyLook();                         // save the loaded character and select it
     std::vector<uint8_t> LookToSend();         // selected character if any, else the loaded one
+    // Reading the look (character files + the loaded character) takes ~2.5 ms: it is read again only when it may
+    // have changed (character picked/saved/deleted, the looks menu closed) or once a minute.
+    void MarkLookDirty();
+    bool TakeLookDirty();
     std::string MyLookName();
     std::string NameOf(uint32_t playerId);     // remote player's character name, "" if unknown                  // selected character's name, or "" if none
 

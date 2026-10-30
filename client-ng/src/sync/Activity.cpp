@@ -112,8 +112,11 @@ namespace F4MP::Activity
         struct BodyFrame { uint32_t body = 0; uint32_t frame = 0; int tries = 0; Clock::time_point nextTry{}; bool in = false;
                            Clock::time_point exitAt{}; };
         std::unordered_map<uint32_t, BodyFrame> g_bodyFrame;   // playerId -> the frame we gave its body
-        // Frames left standing where a body got out (like the real one its player left): removed after a while.
-        std::vector<std::pair<uint32_t, Clock::time_point>> g_leftFrames;
+        // Frames left standing where a body got out (like the real one its player left, with its pieces on):
+        // removed when that player gets into power armor again (they took it back) or after a while.
+        struct LeftFrame { uint32_t pid = 0, frame = 0; Clock::time_point until{}; };
+        std::vector<LeftFrame> g_leftFrames;
+        std::unordered_map<uint32_t, std::vector<uint32_t>> g_lastPieces;   // playerId -> pieces worn last time in
 
         RE::BGSKeyword* ArmorKeyword() { return RE::PowerArmor::GetArmorKeyword(); }
 
@@ -371,6 +374,30 @@ namespace F4MP::Activity
         return ok;
     }
 
+    // The frame the body was in can't be shown again once the body is rebuilt (it stays as worn, hidden: the
+    // known issue "the empty frame isn't shown"). A fresh one goes where the body stood, with the pieces on it.
+    static uint32_t PlaceLeftFrame(RE::Actor* a_body, const std::vector<uint32_t>& a_pieces)
+    {
+        auto* base = Lookup<RE::TESBoundObject>(kBodyFrameBase);
+        auto* dh = RE::TESDataHandler::GetSingleton();
+        auto* cell = a_body ? a_body->GetParentCell() : nullptr;
+        if (!base || !dh || !cell) return 0;
+        RE::NEW_REFR_DATA data;
+        data.location = a_body->GetPosition();
+        data.direction = { 0.0f, 0.0f, a_body->GetHeading() };
+        data.object = base;
+        if (cell->IsInterior()) data.interior = cell;
+        else data.world = cell->worldSpace;
+        auto frame = dh->CreateReferenceAtLocation(data).get();
+        if (!frame) return 0;
+        for (auto fid : a_pieces)
+            if (auto* p = Lookup<RE::TESBoundObject>(fid))
+                frame->AddObjectToContainer(p, nullptr, 1, nullptr, RE::ITEM_REMOVE_REASON::kNone);
+        // Only to look at: getting in or taking its pieces would copy the other player's armor into our game.
+        DynamicActors::BlockActivationOf(frame.get());
+        return frame->GetFormID();
+    }
+
     void ExitPowerArmor(RE::Actor* a_actor)
     {
         if (!a_actor) return;
@@ -414,6 +441,7 @@ namespace F4MP::Activity
         std::erase(pieces, 0u);
         if (w.in != (m.inArmor != 0) || w.pieces != pieces)
             REX::INFO("[Activity] player {} is {} power armor ({} pieces)", m.senderId, m.inArmor ? "in" : "out of", pieces.size());
+        if (m.inArmor && !pieces.empty()) g_lastPieces[m.senderId] = pieces;
         w.in = m.inArmor != 0;
         w.pieces = std::move(pieces);
         w.at = Clock::now();
@@ -434,6 +462,12 @@ namespace F4MP::Activity
             }
             const bool in = RE::PowerArmor::ActorInPowerArmor(*body);
             if (want.in && !in) {
+                // Back in: the frame they left here is the one they took.
+                std::erase_if(g_leftFrames, [&](const LeftFrame& f) {
+                    if (f.pid != pid) return false;
+                    DeleteRef(f.frame);
+                    return true;
+                });
                 if (bf.tries >= 4 || now < bf.nextTry) continue;
                 ++bf.tries;
                 bf.nextTry = now + std::chrono::seconds(2);
@@ -446,8 +480,13 @@ namespace F4MP::Activity
                     bf.exitAt = now;
                     ExitPowerArmor(body);
                 } else if (now - bf.exitAt > std::chrono::milliseconds(500)) {
-                    if (bf.frame) g_leftFrames.emplace_back(bf.frame, now + std::chrono::minutes(2));
+                    if (bf.frame) DeleteRef(bf.frame);
                     bf.frame = 0;
+                    if (const uint32_t left = PlaceLeftFrame(body, g_lastPieces[pid])) {
+                        g_leftFrames.push_back({ pid, left, now + std::chrono::minutes(15) });
+                        if (g_leftFrames.size() > 8) { DeleteRef(g_leftFrames.front().frame); g_leftFrames.erase(g_leftFrames.begin()); }
+                        REX::INFO("[Activity] player {}: frame {:#x} left standing ({} pieces)", pid, left, g_lastPieces[pid].size());
+                    }
                     bf.exitAt = {};
                     Appearance::RequestRespawn(pid);
                     REX::INFO("[Activity] player {} got out of power armor: body rebuilt, frame left standing", pid);
@@ -459,9 +498,9 @@ namespace F4MP::Activity
             bf.in = RE::PowerArmor::ActorInPowerArmor(*body);
             if (!want.in && !bf.in) bf.exitAt = {};
         }
-        std::erase_if(g_leftFrames, [&](auto& f) {
-            if (now < f.second) return false;
-            DeleteRef(f.first);
+        std::erase_if(g_leftFrames, [&](const LeftFrame& f) {
+            if (now < f.until) return false;
+            DeleteRef(f.frame);
             return true;
         });
     }
@@ -501,7 +540,7 @@ namespace F4MP::Activity
         for (auto& [pid, bf] : g_bodyFrame)
             if (bf.frame) DeleteRef(bf.frame);
         g_bodyFrame.clear();
-        for (auto& [fid, at] : g_leftFrames) DeleteRef(fid);
+        for (auto& f : g_leftFrames) DeleteRef(f.frame);
         g_leftFrames.clear();
     }
 }

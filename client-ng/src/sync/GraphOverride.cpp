@@ -37,6 +37,7 @@ namespace F4MP::GraphOverride
             std::atomic<int> wantDrawn{ -1 };      // its player's weapon: 1 out, 0 away, -1 unknown
             std::atomic<long long> wantHoldUntil{ 0 };   // a draw/shot event set wantDrawn ahead of the position stream
             std::atomic<long long> swapUntil{ 0 }; // ms clock: our own equip change may holster/draw
+            std::atomic<long long> lastResyncMs{ 0 };   // when the sync last took a resync
         };
 
         long long NowMs()
@@ -186,7 +187,7 @@ namespace F4MP::GraphOverride
                 holder->SetGraphVariableFloat(kSpeedSmoothed, speed);
                 holder->SetGraphVariableFloat(kDirection, 0.0f);   // it walks the way it faces
                 // The engine sets the walk to a quarter of its speed on an actor whose AI does nothing (testing: a mirrored
-                // Preston had WalkSpeedMult 0.25, a body 1.0): the slow-motion NPCs seen at the Diner.
+                // Preston had WalkSpeedMult 0.25, a body 1.0): the slow-motion NPCs, the Diner.
                 static const RE::BSFixedString kWalkMult{ "WalkSpeedMult" };
                 static const RE::BSFixedString kRunMult{ "RunSpeedMult" };
                 holder->SetGraphVariableFloat(kWalkMult, 1.0f);
@@ -380,7 +381,8 @@ namespace F4MP::GraphOverride
         // Aiming down sights swaps the locomotion subgraph: a moving body kept its position but lost the walk
         // and glided until the footstep watchdog (1.5 s) noticed (39% of aimed movement had
         // no footsteps, 13% otherwise). An equip/unequip "fixed" it because those resync; aiming does too now.
-        if (ok && a_event && _strnicmp(a_event, "rifleSighted", 12) == 0)
+        // A draw or holster we replay ourselves cuts the walk the same way.
+        if (ok && a_event && (_strnicmp(a_event, "rifleSighted", 12) == 0 || _stricmp(a_event, "WeapEquip") == 0 || _stricmp(a_event, "Unequip") == 0))
             if (Slot* s = SlotOf(HolderOf(a_body))) s->resync.store(true, std::memory_order_release);
         return ok;
     }
@@ -410,7 +412,13 @@ namespace F4MP::GraphOverride
     bool TakeResync(RE::Actor* a_body)
     {
         Slot* slot = SlotOf(HolderOf(a_body));
-        return slot && slot->resync.exchange(false, std::memory_order_acq_rel);
+        if (!slot || !slot->resync.load(std::memory_order_acquire)) return false;
+        // Not every frame (the engine sent a body Unequip 60 times a second, and each one restarted
+        // its walk, so the legs never played). The flag stays set: the last one of a burst still gets its resync.
+        const long long now = NowMs();
+        if (now - slot->lastResyncMs.load(std::memory_order_relaxed) < 300) return false;
+        slot->lastResyncMs.store(now, std::memory_order_relaxed);
+        return slot->resync.exchange(false, std::memory_order_acq_rel);
     }
 
     void Install(RE::Actor* a_anyBody)

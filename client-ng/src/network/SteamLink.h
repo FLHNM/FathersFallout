@@ -45,6 +45,11 @@ namespace Network::SteamLink
     // 0 none, 1 connecting, 2 finding route, 3 connected, 4 closed by peer, 5 problem (k_ESteamNetworkingConnectionState_*)
     int  State(HSteamNetConnection a_conn, std::string& a_endDebug);
     void Close(HSteamNetConnection a_conn);
+    // A friend clicked Join Game on our host in their Steam friends list, accepted our Steam invite, or Steam started
+    // this game for one: the host's SteamID64 once, else 0. Any thread.
+    uint64_t TakeJoinRequest();
+    // Friends list line while we play in someone's session ("" clears it).
+    void SetGuestPresence(const std::string& a_hostName);
     void RunCallbacks();
 
     // [Debug] SteamSelfTest=1: connect to our own hosting through Steam and log the server's answer.

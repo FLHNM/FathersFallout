@@ -36,6 +36,7 @@ namespace F4MP::Coop
         bool combatAnims = true; // show other players' shots, swings, aiming and reloads
         bool building = true;    // settlement building, doors and switches
         bool friendlyFire = true; // other players' hits hurt me ([Sync] FriendlyFire in FathersFallout.ini)
+        bool realTimeVats = true; // VATS doesn't slow time while playing together, like Fallout 76 ([Sync] RealTimeVATS)
         bool hitTrace = false;   // [Debug] BodyTrace: log every hit by/on a player, dump the appearance we send
     };
 

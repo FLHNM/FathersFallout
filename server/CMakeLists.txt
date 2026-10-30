@@ -20,8 +20,14 @@ add_definitions(-DBUILD_TIME="${BUILD_TIME}")
 add_executable(FathersFalloutServer
     src/main.cpp
     src/Network/GameServer.cpp
+    src/Wars/ALife.cpp
+    src/Wars/ALifeChatter.cpp
+    src/Wars/ALifeCamps.cpp
+    src/Wars/Teams.cpp
     src/Heartbeat.cpp
 )
+target_include_directories(FathersFalloutServer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 
 if (WIN32)
     # ====================== Windows ======================

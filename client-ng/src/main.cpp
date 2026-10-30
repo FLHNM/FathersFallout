@@ -6,6 +6,7 @@
 #include "F4SEMenuFramework.h"
 #include "network/NetworkClient.h"
 #include "network/SteamLink.h"
+#include "sync/WorldPause.h"
 #include "sync/CoopSync.h"
 #include "sync/FrameLimiter.h"
 #include "sync/CrashLog.h"
@@ -22,6 +23,10 @@
 #include "sync/AimHook.h"
 #include "sync/PlayerEvents.h"
 #include "sync/Explosions.h"
+#include "sync/Wars.h"
+#include "sync/WarsVoice.h"
+#include "sync/WarsTeams.h"
+#include "sync/WarsDeath.h"
 
 #include <thread>
 #include <sstream>
@@ -62,6 +67,7 @@ namespace F4MP
     static int  g_serverPort = 7779;
     static char g_playerName[64] = "Wastelander";
     static std::atomic<bool> g_netThreadStarted{ false };
+    static std::atomic<bool> g_forceReEquip{ false };   // test: "f4mp:reequip", the next body acts as if its walk stayed stuck
 
     // HOST: broadcasts the state of nearby NPCs. Others receive it and drive their local
     // NPCs (by FormID) to the host's state.
@@ -97,19 +103,52 @@ namespace F4MP
 
     // Main-thread tasks the network thread schedules: at most one of each kind waiting. During a
     // loading screen the game runs no tasks, and thousands piled up and ran at once afterwards.
+    // Each kind's main-thread time is measured: a line every minute says what co-op costs per frame
+    // (average and worst run), so a hitch in a busy place can be pinned on one part.
     struct TaskGate {
+        const char* name;
         std::atomic<bool> pending{ false };
+        uint32_t runs = 0;
+        double totalMs = 0.0, worstMs = 0.0;
+        explicit TaskGate(const char* a_name) : name(a_name) {}
         template <class F>
         void Queue(F&& fn)
         {
             if (pending.exchange(true)) return;
             F4SE::GetTaskInterface()->AddTask([this, f = std::forward<F>(fn)]() mutable {
                 pending = false;
+                LARGE_INTEGER t0, t1, freq;
+                QueryPerformanceCounter(&t0);
                 f();
+                QueryPerformanceCounter(&t1);
+                QueryPerformanceFrequency(&freq);
+                const double ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+                ++runs;
+                totalMs += ms;
+                worstMs = (std::max)(worstMs, ms);
+                ReportTaskCosts();
             });
         }
+        static void ReportTaskCosts();
     };
-    static TaskGate g_gateBodies, g_gateCoop, g_gateNpcSend, g_gateNpcSync, g_gateProbe;
+    static TaskGate g_gateBodies{ "bodies" }, g_gateCoop{ "coop" }, g_gateNpcSend{ "npc-send" }, g_gateNpcSync{ "npc-sync" },
+        g_gateProbe{ "probe" };
+
+    void TaskGate::ReportTaskCosts()
+    {
+        static auto s_next = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < s_next) return;
+        s_next = now + std::chrono::seconds(60);
+        std::string line;
+        for (auto* g : { &g_gateBodies, &g_gateCoop, &g_gateNpcSend, &g_gateNpcSync, &g_gateProbe }) {
+            if (!g->runs) continue;
+            line += std::format(" | {} {}x avg {:.2f} ms worst {:.1f}", g->name, g->runs, g->totalMs / g->runs, g->worstMs);
+            g->runs = 0;
+            g->totalMs = g->worstMs = 0.0;
+        }
+        if (!line.empty()) REX::INFO("[Perf] last minute, main thread:{}", line);
+    }
 
     static void BodiesSync();       // defined further down
     static void MaybeTravelOnJoin();
@@ -227,6 +266,7 @@ namespace F4MP
         return _strnicmp(a, "steam", 5) == 0 && (a[5] == '\0' || a[5] == ':');
     }
     static bool g_steamHosting = true;   // [Connect] Steam=0 turns hosting through Steam off
+    static void StartSteamJoin(uint64_t a_host);   // Join Game from the Steam friends list (below)
 
     static bool IsProcessRunning(const wchar_t* a_exeName)
     {
@@ -244,7 +284,11 @@ namespace F4MP
     // writes config.json and exits, so a quick exit gets one more launch.
     static bool LaunchServer()
     {
-        if (g_serverExe.empty() || IsProcessRunning(L"FathersFalloutServer.exe") || IsProcessRunning(L"F4MPServer.exe")) return false;
+        // Wasteland Wars has its own server program (FathersFalloutWarsServer.exe, own port): the campaign's running
+        // server is never taken for it, nor the other way round.
+        if (g_serverExe.empty()) return false;
+        if (Wars::Mode() ? IsProcessRunning(L"FathersFalloutWarsServer.exe")
+                         : IsProcessRunning(L"FathersFalloutServer.exe") || IsProcessRunning(L"F4MPServer.exe")) return false;
         if (GetFileAttributesA(g_serverExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
             Notify("FathersFallout: ServerExe not found: " + g_serverExe);
             return false;
@@ -551,6 +595,7 @@ namespace F4MP
         F4SE::GetTaskInterface()->AddTask([lines]() {
             for (auto& cmd : lines) {
                 REX::INFO("[Bridge] > {}", cmd);
+                if (cmd == "f4mp:reequip") { g_forceReEquip = true; continue; }
                 // Test helper: "f4mp:freezebody <seconds>" lets the animation move bodies alone.
                 if (cmd.rfind("f4mp:freezebody ", 0) == 0) {
                     g_freezeUntil = std::chrono::steady_clock::now() +
@@ -605,7 +650,7 @@ namespace F4MP
                     REX::INFO("[Bridge]   drawn {} state {} equipped:{}", a->GetWeaponMagicDrawn(), static_cast<int>(a->weaponState) & 7, eq);
                     continue;
                 }
-                // Test helper: "f4mp:state <hex>" logs an actor's health and fight (Preston turning on the host).
+                // Test helper: "f4mp:state <hex>" logs an actor's health and fight (Preston turning on the host, U24).
                 if (cmd.rfind("f4mp:state ", 0) == 0) {
                     auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 11, nullptr, 16));
                     auto* a = f ? f->As<RE::Actor>() : nullptr;
@@ -674,6 +719,11 @@ namespace F4MP
                 // Test helper: "f4mp:synctime" = the menu's "Sync time with host".
                 if (cmd == "f4mp:synctime") {
                     REX::INFO("[Bridge] sync time with host -> {}", Coop::SyncTimeWithHost());
+                    continue;
+                }
+                // testing: "f4mp:steamjoin <SteamID64>" = a Join Game click in the Steam friends list on that host.
+                if (cmd.rfind("f4mp:steamjoin ", 0) == 0) {
+                    StartSteamJoin(std::strtoull(cmd.c_str() + 15, nullptr, 10));
                     continue;
                 }
                 // Test helper: "f4mp:clock" logs the calendar (the hour and the days-passed counters).
@@ -949,6 +999,11 @@ namespace F4MP
                     }
                     continue;
                 }
+                // Wasteland Wars test helpers: "f4mp:wars <what>".
+                if (cmd.rfind("f4mp:wars", 0) == 0) {
+                    Wars::Bridge(cmd.substr(9));
+                    continue;
+                }
                 // Test helper: "f4mp:nearfurn" logs the nearest furniture references.
                 if (cmd == "f4mp:nearfurn") {
                     auto* pl = RE::PlayerCharacter::GetSingleton();
@@ -1047,8 +1102,25 @@ namespace F4MP
 
     // The co-op launcher's PLAY: FathersFallout.ini [Launch] LoadSave=<save name> loads that save as soon as
     // the main menu is up, once (the key is cleared first, so a normal launch isn't affected).
+    static void AutoConnectFromIni();
+
     static void LoadSaveFromLauncher()
     {
+        // Wasteland Wars, NEW WAR: a fresh world at the main menu instead of a save.
+        if (Wars::TakeNewWar()) {
+            std::thread([]() {
+                using namespace std::chrono;
+                const auto until = steady_clock::now() + minutes(3);
+                while (steady_clock::now() < until) {
+                    auto* ui = RE::UI::GetSingleton();
+                    if (ui && ui->GetMenuOpen("MainMenu") && !ui->GetMenuOpen("LoadingMenu")) break;
+                    std::this_thread::sleep_for(milliseconds(250));
+                }
+                std::this_thread::sleep_for(milliseconds(1500));
+                Wars::StartNewWar([]() { F4SE::GetTaskInterface()->AddTask([]() { AutoConnectFromIni(); }); });
+            }).detach();
+            return;
+        }
         char save[260]{};
         GetPrivateProfileStringA("Launch", "LoadSave", "", save, sizeof(save), IniPath().c_str());
         if (!save[0]) return;
@@ -1072,6 +1144,45 @@ namespace F4MP
     }
 
     // ---- Network thread: handles messages, sends our position, syncs bodies ----
+    // A Steam friend's Join Game (friends list), an accepted Steam invite, or Steam starting this game for one:
+    // join that host. From the main menu the join waits for a save to load (co-op runs inside a loaded game).
+    static uint64_t g_pendingSteamJoin = 0;
+
+    static void StartSteamJoin(uint64_t a_host)
+    {
+        auto& net = Network::NetworkClient::GetInstance();
+        std::string name, err;
+        Network::SteamLink::FindHost(std::to_string(a_host), name, err);
+        if (net.IsConnected() || net.IsConnecting()) {
+            if (net.IsConnected() && !g_isHost && net.GetTarget().find(name) != std::string::npos) return;   // there already
+            Notify("FathersFallout: you're in a co-op session already - disconnect (F1) to join " + name);
+            return;
+        }
+        g_isHost = false;
+        std::snprintf(g_serverAddr, sizeof(g_serverAddr), "steam:%llu", static_cast<unsigned long long>(a_host));
+        auto* ui = RE::UI::GetSingleton();
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        if ((ui && ui->GetMenuOpen("MainMenu")) || !pl || !pl->parentCell) {
+            g_pendingSteamJoin = a_host;
+            Notify("FathersFallout: load your save (Continue) to join " + name);
+            REX::INFO("[Steam] join {} waits for a save to load", name);
+            return;
+        }
+        g_pendingSteamJoin = 0;
+        if (RefreshInIntro()) { NotifyIntro(); return; }
+        // A Wars save in the campaign or a campaign save in Wars mode never connects (as on load).
+        if (Wars::Mode() != Wars::WorldIsWars()) { Wars::OnGameLoaded(); return; }
+        {   // our name and the session password as the launcher saved them (auto-connect may be off)
+            const std::string ini = IniPath();
+            GetPrivateProfileStringA(Wars::ConnectSection(), "Name", g_playerName, g_playerName, sizeof(g_playerName), ini.c_str());
+            GetPrivateProfileStringA(Wars::ConnectSection(), "Password", g_password, g_password, sizeof(g_password), ini.c_str());
+        }
+        Network::SteamLink::SetGuestPresence(name);
+        Notify("FathersFallout: joining " + name + " through Steam...");
+        REX::INFO("[Steam] joining {} ({}) from Steam", name, a_host);
+        ConnectNow(5);
+    }
+
     static void NetThread()
     {
         using namespace std::chrono;
@@ -1083,6 +1194,8 @@ namespace F4MP
             net.PumpMessages();
             WatchConnection();
             MaybeTravelOnJoin();
+            if (const uint64_t host = Network::SteamLink::TakeJoinRequest())
+                F4SE::GetTaskInterface()->AddTask([host]() { StartSteamJoin(host); });
 
             static auto s_lastBridge = steady_clock::now();
             if (duration_cast<milliseconds>(steady_clock::now() - s_lastBridge).count() >= 500) {
@@ -1182,6 +1295,7 @@ namespace F4MP
                         msg.isJumping = ls.jumping;              // in the air / jumping
                         msg.weaponDrawn = ls.weaponDrawn;  // weapon out?
                         if (ls.lightOn) msg.extraFlags |= Network::kPosLightOn | (ls.lightColor << Network::kPosLightColorShift);   // Pip-Boy light / headlamp
+                        if (WorldPause::LocalPaused()) msg.extraFlags |= Network::kPosPaused;
                         msg.cellId = Authority::LocalSpaceAtomic();   // interior cell / worldspace
                         lastSend = now;
                         net.SendPacket(Network::MessageType::PlayerPosition, &msg, sizeof(msg));
@@ -1193,6 +1307,8 @@ namespace F4MP
                         lastSend = now;
                         s_lastMsg.speed = 0.0f;
                         s_lastMsg.isMoving = false;
+                        if (WorldPause::LocalPaused()) s_lastMsg.extraFlags |= Network::kPosPaused;
+                        else s_lastMsg.extraFlags &= ~Network::kPosPaused;
                         net.SendPacket(Network::MessageType::PlayerPosition, &s_lastMsg, sizeof(s_lastMsg));
                     }
                 }
@@ -1238,8 +1354,10 @@ namespace F4MP
                     g_gateNpcSync.Queue([]() { NpcsSync(); });
                 }
             } else {
-                if (s_sentAppearance)  // just dropped: forget co-op session state
+                if (s_sentAppearance) {  // just dropped: forget co-op session state
                     F4SE::GetTaskInterface()->AddTask([]() { Coop::OnDisconnected(); });
+                    if (!g_isHost) Network::SteamLink::SetGuestPresence("");
+                }
                 s_sentAppearance = false;  // send the appearance again after reconnecting
             }
 
@@ -1327,7 +1445,9 @@ namespace F4MP
                            RE::NiPoint3 lastPos{}; std::chrono::steady_clock::time_point lastPosAt{}; bool havePos = false;
                            // Footstep watchdog (StepWatch): the walk/run must really play while the body moves.
                            bool prevMoving = false; long long movingSinceMs = 0, stillSinceMs = 0, lastKickMs = 0;
-                           long long lastStep = 0, stillStepsFrom = 0, quickUntilMs = 0; int stillSteps = 0; int idleKicks = 0; };
+                           long long lastStep = 0, stillStepsFrom = 0, quickUntilMs = 0; int stillSteps = 0; int idleKicks = 0;
+                           RE::NiAVObject* lastRoot = nullptr; long long fadeFreeAtMs = 0;   // its 3D, when a fade counts as stuck
+                           std::chrono::steady_clock::time_point reEquipUntil{}; };   // putting the weapon away on purpose until then
     static std::unordered_map<uint32_t, BodyAnimState> g_animState;
     static bool g_lastOkSpeed = false, g_lastOkDir = false;       // retorno de SetGraphVariable (debug)
     static bool g_graphDumped = false;                            // graph variables dumped already?
@@ -1713,7 +1833,7 @@ namespace F4MP
         const char* first = sneaking ? "moveStartAnimated" : "moveStart";
         const char* second = sneaking ? "moveStart" : "moveStartAnimated";
         if (GraphOverride::SendEvent(actor, first) || GraphOverride::SendEvent(actor, second)) return true;
-        // Weapon out the stance has its own starts. After the
+        // Weapon out the stance has its own starts. after the
         // footstep watchdog restarted the walk of a body with its gun out, moveStart was refused for seconds
         // at a time and the body slid along on still feet.
         return !sneaking && actor->GetWeaponMagicDrawn() &&
@@ -1736,11 +1856,12 @@ namespace F4MP
     // glided along with still feet, or kept walking on the spot, until its player jumped, crouched or drew:
     // the "press a button to resync" reports. The graph's own footsteps say what really plays.
     // 1 = moving for 1.5 s without a footstep (send the walk/run again), 2 = steps keep coming while its
-    // player/owner stands (stop it), 0 = fine or nothing to judge by (no footsteps from this graph yet).
+    // player/owner stands (stop it), 3 = two restarts brought no footstep (a_escalate only: what the player's
+    // own re-equip does, see the caller), 0 = fine or nothing to judge by (no footsteps from this graph yet).
     // standing: what the sender says (its speed), not our measurement: a body put back on its spot read as
     // moving for a moment every time, and that kept resetting the count.
     template <class S>
-    static int StepWatch(RE::Actor* actor, S& st, bool moving, float speed, bool skip, bool standing, long long patience = 1500)
+    static int StepWatch(RE::Actor* actor, S& st, bool moving, float speed, bool skip, bool standing, long long patience = 1500, bool a_escalate = false)
     {
         const long long now = NowMs();
         if (moving != st.prevMoving) {
@@ -1756,9 +1877,16 @@ namespace F4MP
         if (!step || skip || now - st.lastKickMs < (now < st.quickUntilMs ? 1000 : 3000)) return 0;
         if (newStep) st.idleKicks = 0;
         if (moving && !standing) {
+            const bool stepless = speed > 70.0f && now - st.movingSinceMs > wait && now - step > wait;
             // Some gaits never step: two kicks with no footstep after them = leave it be.
-            if (st.idleKicks >= 2) return 0;
-            if (speed > 70.0f && now - st.movingSinceMs > wait && now - step > wait) { st.lastKickMs = now; ++st.idleKicks; return 1; }
+            // Only a real step reset that, so a body whose restarts didn't take slid until its player re-equipped
+            //. A person's walk always steps: bodies go on to the stronger fix, every 8 s.
+            if (st.idleKicks >= 2) {
+                if (!a_escalate || !stepless || now - st.lastKickMs < 8000) return 0;
+                st.lastKickMs = now;
+                return 3;
+            }
+            if (stepless) { st.lastKickMs = now; ++st.idleKicks; return 1; }
             return 0;
         }
         // Turning on the spot steps too: only a steady stream (4 in 2.5 s, a walk steps every ~0.6 s) is walking in place.
@@ -2171,7 +2299,8 @@ namespace F4MP
             // (its player arrived with the gun out) was cut by the weapon's 3D rebuild and the body
             // stayed half-drawn for good, refusing every aim and shot.
             GraphOverride::SetWantDrawn(actor, rp.weaponDrawn);
-            if (!Coop::EquipmentSettled(pid, fid)) {
+            // A re-equip on purpose (StepWatch below): the holster has to finish, the checks here would undo it.
+            if (!Coop::EquipmentSettled(pid, fid) || clockNow < st.reEquipUntil) {
                 st.lastDrawCheck = clockNow;
             } else {
                 if (rp.weaponDrawn && st.drawReached && KeepDrawn(actor)) {
@@ -2184,7 +2313,11 @@ namespace F4MP
                 // something else changed it (0.5 s to correct). Not reached yet: the draw animation
                 // may still be playing, so 1.5 s. Re-asking every 0.5 s restarted the draw, and the
                 // guard below then reset the AI, which holstered it: hands stayed empty.
-                if (bodyPos == st.weaponDrawn) st.drawReached = true;
+                if (bodyPos == st.weaponDrawn) {
+                    // The draw or holster is over: it cut the walk, and the restart sent during it may not have taken.
+                    if (!st.drawReached) { st.moving = false; st.sprinting = false; }
+                    st.drawReached = true;
+                }
                 const float since = std::chrono::duration<float>(clockNow - st.lastDrawCheck).count();
                 const bool drifted = bodyPos != rp.weaponDrawn && since > (st.drawReached ? 0.5f : 1.5f);
                 const bool undone = drifted && st.drawReached;   // was right, then changed behind our back
@@ -2256,7 +2389,7 @@ namespace F4MP
                 // second restarted the crouch each time, and a crouching body glided along for good.
                 // Refused because it already walks: a landing (jumpLandToRun) or a sprint put the graph in its
                 // locomotion itself, and moveStart is only taken from standing. Fresh footsteps say so: count
-                // it as moving, so the gait events go out (seen refused for 6 s, sliding meanwhile).
+                // it as moving, so the gait events go out (refused for 6 s, sliding meanwhile).
                 if (wantMoving && !ok && st.moveRefused >= 4) {
                     const long long step = GraphOverride::LastStepMs(actor);
                     if (step && NowMs() - step < 700) {
@@ -2272,8 +2405,8 @@ namespace F4MP
                     const bool off = known && (inSneak != 0) != rp.isSneaking;
                     if (off) GraphOverride::SendEvent(actor, rp.isSneaking ? "sneakStart" : "sneakStop");
                     ok = StartMoving(actor, rp.isSneaking);
-                    // Still refused with no footsteps: the graph sits in a locomotion state that doesn't play
-                    // (refused for 4 s after the watchdog's restart). Stop it, then start from standing.
+                    // Still refused with no footsteps: the graph sits in a locomotion state that doesn't play (real
+                    // test U24: refused for 4 s after the watchdog's restart). Stop it, then start from standing.
                     if (!ok && GraphOverride::SendEvent(actor, "moveStop")) ok = StartMoving(actor, rp.isSneaking);
                     static int s_logged = 0;
                     if (s_logged++ < 30)
@@ -2357,15 +2490,52 @@ namespace F4MP
                 st.jumping = rp.isJumping;
             }
 
+            // A body is on screen or it isn't: a fade over a body already seen is undone the same frame (
+            // ~every 3 minutes, 0.00-0.43; the slower check in CoopSync let it blink first). New 3D on a body we
+            // already showed doesn't fade in again at all. A brand-new body keeps its 1.2 s.
+            if (auto* root3D = actor->Get3D()) {
+                const long long nowMs = NowMs();
+                const bool newRoot = root3D != st.lastRoot;
+                if (newRoot) { st.fadeFreeAtMs = st.lastRoot ? nowMs : nowMs + 1200; st.lastRoot = root3D; }
+                if (auto* fade3D = root3D->IsFadeNode(); fade3D && fade3D->currentFade < 1.0f && nowMs >= st.fadeFreeAtMs) {
+                    static int s_logged = 0;
+                    if (fade3D->currentFade < 0.5f && s_logged++ < 40)
+                        REX::INFO("[Body] player {}: fade {:.2f} undone (new 3D {}, {:.0f} u/s)", pid, fade3D->currentFade, newRoot, st.smoothSpeed);
+                    fade3D->currentFade = 1.0f;
+                }
+            }
+
             // Not while crouched: the sneak walk/run clips have no footstep events.
             const bool senderStands = clockNow - st.lastRxMoveAt > std::chrono::milliseconds(800);
-            switch (StepWatch(actor, st, st.moving, st.smoothSpeed, rp.isJumping || rp.isSneaking || Activity::BodyInPowerArmor(pid), senderStands)) {
+            bool swimming = false;
+            const bool bodySwims = actor->GetGraphVariableImplBool("bIsSwimming", swimming) && swimming;
+            int stepVerdict = StepWatch(actor, st, st.moving, st.smoothSpeed, rp.isJumping || rp.isSneaking || Activity::BodyInPowerArmor(pid) || bodySwims, senderStands, 1500, true);
+            if (g_forceReEquip.exchange(false)) stepVerdict = 3;
+            switch (stepVerdict) {
             case 1: {
                 static int s_logged = 0;
-                if (s_logged++ < 40) REX::INFO("[StepWatch] body of player {}: moving ({:.0f}) but no footsteps for 1.5 s - walk/run sent again", pid, st.smoothSpeed);
+                if (s_logged++ < 120) REX::INFO("[StepWatch] body of player {}: moving ({:.0f}) but no footsteps for 1.5 s - walk/run sent again", pid, st.smoothSpeed);
                 st.moving = false;      // resent below next tick, gait and sprint after it
                 st.sprinting = false;
                 st.gait = 0;
+                break;
+            }
+            case 3: {
+                // Restarting the walk did nothing: the graph's weapon stance is stuck under it (a
+                // body sliding with its gun out until its player re-equipped). The same again, by itself: from
+                // standing, and with the gun out the weapon goes away, and the draw check puts it back 0.5 s later.
+                GraphOverride::SendEvent(actor, "moveStop");
+                st.moving = false;
+                st.sprinting = false;
+                st.gait = 0;
+                const bool redraw = rp.weaponDrawn && st.drawReached;
+                if (redraw) {
+                    GraphOverride::AllowWeaponSwap(actor);
+                    actor->DrawWeaponMagicHands(false);
+                    st.reEquipUntil = clockNow + std::chrono::milliseconds(900);
+                }
+                static int s_logged = 0;
+                if (s_logged++ < 60) REX::INFO("[StepWatch] body of player {}: two restarts brought no footsteps - from standing{}", pid, redraw ? ", weapon away and out again" : "");
                 break;
             }
             case 2: {
@@ -2477,6 +2647,12 @@ namespace F4MP
         }
         for (auto& [pid, pos] : remotes) {
             if (g_bodies.find(pid) == g_bodies.end() && IsNearLocalPlayer(pos, Range::BodySpawn())) {
+                // Their look comes a moment after they do: a neutral body placed first was torn down and rebuilt
+                // two seconds later. Wait for it, 6 s at most.
+                static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_firstWanted;
+                const auto wanted = s_firstWanted.try_emplace(pid, std::chrono::steady_clock::now()).first->second;
+                if (!Appearance::GetBodyBase(pid) && std::chrono::steady_clock::now() - wanted < std::chrono::seconds(6)) continue;
+                s_firstWanted.erase(pid);
                 ++g_spawnCount;
                 g_recentSpawns.push_back(std::chrono::steady_clock::now());
                 if (g_recentSpawns.size() == 15) REX::WARN("[FathersFallout] 15 body spawns in 5 minutes: pausing body spawns for a while");
@@ -2662,7 +2838,7 @@ namespace F4MP
         auto& last = g_lastPull[actor->GetFormID()];
         if (now - last < std::chrono::seconds(10)) return;
         last = now;
-        // A few NPCs (bodies the host had dragged) never got their 3D here and were moved
+        // a few NPCs (bodies the host had dragged) never got their 3D here and were moved
         // again every 10 s for the whole session, sliding and floating on the guest's screen.
         int& tries = g_pullTries[actor->GetFormID()];
         if (tries >= 3) return;
@@ -2803,7 +2979,7 @@ namespace F4MP
             }
             g_drivenOwner[local] = owner;
             // Its own AI must never fight: it went for a body or the player on sight (testing: a mirrored radroach
-            // bit a player's body nonstop; a copy shot the guest). The owner's attacks are replayed.
+            // bit a body nonstop; a copy shot the guest). The owner's attacks are replayed.
             if (actor->IsInCombat()) {
                 actor->StopCombat();
                 actor->InitiateDoNothingPackage();
@@ -2832,7 +3008,29 @@ namespace F4MP
             }
             if (!(g_mirrorOff & 1)) Coop::ApplyNpcVitals(actor, owner, fid, s.health, s.isDead);
             GraphOverride::SetMirror(local, !(g_mirrorOff & 4));
-            if (s.isDead || actor->IsDead(false)) continue;   // corpses ragdoll locally
+            static std::unordered_map<uint32_t, std::pair<std::chrono::steady_clock::time_point, int>> s_corpse;
+            if (!s.isDead && !actor->IsDead(false)) s_corpse.erase(local);   // alive (again): a later death starts over
+            if (s.isDead || actor->IsDead(false)) {   // corpses ragdoll locally...
+                // ...so each game's body fell somewhere else (down a slope, into the next room): the one you loot
+                // wasn't where the other player saw it. Once both have lain still a few seconds, ours goes to the
+                // owner's spot (twice at most: a corpse that can't rest there isn't pushed around).
+                const auto now = std::chrono::steady_clock::now();
+                if (s_corpse.size() > 512) s_corpse.clear();
+                auto [c, fresh] = s_corpse.try_emplace(local, now, 0);
+                if (!fresh && s.isDead && actor->IsDead(false) && c->second.second < 2 && s.speed < 5.0f &&
+                    now - c->second.first > std::chrono::seconds(5)) {
+                    const auto p = actor->GetPosition();
+                    const float dx = s.x - p.x, dy = s.y - p.y, dz = s.z - p.z;
+                    c->second.first = now;
+                    if (dx * dx + dy * dy + dz * dz > 200.0f * 200.0f) {
+                        ++c->second.second;
+                        actor->SetPosition(RE::NiPoint3{ s.x, s.y, s.z + 30.0f }, true);
+                        REX::INFO("[World] NPC {:#x}'s corpse lay {:.0f} u from where player {} sees it: moved there", local,
+                            std::sqrt(dx * dx + dy * dy + dz * dz), owner);
+                    }
+                }
+                continue;
+            }
             if (Activity::MirrorSeated(local)) continue;      // on its owner's seat: the furniture places and animates it
 
             // Drive position (smoothly interpolated) + heading, like player bodies. NPC states come ~10/s (bodies
@@ -3251,6 +3449,7 @@ namespace F4MP
         RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event,
             RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
         {
+            if (!a_event.opening && a_event.menuName == "LooksMenu") Appearance::MarkLookDirty();   // barber, surgeon, editor
             if (!a_event.opening && a_event.menuName == "LooksMenu" && g_creatingCharacter.exchange(false)) {
                 F4SE::GetTaskInterface()->AddTask([]() {
                     const auto file = Appearance::SaveCurrentAsCharacter(g_newCharacterName);
@@ -3271,12 +3470,12 @@ namespace F4MP
     static void SaveConnectIni(bool a_autoConnect)
     {
         const std::string ini = IniPath();
-        WritePrivateProfileStringA("Connect", "AutoConnect", a_autoConnect ? "1" : "0", ini.c_str());
-        WritePrivateProfileStringA("Connect", "Server", g_serverAddr, ini.c_str());
-        WritePrivateProfileStringA("Connect", "Port", std::to_string(g_serverPort).c_str(), ini.c_str());
-        WritePrivateProfileStringA("Connect", "Name", g_playerName, ini.c_str());
-        WritePrivateProfileStringA("Connect", "Host", g_isHost ? "1" : "0", ini.c_str());
-        WritePrivateProfileStringA("Connect", "Password", g_password, ini.c_str());
+        WritePrivateProfileStringA(Wars::ConnectSection(), "AutoConnect", a_autoConnect ? "1" : "0", ini.c_str());
+        WritePrivateProfileStringA(Wars::ConnectSection(), "Server", g_serverAddr, ini.c_str());
+        WritePrivateProfileStringA(Wars::ConnectSection(), "Port", std::to_string(g_serverPort).c_str(), ini.c_str());
+        WritePrivateProfileStringA(Wars::ConnectSection(), "Name", g_playerName, ini.c_str());
+        WritePrivateProfileStringA(Wars::ConnectSection(), "Host", g_isHost ? "1" : "0", ini.c_str());
+        WritePrivateProfileStringA(Wars::ConnectSection(), "Password", g_password, ini.c_str());
     }
 
     // Host without ServerExe set: look for the server in the usual places.
@@ -3293,7 +3492,7 @@ namespace F4MP
         for (auto& c : candidates) {
             if (GetFileAttributesA(c.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 g_serverExe = c;
-                WritePrivateProfileStringA("Connect", "ServerExe", c.c_str(), IniPath().c_str());
+                WritePrivateProfileStringA(Wars::ConnectSection(), "ServerExe", c.c_str(), IniPath().c_str());
                 return;
             }
         }
@@ -3374,7 +3573,7 @@ namespace F4MP
             ImGuiMCP::InputTextWithHint("Password", "only if the host set one", g_password, sizeof(g_password), ImGuiMCP::ImGuiInputTextFlags_Password);
             ImGuiMCP::Checkbox("Join automatically next time a save loads", &s_auto);
             if (ImGuiMCP::Checkbox("Travel to the host when I join", &g_travelOnJoin))
-                WritePrivateProfileStringA("Connect", "TravelOnJoin", g_travelOnJoin ? "1" : "0", IniPath().c_str());
+                WritePrivateProfileStringA(Wars::ConnectSection(), "TravelOnJoin", g_travelOnJoin ? "1" : "0", IniPath().c_str());
             ImGuiMCP::BeginDisabled(g_serverAddr[0] == '\0');
             if (ImGuiMCP::Button("Join")) {
                 g_isHost = false;
@@ -3405,11 +3604,11 @@ namespace F4MP
                 ImGuiMCP::TextDisabled("Starts the server for you: %s", g_serverExe.c_str());
             if (Network::SteamLink::Available()) {
                 if (ImGuiMCP::Checkbox("Let Steam friends join (no IP or port forwarding)", &g_steamHosting))
-                    WritePrivateProfileStringA("Connect", "Steam", g_steamHosting ? "1" : "0", IniPath().c_str());
+                    WritePrivateProfileStringA(Wars::ConnectSection(), "Steam", g_steamHosting ? "1" : "0", IniPath().c_str());
                 bool friendsOnly = Network::SteamLink::FriendsOnly();
                 if (ImGuiMCP::Checkbox("Steam: only people on my friends list", &friendsOnly)) {
                     Network::SteamLink::SetFriendsOnly(friendsOnly);
-                    WritePrivateProfileStringA("Connect", "SteamFriendsOnly", friendsOnly ? "1" : "0", IniPath().c_str());
+                    WritePrivateProfileStringA(Wars::ConnectSection(), "SteamFriendsOnly", friendsOnly ? "1" : "0", IniPath().c_str());
                 }
                 ImGuiMCP::TextDisabled("Your friend code: %llu  (%s)", Network::SteamLink::MySteamId() & 0xFFFFFFFFull, Network::SteamLink::MyName().c_str());
                 if (Network::SteamLink::IsHosting())
@@ -3478,7 +3677,8 @@ namespace F4MP
         ImGuiMCP::TextDisabled("FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb");
         RenderPlayTogether();
         RenderCharacters();
-        Voice::RenderMenu();
+        if (Wars::Mode()) Wars::Teams::RenderMenu();
+        if (Wars::Mode()) Wars::Voice::RenderMenu(); else Voice::RenderMenu();
 
         ImGuiMCP::SeparatorText("Sync");
         ImGuiMCP::Text("FPS: %.0f (capped at %d for sync)", FrameLimiter::GetMeasuredFps(), FrameLimiter::kTargetFps);
@@ -3495,6 +3695,7 @@ namespace F4MP
         ImGuiMCP::Checkbox("Time of day + weather (follow the host)", &cs.worldTime);
         ImGuiMCP::Checkbox("Show other players' attacks, aiming and reloads", &cs.combatAnims);
         ImGuiMCP::Checkbox("Friendly fire (other players' shots and swings can hurt me)", &cs.friendlyFire);
+        ImGuiMCP::Checkbox("Real-time VATS (targeting doesn't slow time, so the others aren't left waiting)", &cs.realTimeVats);
         if (Coop::IsLoadOrderMismatch())
             ImGuiMCP::TextColored(ImGuiMCP::ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
                 "LOAD ORDER DIFFERS FROM THE HOST - item/quest/NPC sync paused (see FathersFallout.log)");
@@ -3536,7 +3737,7 @@ namespace F4MP
     // ---- HUD: a floating tag over each remote player (world -> screen) ----
     static void __stdcall RenderHud()
     {
-        Voice::Frame();   // every frame: where I am for voice, can I talk now
+        if (Wars::Mode()) Wars::Voice::Frame(); else Voice::Frame();   // every frame: where I am for voice, can I talk now
         auto& net = Network::NetworkClient::GetInstance();
         if (!net.IsConnected()) return;
 
@@ -3547,7 +3748,7 @@ namespace F4MP
         // Not over a loading screen, the F1 menu
         // (tags were drawn over its text) or the game's full-screen menus.
         if (F4SEMenuFramework::IsAnyBlockingWindowOpened()) return;
-        Voice::RenderHud();
+        if (Wars::Mode()) Wars::Voice::RenderHud(); else Voice::RenderHud();
         if (auto* ui = RE::UI::GetSingleton()) {
             static constexpr const char* kCovering[] = { "LoadingMenu", "PipboyMenu", "PauseMenu", "MainMenu", "LooksMenu",
                 "ContainerMenu", "BarterMenu", "TerminalMenu", "LevelUpMenu", "SPECIALMenu", "CookingMenu", "ExamineMenu",
@@ -3621,8 +3822,11 @@ namespace F4MP
                 y = by - gap;
             }
             if (dead) name += "  (down)";
+            // Wasteland Wars: "[TAG] Name" in their crew's (or faction's) colour.
+            ImGuiMCP::ImU32 nameColour = kName;
+            if (std::string tag; Wars::Mode() && Wars::Teams::TagOf(id, tag, nameColour)) name = tag + name;
             y -= lineH;
-            shadowed(ax - textWidth(name.c_str()) * 0.5f, y, kName, name.c_str());
+            shadowed(ax - textWidth(name.c_str()) * 0.5f, y, nameColour, name.c_str());
         }
     }
 
@@ -3644,6 +3848,7 @@ namespace F4MP
         F4SEMenuFramework::SetSection("FathersFallout");
         F4SEMenuFramework::AddSectionItem("Menu", RenderMenu);
         F4SEMenuFramework::AddHudElement(RenderHud);
+        Wars::Teams::Init();   // Wasteland Wars: the choose-your-side window
         REX::INFO("[FathersFallout] menu + HUD registered");
     }
 
@@ -3665,23 +3870,24 @@ namespace F4MP
         if (!s_readOnce) {  // used by the menu's Conectar button too
             s_readOnce = true;
             char exe[MAX_PATH]{};
-            GetPrivateProfileStringA("Connect", "ServerExe", "", exe, sizeof(exe), ini);
+            GetPrivateProfileStringA(Wars::ConnectSection(), "ServerExe", "", exe, sizeof(exe), ini);
             g_serverExe = exe;
-            g_isHost = GetPrivateProfileIntA("Connect", "Host", 0, ini) != 0;
-            g_steamHosting = GetPrivateProfileIntA("Connect", "Steam", 1, ini) != 0;
-            GetPrivateProfileStringA("Connect", "Password", "", g_password, sizeof(g_password), ini);
-            Network::SteamLink::SetFriendsOnly(GetPrivateProfileIntA("Connect", "SteamFriendsOnly", 1, ini) != 0);
-            g_travelOnJoin = GetPrivateProfileIntA("Connect", "TravelOnJoin", 1, ini) != 0;
+            g_isHost = GetPrivateProfileIntA(Wars::ConnectSection(), "Host", 0, ini) != 0;
+            g_steamHosting = GetPrivateProfileIntA(Wars::ConnectSection(), "Steam", 1, ini) != 0;
+            GetPrivateProfileStringA(Wars::ConnectSection(), "Password", "", g_password, sizeof(g_password), ini);
+            Network::SteamLink::SetFriendsOnly(GetPrivateProfileIntA(Wars::ConnectSection(), "SteamFriendsOnly", 1, ini) != 0);
+            g_travelOnJoin = GetPrivateProfileIntA(Wars::ConnectSection(), "TravelOnJoin", 1, ini) != 0;
             Coop::GetSettings().friendlyFire = GetPrivateProfileIntA("Sync", "FriendlyFire", 1, ini) != 0;
+            Coop::GetSettings().realTimeVats = GetPrivateProfileIntA("Sync", "RealTimeVATS", 1, ini) != 0;
         }
-        if (!GetPrivateProfileIntA("Connect", "AutoConnect", 0, ini)) return;
+        if (!GetPrivateProfileIntA(Wars::ConnectSection(), "AutoConnect", 0, ini)) return;
         if (RefreshInIntro()) { NotifyIntro(); REX::INFO("[FathersFallout] auto-connect skipped: this save is in the pre-war intro"); return; }
         s_done = true;
 
-        GetPrivateProfileStringA("Connect", "Server", g_serverAddr, g_serverAddr, sizeof(g_serverAddr), ini);
-        GetPrivateProfileStringA("Connect", "Name", g_playerName, g_playerName, sizeof(g_playerName), ini);
-        g_serverPort = static_cast<int>(GetPrivateProfileIntA("Connect", "Port", g_serverPort, ini));
-        g_isHost = GetPrivateProfileIntA("Connect", "Host", 0, ini) != 0;
+        GetPrivateProfileStringA(Wars::ConnectSection(), "Server", g_serverAddr, g_serverAddr, sizeof(g_serverAddr), ini);
+        GetPrivateProfileStringA(Wars::ConnectSection(), "Name", g_playerName, g_playerName, sizeof(g_playerName), ini);
+        g_serverPort = static_cast<int>(GetPrivateProfileIntA(Wars::ConnectSection(), "Port", g_serverPort, ini));
+        g_isHost = GetPrivateProfileIntA(Wars::ConnectSection(), "Host", 0, ini) != 0;
 
         ConnectNow(5);  // ~1 min of attempts: covers starting the game before the server
         REX::INFO("[FathersFallout] auto-connect to {}:{} as '{}' ({})", g_serverAddr, g_serverPort, g_playerName,
@@ -3700,9 +3906,14 @@ namespace F4MP
         // would break it. New players join once they've left Vault 111 and saved.
         if (a_msg->type == F4SE::MessagingInterface::kPostLoadGame) {
             F4MP::CrashLog::Reassert();
+            F4MP::Appearance::MarkLookDirty();   // another character may be loaded
             F4MP::Workshop::OnGameLoaded();
             F4MP::Coop::OnGameLoaded();
-            AutoConnectFromIni();
+            // A campaign save in Wars mode, or a Wars save in the campaign: left alone, not connected.
+            if (F4MP::Wars::OnGameLoaded()) {
+                if (g_pendingSteamJoin) StartSteamJoin(g_pendingSteamJoin);   // Join Game clicked at the main menu
+                else AutoConnectFromIni();
+            }
         }
 
         if (a_msg->type == F4SE::MessagingInterface::kPostLoad ||
@@ -3724,11 +3935,15 @@ namespace F4MP
 
             if (!g_netThreadStarted.exchange(true)) {
                 Network::NetworkClient::GetInstance().Initialize();
+                if (const int lag = GetPrivateProfileIntA("Debug", "FakeLagMs", 0, IniPath().c_str()),
+                    loss = GetPrivateProfileIntA("Debug", "FakeLossPct", 0, IniPath().c_str()),
+                    jitter = GetPrivateProfileIntA("Debug", "FakeJitterMs", 0, IniPath().c_str()); lag || loss || jitter)
+                    Network::NetworkClient::GetInstance().SimulateBadNetwork(lag, static_cast<float>(loss), jitter);
                 // testing: [Debug] SteamLoopback=1 relays our own Steam account to a server on this PC, so this game
                 // can join it as a guest with Server=steam:<own friend code> (the guest's Steam path, one PC).
                 if (GetPrivateProfileIntA("Debug", "SteamLoopback", 0, IniPath().c_str()) != 0)
                     Network::SteamLink::StartHosting(Network::NetworkClient::GetInstance().Sockets(),
-                        static_cast<uint16_t>(GetPrivateProfileIntA("Connect", "Port", 7779, IniPath().c_str())), "loopback");
+                        static_cast<uint16_t>(GetPrivateProfileIntA(Wars::ConnectSection(), "Port", 7779, IniPath().c_str())), "loopback");
                 Coop::RegisterSinks();
                 // Bodies' shots leave the way their players aimed (turned before the bullet's ray is cast).
                 AimHook::Install();
@@ -3739,6 +3954,7 @@ namespace F4MP
                 PlayerEvents::SetLogAll(g_bodyTrace);
                 PlayerEvents::Install();
                 if (auto* ui = RE::UI::GetSingleton()) ui->RegisterSink<RE::MenuOpenCloseEvent>(&g_looksWatcher);
+                WorldPause::Install();
                 if (g_consoleBridge) REX::WARN("[FathersFallout] console bridge ON (debug/testing only)");
                 LoadSaveFromLauncher();
                 std::thread(NetThread).detach();
@@ -3755,7 +3971,10 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     REX::INFO("[FathersFallout] FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb (GPL v3 + NOTICE)");
     REX::INFO("[FathersFallout] plugin loaded (CommonLibF4)");
     F4MP::CrashLog::Install();
-    F4MP::Voice::Init(F4MP::IniPath());
+    F4MP::Wars::Init(F4MP::IniPath());   // Wasteland Wars only when the launcher asked for it, this launch only
+    if (F4MP::Wars::Mode()) F4MP::Wars::Voice::Init(F4MP::IniPath());   // Wars: nearby + radio voice
+    else F4MP::Voice::Init(F4MP::IniPath());                            // campaign: proximity voice
+    F4MP::Wars::Death::Install();                                        // Wars only: health stops at 1, Wars death
     F4MP::InstallFastTravelHook();
     F4MP::Activity::InstallHooks();
     F4MP::Coop::InstallHooks();

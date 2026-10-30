@@ -6,6 +6,7 @@
 #include "sync/Appearance.h"
 #include "sync/Paths.h"
 #include "sync/FaceDonors.h"
+#include "network/NetworkClient.h"
 
 #include <algorithm>
 #include <cctype>
@@ -433,8 +434,13 @@ namespace F4MP::Appearance
         return out;
     }
 
+    namespace { std::atomic<bool> g_lookDirty{ true }; }
+    void MarkLookDirty() { g_lookDirty = true; }
+    bool TakeLookDirty() { return g_lookDirty.exchange(false); }
+
     std::string SaveCurrentAsCharacter(const std::string& a_name)
     {
+        MarkLookDirty();
         auto blob = CaptureLocal();
         if (!a_name.empty() && blob.size() >= sizeof(Header)) {
             auto* h = reinterpret_cast<Header*>(blob.data());
@@ -457,6 +463,7 @@ namespace F4MP::Appearance
 
     bool SelectCharacter(const std::string& a_file)
     {
+        MarkLookDirty();
         const auto dir = CharactersDir();
         if (dir.empty()) return false;
         WriteSelected(dir, a_file);
@@ -466,6 +473,7 @@ namespace F4MP::Appearance
 
     bool DeleteCharacter(const std::string& a_file)
     {
+        MarkLookDirty();
         const auto dir = CharactersDir();
         std::error_code ec;
         if (dir.empty() || a_file.empty() || a_file.find_first_of("\\/") != std::string::npos) return false;
@@ -479,6 +487,23 @@ namespace F4MP::Appearance
         return !file.empty() && SelectCharacter(file);
     }
 
+    namespace
+    {
+        // The name on this look: a new war's character has none, and
+        // the game's default says nothing either. The name the player joined with then.
+        std::vector<uint8_t> Named(std::vector<uint8_t> a_blob)
+        {
+            if (a_blob.size() < sizeof(Header)) return a_blob;
+            const auto name = NameIn(a_blob);
+            if (!name.empty() && _stricmp(name.c_str(), "Player") != 0) return a_blob;
+            const auto& mine = Network::NetworkClient::GetInstance().GetPlayerName();
+            auto* h = reinterpret_cast<Header*>(a_blob.data());
+            std::memset(h->name, 0, sizeof(h->name));
+            std::memcpy(h->name, mine.data(), (std::min)(mine.size(), sizeof(h->name) - 1));
+            return a_blob;
+        }
+    }
+
     std::vector<uint8_t> LookToSend()
     {
         const auto dir = CharactersDir();
@@ -488,10 +513,10 @@ namespace F4MP::Appearance
             const auto sel = SelectedFile(dir);
             if (!sel.empty()) {
                 auto blob = ReadFile(dir / sel);
-                if (!blob.empty()) return blob;
+                if (!blob.empty()) return Named(std::move(blob));
             }
         }
-        return CaptureLocal();
+        return Named(CaptureLocal());
     }
 
     std::string MyLookName()
