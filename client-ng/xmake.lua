@@ -3,7 +3,7 @@ includes("lib/commonlibf4")
 
 set_project("FathersFallout")
 set_license("GPL-3.0")
-set_version("0.26.0")
+set_version("0.26.1")
 set_languages("c++23")
 set_warnings("allextra")
 
@@ -16,6 +16,18 @@ add_requires("gamenetworkingsockets")
 add_requires("libopus")
 
 target("F4MPClient")
+    -- CommonLibF4 declares the two IVirtualMachine::CreateObject overloads the wrong way round for MSVC, which
+    -- puts a later overload first in the vtable: the two-argument call landed on the game's three-argument
+    -- function (slot 0xB0), which then used a stale register as its result pointer. Script calls crashed on any
+    -- form with no bound script object yet, such as a dialogue topic. Swap them until upstream does.
+    on_load(function (target)
+        local header = path.join(os.projectdir(), "lib/commonlibf4/include/RE/B/BSScript_IVirtualMachine.h")
+        local text = io.readfile(header)
+        local fixed, n = text:gsub("([ \t]*virtual bool%s+CreateObject%(const BSFixedString& a_objectTypeName, const BSTScrapHashMap[^\n]*\n)"
+            .. "([ \t]*virtual bool%s+CreateObject%(const BSFixedString& a_objectTypeName, BSTSmartPointer[^\n]*\n)", "%2%1")
+        if n > 0 then io.writefile(header, fixed) end
+    end)
+
     add_packages("gamenetworkingsockets", "libopus")
     -- Esta regla genera automaticamente la version del plugin de F4SE
     -- (adios al "incompatible") y despliega el DLL al juego.
