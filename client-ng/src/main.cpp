@@ -3,6 +3,7 @@
 // GPL v3 with additional terms: see LICENSE and NOTICE.
 
 #include "pch.h"
+#include <functional>
 #include "F4SEMenuFramework.h"
 #include "network/NetworkClient.h"
 #include "network/SteamLink.h"
@@ -596,6 +597,8 @@ namespace F4MP
             for (auto& cmd : lines) {
                 REX::INFO("[Bridge] > {}", cmd);
                 if (cmd == "f4mp:reequip") { g_forceReEquip = true; continue; }
+                // f4mp:npchit <localfid>: as if our player just hit that copy (death report test)
+                if (cmd.rfind("f4mp:npchit ", 0) == 0) { Coop::MarkOurHit(static_cast<uint32_t>(std::stoul(cmd.substr(12), nullptr, 16))); continue; }
                 // Test helper: "f4mp:freezebody <seconds>" lets the animation move bodies alone.
                 if (cmd.rfind("f4mp:freezebody ", 0) == 0) {
                     g_freezeUntil = std::chrono::steady_clock::now() +
@@ -686,6 +689,68 @@ namespace F4MP
                 if (cmd.rfind("f4mp:npcai ", 0) == 0) {
                     g_npcAiMove = cmd[11] == '1';
                     REX::INFO("[Bridge] mirrored NPCs {}", g_npcAiMove ? "walked by their own AI" : "placed every frame");
+                    continue;
+                }
+                // Test helper: "f4mp:hud [path]": the HUD menu's display objects (names, depth 3) into the log.
+                if (cmd.rfind("f4mp:hud", 0) == 0) {
+                    auto* ui = RE::UI::GetSingleton();
+                    auto menu = ui ? ui->GetMenu("HUDMenu") : nullptr;
+                    if (menu && menu->menuObj.IsObject()) {
+                        std::function<void(const Scaleform::GFx::Value&, const std::string&, int)> dump =
+                            [&](const Scaleform::GFx::Value& v, const std::string& path, int depth) {
+                                v.VisitMembers([&](const char* name, const Scaleform::GFx::Value& m) {
+                                    const std::string p2 = path + "." + (name ? name : "?");
+                                    REX::INFO("[HUD] {} {}", p2, m.IsDisplayObject() ? "(display)" : m.IsObject() ? "(object)" : "");
+                                    if (depth < 3 && m.IsDisplayObject()) dump(m, p2, depth + 1);
+                                });
+                            };
+                        dump(menu->menuObj, "root", 0);
+                    } else REX::INFO("[HUD] no HUDMenu");
+                    continue;
+                }
+                // Test helper: "f4mp:qinfo <quest>...": current stage of each quest into the log.
+                if (cmd.rfind("f4mp:qinfo ", 0) == 0) {
+                    const char* p = cmd.c_str() + 11;
+                    char* end = nullptr;
+                    for (unsigned long id = std::strtoul(p, &end, 16); end != p; p = end, id = std::strtoul(p, &end, 16)) {
+                        auto* f = RE::TESForm::GetFormByID(static_cast<std::uint32_t>(id));
+                        auto* q = f ? f->As<RE::TESQuest>() : nullptr;
+                        REX::INFO("[Bridge] quest {:#x}: {}", id, q ? std::format("stage {}", q->currentStage) : std::string("not a quest"));
+                    }
+                    continue;
+                }
+                // Test helper: "f4mp:qdump <quest>": each stage object's first 0x20 bytes (looking for the index and done flag).
+                if (cmd.rfind("f4mp:qdump ", 0) == 0) {
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 11, nullptr, 16));
+                    auto* q = f ? f->As<RE::TESQuest>() : nullptr;
+                    if (q) {
+                        REX::INFO("[Bridge] qdump {:#x} current {} stages {}", q->GetFormID(), q->currentStage, q->stages.size());
+                        for (auto* st : q->stages) {
+                            if (!st) continue;
+                            const auto* b = reinterpret_cast<const std::uint8_t*>(st);
+                            std::string hex;
+                            for (int i = 0; i < 0x20; ++i) hex += std::format("{:02X}{}", b[i], (i % 8 == 7) ? " " : "");
+                            REX::INFO("[Bridge]   stage@{:p}: {}", static_cast<const void*>(st), hex);
+                        }
+                    }
+                    continue;
+                }
+                // Test helper: "f4mp:say <npc> <topic>": the NPC says that topic (ObjectReference.Say), as its own line.
+                if (cmd.rfind("f4mp:say ", 0) == 0) {
+                    char* end = nullptr;
+                    auto* f = RE::TESForm::GetFormByID(std::strtoul(cmd.c_str() + 9, &end, 16));
+                    auto* t = RE::TESForm::GetFormByID(std::strtoul(end, nullptr, 16));
+                    auto* a = f ? f->As<RE::Actor>() : nullptr;
+                    auto* topic = t ? t->As<RE::TESTopic>() : nullptr;
+                    auto* game = RE::GameVM::GetSingleton();
+                    auto vm = game ? game->GetVM() : nullptr;
+                    bool ok = false;
+                    if (a && topic && vm) {
+                        const auto h = vm->GetObjectHandlePolicy().GetHandleForObject(static_cast<std::uint32_t>(a->GetFormType()), a);
+                        ok = vm->DispatchMethodCall(h, "ObjectReference", "Say", nullptr, topic, static_cast<RE::Actor*>(nullptr), false,
+                            static_cast<RE::TESObjectREFR*>(nullptr));
+                    }
+                    REX::INFO("[Bridge] say {:#x} topic {:#x} -> {}", f ? f->GetFormID() : 0u, t ? t->GetFormID() : 0u, ok);
                     continue;
                 }
                 // Test helper: "f4mp:papyrus <hex> <Actor function>" calls a no-argument Actor script function.
@@ -2033,6 +2098,15 @@ namespace F4MP
 
         // 1. Move each body smoothly toward its player's position.
         std::vector<RE::Actor*> liveBodies;
+        {
+            // No "E) Talk" on any body, also one whose player hasn't sent a position yet.
+            std::vector<std::uint32_t> ids;
+            for (auto& [pid, fid] : g_bodies) {
+                ids.push_back(fid);
+                if (auto* a = RE::TESForm::GetFormByID(fid) ? RE::TESForm::GetFormByID(fid)->As<RE::Actor>() : nullptr) GraphOverride::InstallNoTalk(a);
+            }
+            GraphOverride::SetBodies(ids);
+        }
         for (auto& [pid, fid] : g_bodies) {
             auto it = remotes.find(pid);
             if (it == remotes.end()) continue;
@@ -2595,6 +2669,8 @@ namespace F4MP
                 } else if (actor && remotes.find(g_spawnFor) != remotes.end()) {
                     g_bodies[g_spawnFor] = actor->GetFormID();
                     g_bodyBase[g_spawnFor] = g_spawnBase;
+                    GraphOverride::AddBody(actor->GetFormID());   // no Talk prompt from the first frame
+                    GraphOverride::InstallNoTalk(actor);
                     // CALM the body's AI: it's an NPC and would otherwise wander off on its own. The "do nothing"
                     // package stops it moving by itself; it still animates when we move it.
                     actor->InitiateDoNothingPackage();

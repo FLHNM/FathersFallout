@@ -24,6 +24,7 @@ namespace F4MP
 // All functions run on the game's main thread (scheduled via the F4SE task interface).
 namespace F4MP::Coop
 {
+    void MarkOurHit(uint32_t localFormId);                  // test aid: as if we just hit this copy
     struct Settings
     {
         bool equipment = true;

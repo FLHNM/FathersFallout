@@ -1,6 +1,6 @@
 # Known issues & what's being worked on
 
-Update 26.1 Experimental (alpha). Already known - no need to report these unless you have new details.
+Update 27 (alpha). Already known - no need to report these unless you have new details.
 
 ## Known issues
 
@@ -15,9 +15,10 @@ Update 26.1 Experimental (alpha). Already known - no need to report these unless
 | Sliding | Since Update 21 a body whose walk stops playing restarts it by itself, usually within a second. A short slide can still happen now and then. |
 | Companions | Shared since Update 23: the other players see a copy of your companion. If the other player's world has that same NPC standing nearby (their Piper in Diamond City while your Piper follows you), you only see your own Piper there. |
 | Far-away NPCs | Guests with a lower view distance (`uGridsToLoad`) see fewer of the host's NPCs far away. Close by, everyone sees the same people. |
-| Quest catch-up | When a guest joins, their quests are moved up to the host's current stage of each quest, but one-time things from steps the guest skipped (items handed out, NPCs moved) don't happen in the guest's game. Gates and doors those steps opened do open for everyone since Update 22. Once you play together, every stage reaches everyone in order (Update 25). |
+| Quest catch-up | Since Update 27 a guest who joins catches up on every stage the host has done, in order (earlier versions only moved to the host's current stage and skipped what earlier steps did). Gates and doors match the host's since Update 22. Tested with a simulated second player, not yet across two PCs. |
 | New in Update 25 | Voice chat, power wires, settler jobs, guests' quest progress and quest buttons pressed by a guest have been tested with a simulated second player, not yet across two PCs. |
 | New in Update 26 | Join Game from the Steam friends list and NPC dialogue for the other players are new: please report anything odd. NPC dialogue works since Update 26.1 (26.0 could crash when NPCs talked), tested with a simulated second player, not yet across two PCs. A game Steam starts by itself has no F4SE, so start the game from the launcher first. |
+| New in Update 27 | Deaths from fire, poison and bleeding now match on every screen, essential characters can't be killed by another player's shots, NPC dialogue is shared with subtitles off too, and late joiners catch up on every quest stage. Tested with a simulated second player, not yet across two PCs. Talking to Piper at Diamond City's gate as the guest hasn't been tested yet. |
 | Wasteland Wars | Experimental. Survival mode, random starts and the latest squad changes have only been tested on one PC so far. Diamond City's gate stays shut and the town is empty. Your death bag is only in your own game, and what you build may not show for other players yet. Squads spread out when they spawn and set off, but still camp close together. The DLC islands aren't in it. |
 | Voice chat | Uses the Windows default microphone. If nobody hears you: F1 → Voice chat → **hear myself** and the mic meter, then your default recording device in Windows Sound settings. |
 | Random encounters | The small radiant quests that pop up on the road belong to the host's game; guests see the creatures and people, but not those quests in their log. |

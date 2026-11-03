@@ -337,9 +337,18 @@ namespace F4MP::GraphOverride
         GetActivateText_t g_origActivateText = nullptr;
         Activate_t g_origActivate = nullptr;
 
+        // Bodies by FormID too: a body just spawned (or rebuilt) has no movement slot until its first position
+        // update, and the "E) Talk" prompt showed on it in that gap.
+        std::mutex g_bodyIdLock;
+        std::vector<std::uint32_t> g_bodyIds;
+
         bool IsBodyRef(const RE::TESObjectREFR* a_ref)
         {
-            return a_ref && IsBody(static_cast<const Holder*>(a_ref));
+            if (!a_ref) return false;
+            if (IsBody(static_cast<const Holder*>(a_ref))) return true;
+            const auto fid = a_ref->GetFormID();
+            std::lock_guard l(g_bodyIdLock);
+            return std::find(g_bodyIds.begin(), g_bodyIds.end(), fid) != g_bodyIds.end();
         }
 
         bool ActivateTextHook(RE::TESBoundObject* a_self, RE::TESObjectREFR* a_ref, RE::BSString& a_out)
@@ -371,6 +380,18 @@ namespace F4MP::GraphOverride
         Patch(vtbl, kGetActivateTextSlot, reinterpret_cast<std::uintptr_t>(&ActivateTextHook), unused);
         Patch(vtbl, kActivateSlot, reinterpret_cast<std::uintptr_t>(&ActivateHook), unused);
         REX::INFO("[GraphOverride] bodies: no Talk prompt / activation (TESNPC vtable {:#x})", reinterpret_cast<std::uintptr_t>(vtbl));
+    }
+
+    void SetBodies(const std::vector<std::uint32_t>& a_ids)
+    {
+        std::lock_guard l(g_bodyIdLock);
+        g_bodyIds = a_ids;
+    }
+
+    void AddBody(std::uint32_t a_id)
+    {
+        std::lock_guard l(g_bodyIdLock);
+        if (std::find(g_bodyIds.begin(), g_bodyIds.end(), a_id) == g_bodyIds.end()) g_bodyIds.push_back(a_id);
     }
 
     bool SendEvent(RE::Actor* a_body, const char* a_event)

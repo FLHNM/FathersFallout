@@ -22,6 +22,9 @@ namespace F4MP::GraphOverride
 
     // No "E) Talk" prompt and no activation on bodies (hooks the TESNPC vtable, once).
     void InstallNoTalk(RE::Actor* a_anyBody);
+    // Every body's FormID, set each frame and at spawn: the no-Talk hooks know a body before its movement slot exists.
+    void SetBodies(const std::vector<std::uint32_t>& a_ids);
+    void AddBody(std::uint32_t a_id);
 
     // The graph manager's bound channels copy game values (movement speed, direction...) into
     // the graph every update, over anything we set. Unbind Speed/Direction on a body (once per

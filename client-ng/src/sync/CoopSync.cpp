@@ -475,6 +475,9 @@ namespace F4MP::Coop
         // Client: driven NPC (local FormID) -> its owner and its FormID in the owner's game.
         struct NpcOwner { uint32_t ownerId; uint32_t formId; Clock::time_point at; };
         std::unordered_map<uint32_t, NpcOwner> g_npcOwners;
+        // When our side last hit each copy (local FormID): its death here is ours to report (burning, see ApplyNpcVitals).
+        std::unordered_map<uint32_t, Clock::time_point> g_ourHitAt;
+        std::unordered_map<uint32_t, std::pair<Clock::time_point, int>> g_deathReported;   // local FormID -> last report, count
         // Keeps bodies alive and full: their player's health lives in their own game. The damage
         // itself is forwarded per hit by HitSink (measuring health drops counted physics bumps and,
         // whenever the body's maximum moved, the same "loss" again every tick).
@@ -545,7 +548,11 @@ namespace F4MP::Coop
                 // Some fades come back every frame (seen 10/s after a body rebuild): log the first few.
                 if (now - v.lastFadeLog > std::chrono::seconds(5)) {
                     v.lastFadeLog = now;
-                    REX::WARN("[Body] player {}: body stuck faded out ({:.2f}), forced visible", pid, fade->currentFade);
+                    auto* me = RE::PlayerCharacter::GetSingleton();
+                    auto* ui = RE::UI::GetSingleton();
+                    REX::WARN("[Body] player {}: body stuck faded out ({:.2f}), forced visible | {:.0f} units from us, menu {}, workshop {}", pid,
+                        fade->currentFade, me ? body->GetPosition().GetDistance(me->GetPosition()) : -1.0f, ui ? ui->menuMode : 0u,
+                        ui && ui->GetMenuOpen("WorkshopMenu"));
                 }
                 fade->currentFade = 1.0f;
             }
@@ -626,6 +633,14 @@ namespace F4MP::Coop
             }
         }
 
+        bool IsEssential(RE::Actor* a)
+        {
+            if (!a) return false;
+            if (a->boolFlags.any(RE::Actor::BOOL_FLAGS::kEssential)) return true;
+            auto* npc = a->GetNPC();
+            return npc && npc->IsEssential();
+        }
+
         void OnNpcDamage(const CoopNpcDamageMsg& m)
         {
             if (m.ownerId != Authority::MyId()) return;   // the NPC's owner applies hits
@@ -639,6 +654,15 @@ namespace F4MP::Coop
                 const float room = npc->GetActorValue(*hp) - 1.0f;
                 if (room > 0.0f) npc->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, -std::min(m.damage, room));
                 REX::INFO("[Coop] player {} hit our companion {:#x} for {:.1f}", m.senderId, m.npcFormId, m.damage);
+                return;
+            }
+            // An essential NPC (Preston, Codsworth, quest people) goes down, never dies, the same as from our own
+            // hits: a forwarded killing blow through KillImpl would get past "essential" and end its quests.
+            if (IsEssential(npc)) {
+                const float room = npc->GetActorValue(*hp) - 1.0f;
+                if (room > 0.0f) npc->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, -std::min(m.damage, room));
+                g_stats.applied++;
+                REX::INFO("[Coop] player {} hit our essential NPC {:#x} for {:.1f} (stops at 1 health)", m.senderId, m.npcFormId, m.damage);
                 return;
             }
             npc->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, -m.damage);
@@ -1099,10 +1123,78 @@ namespace F4MP::Coop
             return ok;
         }
 
+        // The game's own record of a quest's stages:
+        // each stage object has its number at +0x18 (uint16) and "done" in bit 0 of +0x1A. Checked once against the
+        // current stage of a few quests (it must read as done) before anything relies on it.
+        int g_stageLayout = -1;   // -1 unchecked, 0 doesn't match (old behaviour: current stage only), 1 ok
+
+        bool ReadStage(const RE::TESQuestStage* a_st, uint16_t& a_index, bool& a_done)
+        {
+            if (!a_st) return false;
+            const auto* b = reinterpret_cast<const std::uint8_t*>(a_st);
+            std::memcpy(&a_index, b + 0x18, sizeof(a_index));
+            a_done = (b[0x1A] & 1) != 0;
+            return true;
+        }
+
+        bool StageLayoutOk()
+        {
+            if (g_stageLayout >= 0) return g_stageLayout == 1;
+            auto* dh = RE::TESDataHandler::GetSingleton();
+            if (!dh) return false;
+            int checked = 0, good = 0;
+            for (auto* q : dh->GetFormArray<RE::TESQuest>()) {
+                if (!q || q->currentStage == 0 || q->stages.empty()) continue;
+                bool found = false;
+                for (auto* st : q->stages) {
+                    uint16_t idx = 0;
+                    bool done = false;
+                    if (ReadStage(st, idx, done) && idx == q->currentStage) { found = true; if (done) ++good; break; }
+                }
+                if (found && ++checked >= 20) break;
+            }
+            g_stageLayout = checked >= 5 && good * 10 >= checked * 9 ? 1 : (checked >= 5 ? 0 : -1);
+            if (g_stageLayout >= 0)
+                REX::INFO("[Coop] quest stage records: {} ({} of {} current stages read as done)", g_stageLayout ? "readable, earlier stages are caught up too"
+                    : "not readable on this game version, only current stages are caught up", good, checked);
+            return g_stageLayout == 1;
+        }
+
+        // Done in the game's own record.
+        bool GameStageDone(uint32_t a_quest, uint16_t a_stage)
+        {
+            if (!StageLayoutOk()) return false;
+            auto* q = LookupForm<RE::TESQuest>(a_quest);
+            if (!q) return false;
+            for (auto* st : q->stages) {
+                uint16_t idx = 0;
+                bool done = false;
+                if (ReadStage(st, idx, done) && idx == a_stage) return done;
+            }
+            return false;
+        }
+
+        // Done in this game: set by us, or by the game itself.
         bool StageDone(uint32_t a_quest, uint16_t a_stage)
         {
             auto it = g_stagesDone.find(a_quest);
-            return it != g_stagesDone.end() && it->second.count(a_stage);
+            if (it != g_stagesDone.end() && it->second.count(a_stage)) return true;
+            return GameStageDone(a_quest, a_stage);
+        }
+
+        // Every stage this game has done for a quest, lowest first (the order quests normally run in).
+        std::vector<uint16_t> DoneStages(RE::TESQuest* q)
+        {
+            std::vector<uint16_t> out;
+            if (!q || !StageLayoutOk()) return out;
+            for (auto* st : q->stages) {
+                uint16_t idx = 0;
+                bool done = false;
+                if (ReadStage(st, idx, done) && done && idx > 0) out.push_back(idx);
+            }
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+            return out;
         }
 
         bool IsTrackedQuest(RE::TESQuest* q)
@@ -1211,45 +1303,49 @@ namespace F4MP::Coop
                 if (now - it->at < std::chrono::seconds(2)) { ++it; continue; }
                 if (auto* q = LookupForm<RE::TESQuest>(it->quest)) {
                     g_questStages[it->quest] = q->currentStage;   // what the console left: no echo
-                    REX::INFO("[Coop] quest {:#x}: now at stage {} (wanted {}){}", it->quest, q->currentStage, it->stage,
-                        q->currentStage == it->stage ? "" : " - NOT applied");
+                    // An earlier stage of a catch-up is done, not current: the game's record says whether it ran.
+                    const bool took = q->currentStage == it->stage || GameStageDone(it->quest, it->stage);
+                    REX::INFO("[Coop] quest {:#x}: now at stage {} (wanted {}){}", it->quest, q->currentStage, it->stage, took ? "" : " - NOT applied");
                 }
                 it = g_pendingQuestCheck.erase(it);
             }
         }
 
-        void ApplyQuestStage(const CoopQuestStageMsg& m);
+        bool ApplyQuestStage(const CoopQuestStageMsg& m);
         // The join catch-up brings the host's stage for every quest at once (hundreds): applied a few per
         // tick so the console and quest scripts aren't flooded in one frame.
 
         void OnQuestStage(const CoopQuestStageMsg& m)
         {
-            if (m.isSnapshot) { if (g_questBacklog.size() < 4096) g_questBacklog.push_back(m); return; }
+            if (m.isSnapshot) { if (g_questBacklog.size() < 32768) g_questBacklog.push_back(m); return; }
             ApplyQuestStage(m);
         }
 
         void DrainQuestBacklog()
         {
-            for (int i = 0; i < 4 && !g_questBacklog.empty(); ++i) {
+            // Up to 4 stages really set per tick; the ones already done or behind cost nothing and don't count.
+            int applied = 0, looked = 0;
+            while (applied < 4 && looked < 256 && !g_questBacklog.empty()) {
                 const auto m = g_questBacklog.front();
                 g_questBacklog.pop_front();
-                ApplyQuestStage(m);
+                ++looked;
+                if (ApplyQuestStage(m)) ++applied;
             }
         }
 
-        void ApplyQuestStage(const CoopQuestStageMsg& m)
+        bool ApplyQuestStage(const CoopQuestStageMsg& m)
         {
             auto* q = LookupForm<RE::TESQuest>(m.questFormId);
-            if (!q) return;
+            if (!q) return false;
             if (!IsTrackedQuest(q)) {   // e.g. a random encounter from an older host
                 static int s_skipped = 0;
                 if (s_skipped++ < 20) REX::INFO("[Coop] quest {:#x} ({}) not synced: local only", m.questFormId, q->formEditorID.c_str());
-                return;
+                return false;
             }
             const bool host = IsHost();
-            if (m.isRequest && !host) return;   // only the host acts on requests
-            if (!m.isRequest && host) return;   // the host is the source of truth
-            if (q->currentStage == m.stage) return;
+            if (m.isRequest && !host) return false;   // only the host acts on requests
+            if (!m.isRequest && host) return false;   // the host is the source of truth
+            if (q->currentStage == m.stage) return false;
             // Done here already (this game set it, or its own fragments did after an earlier stage we applied):
             // setting it again re-runs its fragment. Behind this game's progress: not rewound either.
             if (StageDone(m.questFormId, m.stage) || m.stage < q->currentStage) {
@@ -1257,7 +1353,7 @@ namespace F4MP::Coop
                 if (s_skipped++ < 40)
                     REX::INFO("[Coop] quest {:#x} stage {} from player {}: already {} here (at {})", m.questFormId, m.stage, m.senderId,
                         StageDone(m.questFormId, m.stage) ? "done" : "past", q->currentStage);
-                return;
+                return false;
             }
 
             const uint16_t before = q->currentStage;
@@ -1281,20 +1377,41 @@ namespace F4MP::Coop
             g_stats.applied++;
             REX::INFO("[Coop] quest {:#x} ({}) stage {} -> {} via {} (native {}, from player {}{})", m.questFormId, q->formEditorID.c_str(), before, m.stage, how,
                 ok, m.senderId, m.isRequest ? ", request" : "");
+            return true;
+        }
+
+        // The snapshot goes out ~2000 stages a second: the server drops anything over 6000/s from one game, and a
+        // host with many quests done has thousands of stages.
+        std::deque<std::pair<uint32_t, uint16_t>> g_snapshotOut;
+
+        void DrainSnapshotOut()
+        {
+            for (int i = 0; i < 200 && !g_snapshotOut.empty(); ++i) {
+                const auto [q, st] = g_snapshotOut.front();
+                g_snapshotOut.pop_front();
+                SendQuestStage(q, st, false, true);
+            }
         }
 
         void OnQuestSnapshotRequest()
         {
+            if (!g_snapshotOut.empty()) { REX::INFO("[Coop] host: quest snapshot already going out ({} left)", g_snapshotOut.size()); return; }
             if (!IsHost()) return;
             auto* dh = RE::TESDataHandler::GetSingleton();
             if (!dh) return;
             uint32_t n = 0;
+            uint32_t earlier = 0;
             for (auto* q : dh->GetFormArray<RE::TESQuest>()) {
                 if (!IsTrackedQuest(q) || q->currentStage == 0) continue;
-                SendQuestStage(q->GetFormID(), q->currentStage, false, true);
+                // Every stage done here, in order, then the current one: a guest behind on this quest runs the
+                // stages in between too (their items, doors, NPC moves), not just the last (was: current stage only,
+                // so a joiner missed everything the earlier stages' scripts did).
+                for (uint16_t st : DoneStages(q))
+                    if (st != q->currentStage) { g_snapshotOut.emplace_back(q->GetFormID(), st); ++earlier; }
+                g_snapshotOut.emplace_back(q->GetFormID(), q->currentStage);
                 n++;
             }
-            REX::INFO("[Coop] host: sent quest snapshot ({} quests)", n);
+            REX::INFO("[Coop] host: sent quest snapshot ({} quests, {} earlier stages)", n, earlier);
         }
 
         // ---------- combat animations (player -> all) ----------
@@ -2127,6 +2244,7 @@ namespace F4MP::Coop
                     msg.damage = dmg;
                     Send(MessageType::CoopNpcDamage, msg);
                     g_stats.damageForwarded++;
+                    g_ourHitAt[target->GetFormID()] = Clock::now();
                     REX::INFO("[Coop] {} hit player {}'s NPC {:#x} for {:.1f}: forwarded",
                         cause->GetFormID() == kPlayerRefId ? "we" : "our companion", msg.ownerId, msg.npcFormId, dmg);
                     return RE::BSEventNotifyControl::kContinue;
@@ -2721,6 +2839,7 @@ namespace F4MP::Coop
         if (g_settings.quests) {
             DrainStagesSet();
             DrainQuestBacklog();
+            DrainSnapshotOut();
         }
 
         if (g_settings.items) PollLocks();
@@ -2769,10 +2888,14 @@ namespace F4MP::Coop
         Authority::Reset();
         g_npcAppliedHealth.clear();
         g_npcOwners.clear();
+        g_ourHitAt.clear();
+        g_deathReported.clear();
         Explosions::Reset();
+        Dialogue::Reset();   // the player's own subtitle settings back
         g_pendingSnapshot.clear();
         g_questStages.clear();
         g_questBacklog.clear();
+        g_snapshotOut.clear();
         g_doorMismatch.clear();
         g_doorsUsed.clear();
         g_lockWatch.clear();
@@ -2820,6 +2943,8 @@ namespace F4MP::Coop
         return true;
     }
 
+    void MarkOurHit(uint32_t localFormId) { g_ourHitAt[localFormId] = Clock::now(); }
+
     void ApplyNpcVitals(RE::Actor* actor, uint32_t ownerId, uint32_t formId, float hostHealth, bool hostDead)
     {
         auto* hp = HealthAV();
@@ -2844,7 +2969,28 @@ namespace F4MP::Coop
             g_npcAppliedHealth.erase(local);
             return;
         }
-        if (actor->IsDead(false)) return;  // our killing blow is on its way to the host
+        if (actor->IsDead(false)) {
+            // Dead here, alive in its owner's game. Hits are forwarded one by one, but burning, poison and bleeding
+            // aren't hits: a copy our flamer set on fire burned to death here while the real one took only the
+            // flame's hits (dead on one screen, still alive and down on the other). If
+            // our side was fighting it, the death is ours: the owner gets the rest of its health as a hit.
+            auto hit = g_ourHitAt.find(local);
+            if (hostHealth > 0.0f && hit != g_ourHitAt.end() && Clock::now() - hit->second < std::chrono::seconds(15)) {
+                auto& [at, n] = g_deathReported[local];
+                if (n < 3 && Clock::now() - at > std::chrono::seconds(2)) {
+                    CoopNpcDamageMsg msg{};
+                    msg.ownerId = ownerId;
+                    msg.npcFormId = formId;
+                    msg.damage = hostHealth + 50.0f;
+                    Send(MessageType::CoopNpcDamage, msg);
+                    at = Clock::now();
+                    ++n;
+                    REX::INFO("[Coop] NPC {:#x} died here but lives in player {}'s game ({:.1f} health): finishing blow sent ({} of 3)",
+                        local, ownerId, hostHealth, n);
+                }
+            }
+            return;
+        }
 
         if (std::fabs(cur - hostHealth) > 0.5f)
             actor->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *hp, hostHealth - cur);
