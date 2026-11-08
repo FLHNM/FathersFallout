@@ -20,5 +20,9 @@ namespace F4MP::CrashLog
     // Once a frame: notices the player quitting, so a fault in the game's own teardown is logged as
     // "closed while quitting" instead of a crash.
     void NoteFrame();
+    // On every save (kPreSaveGame): a save from the pause menu is how Quit starts.
+    void NoteSave();
+    // On every loaded game: quitting to the main menu and loading again ends the "closing" state.
+    void NoteGameLoaded();
     std::wstring LogPath();
 }

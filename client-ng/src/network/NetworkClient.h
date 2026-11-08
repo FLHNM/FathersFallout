@@ -117,7 +117,11 @@ struct ConnectionAcceptedMsg {
     uint32_t playerId;
     uint32_t currentPlayers;
     uint32_t maxPlayers;
+    uint32_t flags;   // Update 28 (must match the server): kAccept*. Older servers send only the first 12 bytes
 };
+constexpr size_t kConnectionAcceptedV1Size = 12;
+constexpr uint32_t kAcceptDedicated = 1;   // a dedicated server: it picks the host, not our ini
+constexpr uint32_t kAcceptYouHost = 2;     // dedicated: our game runs the shared world this session
 
 // (type Disconnect) sent by the server when a player leaves or is kicked, so their body goes AT ONCE
 // instead of after the 5 s timeout.
@@ -714,6 +718,9 @@ public:
     void PumpMessages();
 
     uint32_t GetPlayerId() const { return m_playerId; }
+    // Dedicated server (Update 28): the server hands out the host role instead of [Connect] Host.
+    bool ServerIsDedicated() const { return (m_acceptFlags.load() & kAcceptDedicated) != 0; }
+    bool ServerMadeMeHost() const { return (m_acceptFlags.load() & kAcceptYouHost) != 0; }
 
     // Copy of the remote players' state (id -> last position).
     std::unordered_map<uint32_t, PlayerPositionMsg> GetRemotePlayers();
@@ -744,6 +751,7 @@ private:
     bool m_ownSteamEvent = false;
 
     bool m_connected = false;
+    std::atomic<uint32_t> m_acceptFlags{ 0 };
     std::mutex m_statusMutex;
     std::string m_lastError;
     std::string m_target;

@@ -287,6 +287,8 @@ namespace F4MP::Coop
         // flags on inventory stacks are not set for NPC bodies (verified in game: always empty),
         // so we track our own changes instead of reading equip state back.
         std::unordered_map<uint32_t, std::vector<uint32_t>> g_appliedEquip;
+        struct EquipVerify { Clock::time_point at; int round = 0; };
+        std::unordered_map<uint32_t, EquipVerify> g_equipVerify;   // body FormID -> check its clothing then
 
         void PollLocalEquipment()
         {
@@ -373,6 +375,46 @@ namespace F4MP::Coop
                 const auto modKey = ModKey(wm.weapon, wm.mods, wm.count);
                 auto applied = g_appliedEquip.find(bodyId);
                 const bool modsChanged = g_appliedMods[bodyId] != modKey;
+
+                // A rebuild (clothing off) can leave the body wearing less than it was given: the
+                // guest took off a jumpsuit and the body had nothing on at all, then only the jumpsuit when it went
+                // back on (players saw that player invisible until a Pip-Boy close rebuilt the body). Checked 1.5 s
+                // after a change: missing clothing is put on again, and a body still wrong after that is rebuilt.
+                if (auto v = g_equipVerify.find(bodyId); v != g_equipVerify.end() && Clock::now() >= v->second.at &&
+                    applied != g_appliedEquip.end()) {
+                    const auto has = CollectEquipped(body);
+                    std::vector<RE::TESBoundObject*> missing;
+                    for (uint32_t fid : applied->second) {
+                        auto* obj = LookupForm<RE::TESBoundObject>(fid);
+                        if (obj && obj->GetFormType() == RE::ENUM_FORM_ID::kARMO && !IsPowerArmorItem(obj) &&
+                            !std::binary_search(has.begin(), has.end(), fid))
+                            missing.push_back(obj);
+                    }
+                    if (missing.empty()) {
+                        g_equipVerify.erase(v);
+                    } else if (v->second.round == 0) {
+                        for (auto* obj : missing) {
+                            if (body->GetInventoryObjectCount(obj) == 0) AddItems(body, obj, 1);
+                            RE::BGSObjectInstance inst(obj, nullptr);
+                            mgr->EquipObject(body, inst, 0, 1, nullptr, false, true, false, true, false);
+                        }
+                        REX::WARN("[Coop] body {:#x} (player {}): {} piece(s) of clothing fell off after the change: put on again",
+                            bodyId, pid, missing.size());
+                        v->second = { Clock::now() + std::chrono::milliseconds(1500), 1 };
+                    } else {
+                        g_equipVerify.erase(v);
+                        // At most once a minute per player: an engine that never reports a body's worn items
+                        // (seen in early builds) must not rebuild it over and over.
+                        static std::unordered_map<uint32_t, Clock::time_point> s_rebuiltAt;
+                        auto& last = s_rebuiltAt[pid];
+                        if (last != Clock::time_point{} && Clock::now() - last < std::chrono::seconds(60)) continue;
+                        last = Clock::now();
+                        Appearance::RequestRespawn(pid);
+                        REX::WARN("[Coop] body {:#x} (player {}): still missing {} piece(s) of clothing: body rebuilt", bodyId, pid,
+                            missing.size());
+                        continue;
+                    }
+                }
                 if (applied != g_appliedEquip.end() && applied->second == want->second && !modsChanged) continue;
                 if (applied != g_appliedEquip.end()) {   // the first outfit goes on at once
                     const auto now = Clock::now();
@@ -455,6 +497,7 @@ namespace F4MP::Coop
                             data != nullptr, equipped);
                 }
                 if (weaponChanged || armorRemoved) body->Reset3D(false, 0, true, 0);
+                g_equipVerify[bodyId] = { Clock::now() + std::chrono::milliseconds(1500), 0 };
                 g_appliedEquip[bodyId] = w;
                 g_appliedMods[bodyId] = modKey;
                 g_stats.applied++;
@@ -586,7 +629,8 @@ namespace F4MP::Coop
                 if (s_crew++ < 20) REX::INFO("[Coop] player {}'s hit for {:.1f} ignored: same side", m.senderId, m.damage);
                 return;
             }
-            if (!m.byNpc && !g_settings.friendlyFire) {
+            // Campaign only: in Wars other sides are meant to hurt each other (crews/factions are handled above).
+            if (!m.byNpc && !Wars::Mode() && !g_settings.friendlyFire) {
                 static int s_ff = 0;
                 if (s_ff++ < 20) REX::INFO("[Coop] player {}'s hit for {:.1f} ignored: friendly fire is off", m.senderId, m.damage);
                 return;
@@ -1065,7 +1109,7 @@ namespace F4MP::Coop
                 } else {
                     g_badSenders.insert(m.senderId);
                     REX::WARN("[Coop] player {} has a DIFFERENT load order ({:08X}, {}+{} plugins; host {:08X}, {}+{}): "
-                              "ignoring their item/quest/combat sync", m.senderId, m.loadOrderHash, m.fullCount,
+                              "their item/quest/combat sync waits for their plugin list (then it is translated)", m.senderId, m.loadOrderHash, m.fullCount,
                               m.lightCount, fp.hash, fp.full, fp.light);
                 }
                 if (!m.isReply) SendHello(true);  // tell the newcomer what the host runs
@@ -1075,7 +1119,7 @@ namespace F4MP::Coop
                     REX::INFO("[Coop] load order matches the host ({:08X})", fp.hash);
                 else
                     REX::WARN("[Coop] load order DIFFERS from the host ({:08X}, {}+{} plugins; mine {:08X}, {}+{}): "
-                              "item/quest/NPC sync paused", m.loadOrderHash, m.fullCount, m.lightCount, fp.hash, fp.full, fp.light);
+                              "item/quest/NPC sync waits for its plugin list (then it is translated)", m.loadOrderHash, m.fullCount, m.lightCount, fp.hash, fp.full, fp.light);
             }
         }
 

@@ -68,6 +68,13 @@ the same mods, or base game + DLC only. Texture or mesh mods without plugins are
 Bug reports on GitHub are **public**, which is why the launcher cleans the log first. Have a quick
 look at the file before posting if you want to be sure. (A free GitHub account is needed to post.)
 
+## Loading screens take ages
+
+Check the launcher's **LOAD SETTINGS** line (Update 28). If it says the grids are above 5, a tweak
+guide or an older setup raised `uGridsToLoad`: loading screens then take two to three times longer
+(36 s instead of 13 s in a test). Click **FIX IT** to put the game's own value back - your ini files
+are backed up first (`<name>.fathersfallout-backup`).
+
 ## How many players?
 
 Tested with 2 so far. More should work but hasn't been tested yet.

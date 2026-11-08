@@ -4,6 +4,8 @@
 
 #include "pch.h"
 #include "sync/Dialogue.h"
+
+#include <atomic>
 #include "sync/Authority.h"
 #include "sync/DynamicActors.h"
 #include "network/NetworkClient.h"
@@ -88,12 +90,35 @@ namespace F4MP::Dialogue
             if (s_logged++ < 2) REX::INFO("[Dialogue] HUD subtitle text {}: alpha {} visible {}", a_show ? "shown" : "hidden", a, v);
         }
 
+        // Scaleform belongs to the UI thread, and Tick runs on the game's job threads: the HUD was changed from
+        // there every frame (U27). Now it is queued as a UI task, at most every 2 s or when it flips, never twice
+        // at once. A test session ended in a fault in GFx::Value::ObjectRelease while quitting.
+        std::atomic<bool> g_hudTaskPending{ false };
+        std::atomic<bool> g_hudWant{ true };   // the newest request: a queued task applies whatever is wanted when it runs
+        bool g_hudShownLast = true;
+        std::chrono::steady_clock::time_point g_hudAt{};
+
+        void QueueHudSubtitles(bool a_show)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (a_show == g_hudShownLast && now - g_hudAt < std::chrono::seconds(2)) return;
+            g_hudWant = a_show;
+            g_hudShownLast = a_show;
+            g_hudAt = now;
+            auto* tasks = F4SE::GetTaskInterface();
+            if (!tasks || g_hudTaskPending.exchange(true)) return;   // one already queued: it takes g_hudWant
+            tasks->AddUITask([]() {
+                g_hudTaskPending = false;
+                ShowHudSubtitles(g_hudWant.load());
+            });
+        }
+
         void Release()
         {
             if (!g_forced) return;
             for (auto& p : g_prefs)
                 if (p.setting) p.setting->SetBinary(p.user);
-            if (g_hudHidden) ShowHudSubtitles(true);
+            if (g_hudHidden) QueueHudSubtitles(true);
             g_forced = false;
             g_hudHidden = false;
             REX::INFO("[Dialogue] subtitle settings back to the player's own");
@@ -118,7 +143,7 @@ namespace F4MP::Dialogue
                     g_prefs[0].user, g_prefs[1].user);
             }
             // Hidden only when the player had dialogue subtitles off; general-only players still see conversations.
-            if (!g_prefs[0].user) { ShowHudSubtitles(false); g_hudHidden = true; }
+            if (!g_prefs[0].user) { QueueHudSubtitles(false); g_hudHidden = true; }
         }
     }
 

@@ -300,7 +300,8 @@ namespace F4MP::Activity
                 if (furn && cur == furn) {
                     if (!w.seated) REX::INFO("[Activity] NPC {:#x} is on {:#x} like its owner's copy", local, wantSeat);
                     w.seated = wantSeat;
-                    w.tries = 0;
+                    // tries are NOT reset here: a copy that sits and then gets up again by itself was put back
+                    // every 1.5 s for good. 6 sits per seat its owner picks.
                 } else if (furn && furn->Get3D() && w.tries < 6 && now >= w.nextTry) {
                     // A seat someone else holds here (our own NPC on that chair) can't be taken: tried a few times.
                     const bool ok = Seat(a, furn, w.marker);

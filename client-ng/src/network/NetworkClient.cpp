@@ -276,8 +276,12 @@ void NetworkClient::PumpMessages() {
             const void* payload = reinterpret_cast<const uint8_t*>(msg->m_pData) + sizeof(MessageHeader);
 
             if (header->type == MessageType::ConnectionAccepted) {
-                if ((size_t)msg->m_cbSize < sizeof(MessageHeader) + sizeof(ConnectionAcceptedMsg)) { msg->Release(); continue; }
+                const size_t acceptSize = (size_t)msg->m_cbSize - sizeof(MessageHeader);
+                if ((size_t)msg->m_cbSize < sizeof(MessageHeader) + kConnectionAcceptedV1Size) { msg->Release(); continue; }
                 const auto* accept = reinterpret_cast<const ConnectionAcceptedMsg*>(payload);
+                m_acceptFlags = acceptSize >= sizeof(ConnectionAcceptedMsg) ? accept->flags : 0u;   // before m_connected
+                if (m_acceptFlags.load() & kAcceptDedicated)
+                    REX::INFO("[Network] dedicated server: {}", (m_acceptFlags.load() & kAcceptYouHost) ? "we host the shared world" : "someone else hosts (or nobody yet)");
                 m_playerId = accept->playerId;
                 m_connected = true;
                 REX::INFO("[Network] connected! ID {}, players {}/{}",

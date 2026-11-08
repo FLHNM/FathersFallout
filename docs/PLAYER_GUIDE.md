@@ -55,6 +55,21 @@ Everything you need to install, host and join. The same guide ships in the downl
 
 Only **one** player hosts. Start the host's game first.
 
+### Dedicated server (Update 28) - the world stays up
+Runs only the server, with no game open, on any Windows PC that stays on.
+
+1. **[ HOST ]** → **[X] DEDICATED SERVER (NO GAME)**. Pick **CAMPAIGN CO-OP** or **WASTELAND WARS** at the top.
+2. Set the **PORT** (campaign `7779`, Wars `7790`), a **SERVER PASSWORD** if you want one and, for the campaign,
+   an optional **WORLD OWNER**.
+3. **START SERVER**. The server opens in its own window - keep it open, close it to stop. Allow it in Windows Firewall.
+4. Friends join **BY IP** with your internet IP (**[ MY IP ]**) and the port; forward that UDP port to the server PC.
+   To play on the same PC, join `127.0.0.1`. Steam join doesn't work with a dedicated server.
+
+- **Campaign co-op:** someone's game still runs the shared world (NPCs, quests, builds); the server picks who. With a
+  **WORLD OWNER** set, only that player hosts, so the world carries on in their save between sessions. Empty = the
+  first player in hosts. If the host leaves, the others play on and the next player to connect hosts.
+- **Wasteland Wars:** the war lives on the server (NPC world, crews, claims) and carries on whoever is online.
+
 ## 4. Joining a friend
 
 ### Through Steam (recommended)
@@ -77,14 +92,14 @@ about a minute.
 ## 5. In game
 
 - **Co-op menu:** **F1 → FathersFallout → Menu** - connect/disconnect, host or join, pick which
-  character others see, and **Go to host**.
+  character others see, and **Teleport to host** (campaign co-op only).
 - When you join, you're moved next to the host (or told how far away they are).
 - **Guests:** while connected, the **host's world and story are the story**. Your quests are moved
   up to the host's progress and NPCs go where the host has them. **This changes your save** - use
   a separate save (a copy of your character) for co-op if you want your own playthrough untouched.
 - **Shared:** movement and animations, weapons and armor (with mods), power armor, furniture (sitting,
   lying, cooking - players and NPCs), NPC idles, shooting and melee, damage
-  (including to each other - switch **Friendly fire** off in the menu if you don't want that),
+  (other players' hits only hurt you if you switch **Friendly fire** on in the menu - off by default since Update 28),
   enemies and NPCs, deaths, explosions, doors and switches (gates a quest opened for one player
   open for everyone), items you drop for each other, containers (including the ones you build at
   settlements), building / moving / scrapping in workshops, power wires, settlers' jobs, quest progress,

@@ -311,6 +311,18 @@ void GameServer::HandleConnectionRequest(HSteamNetConnection conn, const Connect
     acceptMsg.playerId = client.id;
     acceptMsg.currentPlayers = GetPlayerCount();
     acceptMsg.maxPlayers = m_maxPlayers;
+    if (m_dedicated) {
+        acceptMsg.flags |= kAcceptDedicated;
+        auto lower = [](std::string s) { for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; };
+        const bool mayHost = m_worldOwner.empty() || lower(m_worldOwner) == lower(client.name);
+        if (m_hostId == 0 && mayHost) {
+            m_hostId = client.id;
+            acceptMsg.flags |= kAcceptYouHost;
+            spdlog::info("[Server] {} (ID {}) hosts the shared world this session", client.name, client.id);
+        } else if (m_hostId == 0) {
+            spdlog::info("[Server] {} joined while the world owner '{}' is away: no host until they come", client.name, m_worldOwner);
+        }
+    }
 
     // ConnectionAccepted with its header, the way the game reads it.
     MessageHeader header;
@@ -597,6 +609,7 @@ void GameServer::OnConnStatusChanged(SteamNetConnectionStatusChangedCallback_t* 
 
                 uint32_t playerId = it->second.id;
                 m_clients.erase(it);
+                HostLeft(playerId);
 
                 BroadcastMessage(MessageType::ChatMessage, &leaveMsg, sizeof(leaveMsg), playerId);
                 // Tell the others so they remove the body AT ONCE.
@@ -723,6 +736,20 @@ void GameServer::CmdList() {
     }
 }
 
+// Dedicated: the host's game left. Nobody is promoted mid-session (a guest's game holds the host's copies, not its
+// own world): the others play on, and the next player to connect (or the owner, when set) hosts.
+void GameServer::HostLeft(uint32_t a_id) {
+    if (!m_dedicated || a_id != m_hostId) return;
+    m_hostId = 0;
+    spdlog::info("[Server] the world host left; next host: {}",
+        m_worldOwner.empty() ? std::string("the next player to connect") : "'" + m_worldOwner + "' when they connect");
+    ChatMessageMsg m{};
+    m.senderId = 0;
+    snprintf(m.message, sizeof(m.message), "The world host left. Reconnect (F1) to take over the shared world.");
+    m.channel = 0;
+    BroadcastMessage(MessageType::ChatMessage, &m, sizeof(m), 0);
+}
+
 void GameServer::CmdKick(uint32_t id) {
     std::lock_guard<std::mutex> lock(m_clientsMutex);
     for (auto it = m_clients.begin(); it != m_clients.end(); ++it) {
@@ -731,6 +758,7 @@ void GameServer::CmdKick(uint32_t id) {
             m_sockets->CloseConnection(it->first, 0, "Kicked by admin", false);
             m_rates.erase(it->first);
             m_clients.erase(it);
+            HostLeft(id);
             // Tell the others so they remove the body AT ONCE.
             PlayerLeftMsg leftPkt{ id };
             BroadcastMessage(MessageType::Disconnect, &leftPkt, sizeof(leftPkt), id);

@@ -72,7 +72,10 @@ struct ConnectionAcceptedMsg {
     uint32_t playerId;
     uint32_t currentPlayers;
     uint32_t maxPlayers;
+    uint32_t flags;   // Update 28 (must match the client): kAccept*. Older games read only the first 12 bytes
 };
+constexpr uint32_t kAcceptDedicated = 1;   // a dedicated server: nobody's game started it, the server picks the host
+constexpr uint32_t kAcceptYouHost = 2;     // dedicated: your game runs the shared world this session
 
 // Sent (type Disconnect) when a player leaves or is kicked, so the others remove their body AT ONCE
 // (no waiting for the timeout).
@@ -304,6 +307,9 @@ public:
     void SetTickRate(int r) { if (r >= 1 && r <= 256) m_tickRate = r; }
     void SetPassword(const std::string& pw) { m_password = pw.substr(0, 31); }   // "" = anyone can join
     void SetWars(bool a_wars) { m_wars = a_wars; }   // a Wasteland Wars server (FathersFalloutWarsServer.exe)
+    // Dedicated server (--dedicated, started by the launcher's DEDICATED SERVER): the first player in hosts the
+    // shared world (or only a_owner, when set: their save is the world that carries on between sessions).
+    void SetDedicated(bool a_on, const std::string& a_owner) { m_dedicated = a_on; m_worldOwner = a_owner; }
     void Stop() { m_running = false; }
 
     // Queues a console command for the main thread.
@@ -379,6 +385,10 @@ private:
     std::string m_master;  // master server URL (empty = off)
     std::string m_password;   // join password ("" = none)
     bool m_wars = false;      // Wasteland Wars: expects PROTOCOL_VERSION + kWarsProtocolOffset
+    bool m_dedicated = false;
+    std::string m_worldOwner;  // dedicated: only this player name hosts ("" = whoever comes first)
+    uint32_t m_hostId = 0;     // dedicated: the player whose game runs the shared world (0 = nobody right now)
+    void HostLeft(uint32_t a_id);
 
     std::chrono::steady_clock::time_point m_startTime;
     std::chrono::steady_clock::time_point m_lastStatus;

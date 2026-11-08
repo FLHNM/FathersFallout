@@ -35,6 +35,7 @@ public:
         RunAsService = static_cast<bool>(JSON["run-as-service"]);
         LogLocation = JSON["log-location"];
         Password = JSON.value("password", std::string(""));    // "" = anyone can join
+        WorldOwner = JSON.value("world-owner", std::string("")); // dedicated: the only player who hosts ("" = first in)
         // The host's game starts the server with the password typed in the launcher/F1 menu.
         if (const char* env = std::getenv("FF_SERVER_PASSWORD")) Password = env;
     }
@@ -63,6 +64,7 @@ public:
 
     std::string LogLocation;
     std::string Password;
+    std::string WorldOwner;
 
     nlohmann::json JSON;
 

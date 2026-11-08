@@ -6,6 +6,6 @@ if not exist "%CSC%" set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe
 cd /d "%~dp0"
 "%CSC%" /nologo /target:winexe /optimize+ /out:"FathersFallout.exe" /win32icon:art\icon.ico ^
   /resource:art\logo.png,FathersFallout.logo.png ^
-  /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll Launcher.cs
+  /r:System.dll /r:System.Core.dll /r:System.Web.Extensions.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll Launcher.cs
 if errorlevel 1 (echo [ERROR] build failed & exit /b 1)
 echo [OK] FathersFallout.exe

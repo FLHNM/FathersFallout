@@ -412,6 +412,9 @@ namespace F4MP
             if (now == S::Connected) {
                 g_retriesLeft = 0;
                 Notify("FathersFallout: connected to " + net.GetTarget() + " as " + g_playerName);
+                if (net.ServerIsDedicated())
+                    Notify(net.ServerMadeMeHost() ? "FathersFallout: dedicated server - your game runs the shared world this session"
+                                                  : "FathersFallout: dedicated server - you joined the shared world");
                 // Host: friends can now join through Steam too (the server keeps taking IP joins).
                 if (g_isHost && g_steamHosting && !net.IsSteam() && Network::SteamLink::Available() && !Network::SteamLink::IsHosting()) {
                     Network::SteamLink::StartHosting(net.Sockets(), static_cast<uint16_t>(g_serverPort), g_playerName);
@@ -1219,7 +1222,7 @@ namespace F4MP
         std::string name, err;
         Network::SteamLink::FindHost(std::to_string(a_host), name, err);
         if (net.IsConnected() || net.IsConnecting()) {
-            if (net.IsConnected() && !g_isHost && net.GetTarget().find(name) != std::string::npos) return;   // there already
+            if (net.IsConnected() && !IsHost() && net.GetTarget().find(name) != std::string::npos) return;   // there already
             Notify("FathersFallout: you're in a co-op session already - disconnect (F1) to join " + name);
             return;
         }
@@ -1421,7 +1424,7 @@ namespace F4MP
             } else {
                 if (s_sentAppearance) {  // just dropped: forget co-op session state
                     F4SE::GetTaskInterface()->AddTask([]() { Coop::OnDisconnected(); });
-                    if (!g_isHost) Network::SteamLink::SetGuestPresence("");
+                    if (!IsHost()) Network::SteamLink::SetGuestPresence("");
                 }
                 s_sentAppearance = false;  // send the appearance again after reconnecting
             }
@@ -1445,21 +1448,27 @@ namespace F4MP
     static uint32_t g_spawnBase = kBodyBaseMale;
 
     // Finds an actor of the given base near the player that isn't claimed yet.
+    // Bodies we removed: never taken again as a "new" body (a body rebuilt for a new look took the
+    // old body it had just removed, and the 3 new ones stood around until the leftover sweep).
+    static std::unordered_set<uint32_t> g_despawned;
+
     static RE::Actor* FindNearbyActor(uint32_t baseFormId, const std::unordered_set<uint32_t>& exclude)
     {
         auto* pl = RE::PlayerCharacter::GetSingleton();
-        if (!pl) return nullptr;
-        auto* cell = pl->GetParentCell();
-        if (!cell) return nullptr;
+        auto* tes = RE::TES::GetSingleton();
+        if (!pl || !tes || !pl->GetParentCell()) return nullptr;
         const RE::NiPoint3 pos = pl->GetPosition();
 
         // Take the NEWEST match (highest runtime FormID): the actor placeatme just created,
         // not an older copy such as a test dummy standing nearby.
+        // Every loaded cell, not only the player's: outside, placeatme near a cell edge puts the actor in the
+        // next cell, and the spawn was "not there" three times in a row.
         RE::Actor* found = nullptr;
-        cell->ForEachReferenceInRange(pos, 800.0f, [&](RE::TESObjectREFR* ref) {
+        tes->ForEachReferenceInRange(pos, 800.0f, [&](RE::TESObjectREFR* ref) {
             if (ref && ref != static_cast<RE::TESObjectREFR*>(pl)) {
                 auto* base = ref->GetObjectReference();
                 if (base && base->GetFormID() == baseFormId && exclude.find(ref->GetFormID()) == exclude.end() &&
+                    !g_despawned.contains(ref->GetFormID()) &&
                     !ref->IsDeleted() && !ref->IsDisabled() &&
                     (!found || ref->GetFormID() > found->GetFormID())) {
                     if (auto* a = ref->As<RE::Actor>()) found = a;
@@ -1478,7 +1487,13 @@ namespace F4MP
     static std::unordered_map<uint32_t, RE::NiPoint3> g_tagBodyPos;
 
     // Used by CoopSync (main thread only, like g_bodies itself).
-    bool IsHost() { return g_isHost; }
+    // A dedicated server decides who hosts (the first player in, or its world owner); otherwise [Connect] Host.
+    bool IsHost()
+    {
+        const auto& net = Network::NetworkClient::GetInstance();
+        if (net.IsConnected() && net.ServerIsDedicated()) return net.ServerMadeMeHost();
+        return g_isHost;
+    }
     std::vector<std::pair<uint32_t, uint32_t>> GetBodies() { return { g_bodies.begin(), g_bodies.end() }; }
     uint32_t GetPlayerIdForBody(uint32_t formId)
     {
@@ -1573,6 +1588,8 @@ namespace F4MP
         auto* ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
         if (!ref) return;
         AimHook::Forget(ref->As<RE::Actor>());
+        if (g_despawned.size() > 512) g_despawned.clear();
+        g_despawned.insert(fid);
         ref->Disable();
         ref->SetWantsDelete(true);
         ref->MarkAsDeleted();
@@ -1611,6 +1628,8 @@ namespace F4MP
         }
     }
 
+    struct LateSpawn { uint32_t base; std::chrono::steady_clock::time_point at; int left; };
+    static std::vector<LateSpawn> g_lateSpawns;   // spawns given up on (see "late body" in the body tick)
     static std::chrono::steady_clock::time_point g_travelHoldUntil;   // no body spawns before (fast travel)
     static std::chrono::steady_clock::time_point g_travelGoneAt;      // when we let a fast travel go
 
@@ -2455,7 +2474,9 @@ namespace F4MP
             }
             // A state counts as sent only once the graph accepts it; refused events are retried
             // next tick (the graph refuses e.g. moveStart while it's still in a start-up state).
-            if (wantMoving != st.moving) {
+            // Our own game sits in a menu: no graph runs, so every walk start was refused and retried for as long
+            // as the menu stayed open.
+            if (wantMoving != st.moving && !WorldPause::LocalPaused()) {
                 bool ok = wantMoving ? StartMoving(actor, rp.isSneaking) : GraphOverride::SendEvent(actor, "moveStop");
                 // Refused for a quarter second while the body is being moved = it slides. Seen right after the
                 // local player crouched (the body's AI copies that): if the graph's stance isn't its player's,
@@ -2652,6 +2673,23 @@ namespace F4MP
             }
         }
 
+        // A spawn given up on after 3 s can still arrive later: it then stood next to the retry's body
+        // (a character seen twice for a while, leftovers removed later). Late ones of a given-up
+        // spawn's base are removed as soon as they show, for 30 s.
+        if (!g_lateSpawns.empty()) {
+            const auto t = std::chrono::steady_clock::now();
+            std::erase_if(g_lateSpawns, [&](auto& l) { return t - l.at > std::chrono::seconds(30); });
+            for (auto& l : g_lateSpawns) {
+                if (l.left <= 0) continue;
+                auto claimed = ClaimedFormIds();
+                if (auto* late = FindNearbyActor(l.base, claimed); late && (!g_spawnPending || l.base != g_spawnBase)) {
+                    DespawnBody(late->GetFormID());
+                    --l.left;
+                    REX::INFO("[FathersFallout] late body {:#x} from a spawn given up on: removed", late->GetFormID());
+                }
+            }
+        }
+
         // 2. Finish a pending spawn (placeatme is asynchronous).
         if (g_spawnPending) {
             const float waited = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_spawnAt).count();
@@ -2661,7 +2699,10 @@ namespace F4MP
                 // than 0.4 s. Giving up at once let SweepOrphanBodies delete the late body as a "leftover",
                 // and the next spawn the same way: the friend's body flickered out after travelling.
                 if (!actor && waited < 3.0f) return;
-                if (!actor) REX::WARN("[FathersFallout] body for player {} didn't appear within 3 s; trying again", g_spawnFor);
+                if (!actor) {
+                    REX::WARN("[FathersFallout] body for player {} didn't appear within 3 s; trying again", g_spawnFor);
+                    g_lateSpawns.push_back({ g_spawnBase, std::chrono::steady_clock::now(), 1 });
+                }
                 if (actor && RE::TESForm::GetFormByID(actor->GetFormID()) != actor) {
                     // The respawn check looks bodies up by FormID; if that can't find this actor
                     // it would be "lost" every tick. Refuse it loudly instead.
@@ -2865,18 +2906,57 @@ namespace F4MP
     // Mirror the NPCs other players own (sync/Authority): find our copy, calm its AI and drive it
     // to the owner's state. NPCs we own run normally and are broadcast by BroadcastNpcs.
 
+    // Mirrored NPCs whose owner's copy has its weapon out (local FormID -> when last told so).
+    static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> g_drivenArmedAt;
+
+    // An NPC handed to us in a fight starts out of combat: its mirror had StopCombat every tick. Seen in testing: enemies
+    // that knew about the players stood still now and then, right after the other player opened a menu (every
+    // Pip-Boy hands that game's NPCs to the others and back). It goes for the nearest player it is hostile to.
+    static void ResumeFight(RE::Actor* a)
+    {
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        if (!a || !pl || a->IsDead(false) || a->IsInCombat()) return;
+        std::vector<RE::Actor*> players{ pl };
+        for (auto& [pid, fid] : g_bodies) {
+            auto* f = RE::TESForm::GetFormByID(fid);
+            if (auto* b = f ? f->As<RE::Actor>() : nullptr; b && !b->IsDisabled() && b->Get3D()) players.push_back(b);
+        }
+        RE::Actor* best = nullptr;
+        float bestD = 4000.0f * 4000.0f;
+        const auto p = a->GetPosition();
+        for (auto* t : players) {
+            if (!a->GetHostileToActor(t)) continue;
+            const auto q = t->GetPosition();
+            const float d = (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y) + (p.z - q.z) * (p.z - q.z);
+            if (d < bestD) { bestD = d; best = t; }
+        }
+        if (!best) return;
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "%X.startcombat %X", a->GetFormID(), best == pl ? 0x14u : best->GetFormID());
+        RE::Console::ExecuteCommand(cmd);
+        static int s_logged = 0;
+        if (s_logged++ < 40) REX::INFO("[FathersFallout] NPC {:#x} handed to us mid-fight: back in combat with {:#x}", a->GetFormID(),
+            best == pl ? 0x14u : best->GetFormID());
+    }
+
     static void ReleaseDriven(uint32_t localFid)
     {
         // Give the NPC its own AI back (we had it on a do-nothing package).
         char cmd[48];
         snprintf(cmd, sizeof(cmd), "%X.evp", localFid);
         RE::Console::ExecuteCommand(cmd);
+        bool armed = false;
+        if (auto it = g_drivenArmedAt.find(localFid); it != g_drivenArmedAt.end()) {
+            armed = std::chrono::steady_clock::now() - it->second < std::chrono::seconds(5);
+            g_drivenArmedAt.erase(it);
+        }
         GraphOverride::SetMirror(localFid, false);
         g_npcAnim.erase(localFid);
         // Back on its own AI with Speed unbound: Speed from how it really moves (else it slid wherever it walked).
         if (auto* f = RE::TESForm::GetFormByID(localFid); auto* a = f ? f->As<RE::Actor>() : nullptr) {
             GraphOverride::ReleaseMirrorSpeed(a);
             FreeMarker(localFid);
+            if (armed) ResumeFight(a);
         }
         if (auto it = g_npcDamageMult.find(localFid); it != g_npcDamageMult.end()) {
             auto* f = RE::TESForm::GetFormByID(localFid);
@@ -2906,7 +2986,7 @@ namespace F4MP
     static void PullHostNpc(RE::Actor* actor, const Network::NpcStateMsg& s)
     {
         auto* pl = RE::PlayerCharacter::GetSingleton();
-        if (!pl || g_isHost || !HostInMySpace()) return;
+        if (!pl || IsHost() || !HostInMySpace()) return;
         const auto here = pl->GetPosition();
         const float dx = s.x - here.x, dy = s.y - here.y;
         if (dx * dx + dy * dy > Range::Loaded() * Range::Loaded() * 0.64f) return;   // not near us
@@ -2940,7 +3020,7 @@ namespace F4MP
         auto& net = Network::NetworkClient::GetInstance();
         auto* pl = RE::PlayerCharacter::GetSingleton();
         auto* tes = RE::TES::GetSingleton();
-        if (g_isHost || !pl || !tes || !net.IsConnected() || Coop::IsLoadOrderMismatch()) return;
+        if (IsHost() || !pl || !tes || !net.IsConnected() || Coop::IsLoadOrderMismatch()) return;
         static std::chrono::steady_clock::time_point s_next{}, s_since{};
         static std::unordered_map<uint32_t, int> s_missing;   // consecutive sweeps not sent by the host
         const auto now = std::chrono::steady_clock::now();
@@ -3290,6 +3370,7 @@ namespace F4MP
                 const bool want = (s.flags & Network::kNpcWeaponDrawn) != 0;
                 const auto t = std::chrono::steady_clock::now();
                 GraphOverride::SetMirrorDrawn(local, want);
+                if (want) g_drivenArmedAt[local] = t; else g_drivenArmedAt.erase(local);
                 if (want != anim.ownerDrawn) {
                     anim.ownerDrawn = want;
                     static int s_logged = 0;
@@ -3376,7 +3457,7 @@ namespace F4MP
     // settled: moving NPCs out of unloaded cells while a trip's load starts hung a guest's game.
     static bool TravelBusy()
     {
-        if (g_isHost) return false;
+        if (IsHost()) return false;
         {
             std::lock_guard l(g_travelLock);
             if (g_travelPending) return true;
@@ -3387,11 +3468,16 @@ namespace F4MP
 
     static bool GoToHost(bool a_quiet = false)
     {
+        // Campaign co-op only: Wasteland Wars has no host to run to (random starts, sides fighting).
+        if (Wars::Mode()) {
+            if (!a_quiet) Notify("FathersFallout: Go to host is for campaign co-op only");
+            return false;
+        }
         auto& net = Network::NetworkClient::GetInstance();
         const uint32_t hostId = Authority::HostId();
         auto remotes = net.GetRemotePlayers();
         auto it = remotes.find(hostId);
-        if (!net.IsConnected() || g_isHost || it == remotes.end()) {
+        if (!net.IsConnected() || IsHost() || it == remotes.end()) {
             if (!a_quiet) Notify("FathersFallout: the host's position isn't known yet");
             return false;
         }
@@ -3498,7 +3584,7 @@ namespace F4MP
         FinishTravel();
         auto& net = Network::NetworkClient::GetInstance();
         if (!net.IsConnected()) { g_travelDone = false; return; }
-        if (g_isHost || !g_travelOnJoin || g_travelDone || g_inIntro) return;
+        if (IsHost() || !g_travelOnJoin || g_travelDone || g_inIntro || Wars::Mode()) return;
         auto remotes = net.GetRemotePlayers();
         auto host = remotes.find(Authority::HostId());
         if (host == remotes.end() || host->second.cellId == 0) return;   // where the host is isn't known yet
@@ -3582,11 +3668,12 @@ namespace F4MP
 
         if (net.IsConnected()) {
             ImGuiMCP::TextColored(ImGuiMCP::ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Connected to %s as %s (%s)",
-                net.GetTarget().c_str(), g_playerName, g_isHost ? "host" : "joined");
+                net.GetTarget().c_str(), g_playerName, IsHost() ? (net.ServerIsDedicated() ? "world host, dedicated server" : "host") : "joined");
             auto remotes = net.GetRemotePlayers();
             ImGuiMCP::Text("Other players here: %d", (int)remotes.size());
-            if (!g_isHost) {
-                if (ImGuiMCP::Button("Go to host")) GoToHost();
+            if (!IsHost() && !Wars::Mode()) {
+                // Teleport next to the host (campaign co-op only; hidden in Wasteland Wars).
+                if (ImGuiMCP::Button("Teleport to host")) GoToHost();
                 ImGuiMCP::SameLine();
                 // Day here, night there: the host's time of day and weather right now.
                 if (ImGuiMCP::Button("Sync time with host"))
@@ -3770,7 +3857,8 @@ namespace F4MP
         ImGuiMCP::Checkbox("Send my own quest progress to the host (changes the host's save)", &cs.shareMyQuests);
         ImGuiMCP::Checkbox("Time of day + weather (follow the host)", &cs.worldTime);
         ImGuiMCP::Checkbox("Show other players' attacks, aiming and reloads", &cs.combatAnims);
-        ImGuiMCP::Checkbox("Friendly fire (other players' shots and swings can hurt me)", &cs.friendlyFire);
+        if (!Wars::Mode())   // Wars: other sides always can, crewmates never
+            ImGuiMCP::Checkbox("Friendly fire (other players' shots and swings can hurt me)", &cs.friendlyFire);
         ImGuiMCP::Checkbox("Real-time VATS (targeting doesn't slow time, so the others aren't left waiting)", &cs.realTimeVats);
         if (Coop::IsLoadOrderMismatch())
             ImGuiMCP::TextColored(ImGuiMCP::ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
@@ -3795,8 +3883,8 @@ namespace F4MP
             if (net.IsConnected()) {
                 for (const auto& [id, p] : net.GetRemotePlayers())
                     ImGuiMCP::Text("  player #%u  x=%.0f y=%.0f z=%.0f", id, p.x, p.y, p.z);
-                ImGuiMCP::Text("Role: %s", g_isHost ? "host (my game runs the shared world)" : "guest (the host's world)");
-                if (!g_isHost) ImGuiMCP::Text("NPCs mirrored: %d", (int)net.GetRemoteNpcs().size());
+                ImGuiMCP::Text("Role: %s", IsHost() ? "host (my game runs the shared world)" : "guest (the host's world)");
+                if (!IsHost()) ImGuiMCP::Text("NPCs mirrored: %d", (int)net.GetRemoteNpcs().size());
                 // Test tools: two hosts in one session break it, so players never see these.
                 if (g_consoleBridge || g_bodyTrace) {
                     if (ImGuiMCP::Button(g_isHost ? "Stop being host (test)" : "Become NPC host (test)")) g_isHost = !g_isHost;
@@ -3953,7 +4041,8 @@ namespace F4MP
             GetPrivateProfileStringA(Wars::ConnectSection(), "Password", "", g_password, sizeof(g_password), ini);
             Network::SteamLink::SetFriendsOnly(GetPrivateProfileIntA(Wars::ConnectSection(), "SteamFriendsOnly", 1, ini) != 0);
             g_travelOnJoin = GetPrivateProfileIntA(Wars::ConnectSection(), "TravelOnJoin", 1, ini) != 0;
-            Coop::GetSettings().friendlyFire = GetPrivateProfileIntA("Sync", "FriendlyFire", 1, ini) != 0;
+            // Off by default since Update 28.
+            Coop::GetSettings().friendlyFire = GetPrivateProfileIntA("Sync", "FriendlyFire", 0, ini) != 0;
             Coop::GetSettings().realTimeVats = GetPrivateProfileIntA("Sync", "RealTimeVATS", 1, ini) != 0;
         }
         if (!GetPrivateProfileIntA(Wars::ConnectSection(), "AutoConnect", 0, ini)) return;
@@ -3975,6 +4064,7 @@ namespace F4MP
         if (!a_msg) return;
 
         if (a_msg->type == F4SE::MessagingInterface::kPreSaveGame) {
+            F4MP::CrashLog::NoteSave();
             DespawnBodiesForSave();
         }
 
@@ -3982,6 +4072,7 @@ namespace F4MP
         // would break it. New players join once they've left Vault 111 and saved.
         if (a_msg->type == F4SE::MessagingInterface::kPostLoadGame) {
             F4MP::CrashLog::Reassert();
+            F4MP::CrashLog::NoteGameLoaded();
             F4MP::Appearance::MarkLookDirty();   // another character may be loaded
             F4MP::Workshop::OnGameLoaded();
             F4MP::Coop::OnGameLoaded();

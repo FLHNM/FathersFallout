@@ -23,6 +23,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -32,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.27.0.0")]
-[assembly: AssemblyFileVersion("0.27.0.0")]
+[assembly: AssemblyVersion("0.28.0.0")]
+[assembly: AssemblyFileVersion("0.28.0.0")]
 
 namespace F4MPLauncher
 {
@@ -80,6 +81,7 @@ namespace F4MPLauncher
     {
         public string Label, Detail, Url;
         public bool Ok;
+        public Action Fix;   // a [ FIX > ] link instead of DOWNLOAD (the launcher can repair it itself)
     }
 
     // ---------- Pip-Boy look ----------
@@ -222,6 +224,11 @@ namespace F4MPLauncher
         readonly TermButton steamOpt = new TermButton("[ ] THROUGH STEAM"), ipOpt = new TermButton("[ ] BY IP (GOG)");
         readonly TermField ip = new TermField(), port = new TermField(), name = new TermField(), steamWho = new TermField(), password = new TermField();
         readonly TermButton friendsOpt = new TermButton("[X] FRIENDS ONLY");
+        // Dedicated server (Update 28): HOST > DEDICATED SERVER runs only the server program on this PC, no game.
+        readonly TermButton dedicatedOpt = new TermButton("[ ] DEDICATED SERVER (NO GAME)");
+        readonly TermField owner = new TermField();
+        readonly Label ownerLabel = new Label();
+        bool dedicated;
         readonly Label passwordLabel = new Label();
         bool friendsOnly = true;
         readonly Label steamLabel = new Label();
@@ -416,8 +423,20 @@ namespace F4MPLauncher
             ipOpt.Click += delegate { SetVia(false); };
             ipButton.Click += delegate { ShowHostIp(); };
             hostInfo.AutoSize = true; hostInfo.BackColor = Color.Transparent; hostInfo.ForeColor = Pip.Mid;
-            hostInfo.Font = Pip.Font(9f, FontStyle.Regular); hostInfo.Location = new Point(x, 352);
+            hostInfo.Font = Pip.Font(9f, FontStyle.Regular); hostInfo.Location = new Point(x + 262, 356);
             Controls.Add(hostInfo);
+            Place(dedicatedOpt, x, 350, 250, 28);
+            dedicatedOpt.Click += delegate {
+                SetDedicated(!dedicated);
+                Say(dedicated ? (wars ? "WARS SERVER: THE WAR GOES ON WITH NO GAME OPEN. PRESS START SERVER."
+                                      : "DEDICATED: NO GAME NEEDED. FIRST PLAYER IN (OR THE WORLD OWNER) HOSTS.")
+                              : "HOST: YOUR GAME RUNS THE SERVER AND THE SHARED WORLD.");
+            };
+            ownerLabel.Text = "WORLD OWNER";
+            ownerLabel.AutoSize = true; ownerLabel.BackColor = Color.Transparent; ownerLabel.ForeColor = Pip.Mid;
+            ownerLabel.Font = Pip.Font(9.5f, FontStyle.Regular); ownerLabel.Location = new Point(right - 158, 392);
+            Controls.Add(ownerLabel);
+            Place(owner, right - 158, 410, 158, 30);
 
             Place(name, x, 410, 260, 30);
             // Join password: the host sets one, friends type the same. Empty = anyone who finds the game.
@@ -471,8 +490,7 @@ namespace F4MPLauncher
             campaignOpt.Text = wars ? "[ ] CAMPAIGN CO-OP" : "[X] CAMPAIGN CO-OP";
             warsOpt.Text = wars ? "[X] WASTELAND WARS (EXPERIMENTAL)" : "[ ] WASTELAND WARS (EXPERIMENTAL)";
             campaignOpt.Invalidate(); warsOpt.Invalidate();
-            saveHint.Text = wars ? WarsHint : CampaignHint;
-            saveHint.ForeColor = wars ? Pip.Amber : Pip.Dim;
+            SetMode(hostOpt.Selected);   // hints and the owner field (campaign only) follow the game mode
             LoadSaves();
             Say(wars ? "WASTELAND WARS: NO STORY. FACTIONS, RAIDERS AND EACH OTHER." : "CAMPAIGN CO-OP: THE FULL STORY TOGETHER.");
         }
@@ -496,22 +514,43 @@ namespace F4MPLauncher
 
         void SetMode(bool host)
         {
+            if (!host) dedicated = false;
             hostOpt.Selected = host; joinOpt.Selected = !host;
             hostOpt.Text = host ? "[X] HOST" : "[ ] HOST";
             joinOpt.Text = host ? "[ ] JOIN A FRIEND" : "[X] JOIN A FRIEND";
-            ipButton.Visible = hostInfo.Visible = host;
+            ipButton.Visible = hostInfo.Visible = dedicatedOpt.Visible = host;
             steamOpt.Visible = ipOpt.Visible = !host;
-            // Host: password + Steam friends-only side by side; guest: the host's password, full width.
-            friendsOpt.Visible = host;
-            password.Width = (host ? W - 30 - 158 - 12 : W - 30) - password.Left;
-            passwordLabel.Text = host ? "PASSWORD FOR YOUR GAME (OPTIONAL)" : "HOST'S PASSWORD (IF THEY SET ONE)";
+            // Host: password + Steam friends-only side by side; dedicated campaign: password + world owner; guest:
+            // the host's password, full width.
+            friendsOpt.Visible = host && !dedicated;
+            owner.Visible = ownerLabel.Visible = host && dedicated && !wars;   // Wars: no host's world to own
+            password.Width = (host && !(dedicated && wars) ? W - 30 - 158 - 12 : W - 30) - password.Left;
+            passwordLabel.Text = !host ? "HOST'S PASSWORD (IF THEY SET ONE)" : dedicated ? "SERVER PASSWORD" : "PASSWORD FOR YOUR GAME (OPTIONAL)";
+            dedicatedOpt.Selected = dedicated;
+            dedicatedOpt.Text = dedicated ? "[X] DEDICATED SERVER (NO GAME)" : "[ ] DEDICATED SERVER (NO GAME)";
+            ipButton.Text = dedicated ? "[ MY IP ]" : "[ MY IP FOR FRIENDS ]";
+            ipButton.Width = dedicated ? 150 : W - 30 - (LeftW + 30) - 390;
             if (host) {
                 string code = MyFriendCode();
-                hostInfo.Text = code != "" ? "STEAM FRIENDS JOIN YOU WITH NO IP.  YOUR FRIEND CODE: " + code + "   (GOG FRIENDS: MY IP)"
-                                           : "FRIENDS JOIN BY YOUR IP (PRESS MY IP FOR FRIENDS).";
+                hostInfo.Text = dedicated ? "FRIENDS JOIN BY IP + PORT (NOT STEAM)" :
+                                code != "" ? "STEAM FRIEND CODE: " + code + "  (GOG: MY IP)" : "FRIENDS JOIN BY YOUR IP (MY IP FOR FRIENDS)";
             }
+            // Dedicated: no save to load, and PLAY starts the server.
+            saveButton.Visible = !dedicated;
+            saveHint.Text = dedicated ? (wars ? "THE WAR (NPC WORLD, CREWS, CLAIMS) IS SAVED BY THE SERVER. PLAYERS JOIN BY IP + PORT."
+                                              : "WORLD OWNER'S SAVE IS THE SHARED WORLD. EMPTY = FIRST PLAYER IN HOSTS. JOIN BY IP.")
+                                      : (wars ? WarsHint : CampaignHint);
+            saveHint.ForeColor = dedicated || wars ? Pip.Amber : Pip.Dim;
+            play.Text = dedicated ? "[ START SERVER ]" : "[  PLAY  ]";
+            play.Font = Pip.Font(dedicated ? 14f : 18f, FontStyle.Bold);
             SetVia(viaSteam);
-            joinOpt.Invalidate(); hostOpt.Invalidate();
+            joinOpt.Invalidate(); hostOpt.Invalidate(); dedicatedOpt.Invalidate();
+        }
+
+        void SetDedicated(bool on)
+        {
+            dedicated = on;
+            SetMode(true);
         }
 
         void SetVia(bool steam)
@@ -521,7 +560,8 @@ namespace F4MPLauncher
             steamOpt.Selected = steam; ipOpt.Selected = !steam;
             steamOpt.Text = steam ? "[X] THROUGH STEAM" : "[ ] THROUGH STEAM";
             ipOpt.Text = steam ? "[ ] BY IP (GOG)" : "[X] BY IP (GOG)";
-            ip.Visible = port.Visible = ipLabel.Visible = portLabel.Visible = join && !steam;
+            ip.Visible = ipLabel.Visible = join && !steam;
+            port.Visible = portLabel.Visible = (join && !steam) || dedicated;   // a dedicated server picks its port
             steamWho.Visible = steamLabel.Visible = join && steam;
             steamOpt.Invalidate(); ipOpt.Invalidate();
         }
@@ -578,7 +618,10 @@ namespace F4MPLauncher
             password.Box.Text = Ini.Get(settings, "Launcher", "Password", "");
             SetFriendsOnly(Ini.Get(settings, "Launcher", "FriendsOnly", "1") != "0");
             viaSteam = Ini.Get(settings, "Launcher", "JoinVia", SteamGame() ? "Steam" : "IP") == "Steam";
-            SetMode(Ini.Get(settings, "Launcher", "Mode", "Join") == "Host");
+            owner.Box.Text = Ini.Get(settings, "Launcher", "WorldOwner", "");
+            string mode = Ini.Get(settings, "Launcher", "Mode", "Join");
+            dedicated = mode == "Dedicated";
+            SetMode(mode == "Host" || dedicated);
         }
 
         void SaveSettings()
@@ -587,7 +630,8 @@ namespace F4MPLauncher
             Ini.Set(settings, "Launcher", "Server", ip.Box.Text.Trim());
             Ini.Set(settings, "Launcher", wars ? "WarsPort" : "Port", port.Box.Text.Trim());
             Ini.Set(settings, "Launcher", "Name", name.Box.Text.Trim());
-            Ini.Set(settings, "Launcher", "Mode", hostOpt.Selected ? "Host" : "Join");
+            Ini.Set(settings, "Launcher", "Mode", dedicated ? "Dedicated" : hostOpt.Selected ? "Host" : "Join");
+            Ini.Set(settings, "Launcher", "WorldOwner", owner.Box.Text.Trim());
             Ini.Set(settings, "Launcher", "JoinVia", viaSteam ? "Steam" : "IP");
             Ini.Set(settings, "Launcher", "SteamHost", steamWho.Box.Text.Trim());
             Ini.Set(settings, "Launcher", "Password", password.Box.Text);
@@ -690,10 +734,81 @@ namespace F4MPLauncher
             var extra = ExtraPlugins();
             add("MOD LIST", extra.Count == 0, extra.Count == 0 ? "GAME + DLC ONLY (MATCHES THE HOST)" :
                 "EXTRA: " + string.Join(", ", extra.Take(3)).ToUpper() + (extra.Count > 3 ? " ..." : "") + " - HOST NEEDS THE SAME", null);
+            // Loading screens: uGridsToLoad above the game's 5 (old co-op tips, "distant detail" guides) made one
+            // host's loads 31-36 s instead of 13-14 s (Update 28). Warn and offer to put it back.
+            string where;
+            int grids = GameIniValue("uGridsToLoad", out where);
+            bool gridsOk = grids <= 5;
+            var load = add("LOAD SETTINGS", gridsOk, grids < 0 ? "GAME DEFAULT" :
+                gridsOk ? "GRIDS " + grids + " (FAST LOADS)" : "GRIDS " + grids + " - SLOW LOADING SCREENS", null);
+            if (!gridsOk) load.Fix = FixLoadSettings;
             return list;
         }
 
         bool ModOrganizer() { return Ini.Get(settings, "Launcher", "PluginsDir", "") != ""; }
+
+        // ---------- game settings (Fallout4.ini / Fallout4Prefs.ini / Fallout4Custom.ini) ----------
+
+        // Where the game reads its ini files: Documents\My Games\Fallout4, or a Mod Organizer profile with its own
+        // copies (LocalSettings) next to the profile's plugins.txt. [Launcher] GameIniDir overrides both.
+        string GameIniDir()
+        {
+            string over = Ini.Get(settings, "Launcher", "GameIniDir", "");
+            if (over != "") return over;
+            string pt = Ini.Get(settings, "Launcher", "PluginsTxt", "");
+            if (pt != "") {
+                try {
+                    string d = Path.GetDirectoryName(pt);
+                    if (File.Exists(Path.Combine(d, "Fallout4Prefs.ini"))) return d;
+                } catch { }
+            }
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "My Games", "Fallout4");
+        }
+
+        // Read in the game's order: Fallout4.ini, then Prefs, then Custom (the last one that sets it wins).
+        static readonly string[] GameInis = { "Fallout4.ini", "Fallout4Prefs.ini", "Fallout4Custom.ini" };
+
+        // The value the game ends up with for a [General] number, -1 when no file sets it.
+        int GameIniValue(string key, out string where)
+        {
+            int value = -1;
+            where = "";
+            foreach (string name in GameInis) {
+                string f = Path.Combine(GameIniDir(), name);
+                if (!File.Exists(f)) continue;
+                int v;
+                if (int.TryParse(Ini.Get(f, "General", key, "").Trim(), out v)) { value = v; where = name; }
+            }
+            return value;
+        }
+
+        // Back to the game's own grid (5) in every file that raised it; a raised cell buffer goes back to 36.
+        // Each file is copied once to <name>.fathersfallout-backup first.
+        void FixLoadSettings()
+        {
+            int changed = 0;
+            try {
+                foreach (string name in GameInis) {
+                    string f = Path.Combine(GameIniDir(), name);
+                    if (!File.Exists(f)) continue;
+                    int grids, buffer;
+                    bool raisedGrids = int.TryParse(Ini.Get(f, "General", "uGridsToLoad", "").Trim(), out grids) && grids > 5;
+                    bool raisedBuffer = int.TryParse(Ini.Get(f, "General", "uExterior Cell Buffer", "").Trim(), out buffer) && buffer > 47;
+                    if (!raisedGrids && !raisedBuffer) continue;
+                    string backup = f + ".fathersfallout-backup";
+                    if (!File.Exists(backup)) File.Copy(f, backup);
+                    if (raisedGrids) Ini.Set(f, "General", "uGridsToLoad", "5");
+                    if (raisedGrids || raisedBuffer) Ini.Set(f, "General", "uExterior Cell Buffer", "36");
+                    changed++;
+                }
+            } catch (Exception e) {
+                Say("COULDN'T CHANGE THE GAME SETTINGS: " + e.Message.ToUpper());
+                return;
+            }
+            Refresh2();
+            Say(changed > 0 ? "LOAD SETTINGS FIXED (GRIDS 5). BACKUPS SAVED NEXT TO THE GAME'S INI FILES. RESTART THE GAME IF IT'S OPEN."
+                            : "NOTHING TO CHANGE.");
+        }
 
         string GameVersion()
         {
@@ -790,12 +905,19 @@ namespace F4MPLauncher
             foreach (var c in RunChecks()) {
                 // Things PLAY fixes by itself (the mod's version) or that only might matter (extra mods)
                 // are warnings, not failures.
-                bool soft = c.Label == "FATHERSFALLOUT" || c.Label == "MOD LIST";
+                bool soft = c.Label == "FATHERSFALLOUT" || c.Label == "MOD LIST" || c.Label == "LOAD SETTINGS";
                 var mark = AddText(c.Ok ? "[ OK ]" : (soft ? "[ !! ]" : "[FAIL]"), x, y, c.Ok ? Pip.Green : Pip.Amber, 10f);
                 var label = AddText(c.Label.PadRight(16, '.'), x + 64, y, c.Ok ? Pip.Mid : Pip.Amber, 10f);
                 var detail = AddText(c.Detail, x + 220, y, c.Ok ? Pip.Green : Pip.Amber, 10f);
                 checkRows.Add(mark); checkRows.Add(label); checkRows.Add(detail);
-                if (!c.Ok && c.Url != null) {
+                if (!c.Ok && c.Fix != null) {
+                    var fix = new LinkLabel { Text = "FIX IT >", AutoSize = true, BackColor = Color.Transparent, LinkColor = Pip.Amber,
+                        ActiveLinkColor = Pip.Green, Font = Pip.Font(10f, FontStyle.Bold), Location = new Point(W - 140, y) };
+                    Action act = c.Fix;
+                    fix.LinkClicked += delegate { act(); };
+                    Controls.Add(fix);
+                    checkRows.Add(fix);
+                } else if (!c.Ok && c.Url != null) {
                     var link = new LinkLabel { Text = "DOWNLOAD >", AutoSize = true, BackColor = Color.Transparent, LinkColor = Pip.Amber,
                         ActiveLinkColor = Pip.Green, Font = Pip.Font(10f, FontStyle.Bold), Location = new Point(W - 140, y) };
                     string url = c.Url;
@@ -803,7 +925,7 @@ namespace F4MPLauncher
                     Controls.Add(link);
                     checkRows.Add(link);
                 }
-                y += 24;
+                y += 22;   // 7 rows above the install button
             }
             LoadSaves();
         }
@@ -923,14 +1045,71 @@ namespace F4MPLauncher
             return t;
         }
 
+        // ---------- dedicated server ----------
+
+        static bool ServerRunning(string exeName)
+        {
+            try { return Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exeName)).Length > 0; } catch { return false; }
+        }
+
+        // The server program on its own, in its own window, from the same stable folder a host's game uses (so a
+        // Wasteland Wars server carries on the same war). config.json keeps everything else the owner set in it.
+        void StartDedicated()
+        {
+            string exeName = wars ? "FathersFalloutWarsServer.exe" : "FathersFalloutServer.exe";
+            if (!File.Exists(ServerExe())) { Say("THE LAUNCHER'S 'SERVER' FOLDER IS MISSING FATHERSFALLOUTSERVER.EXE."); return; }
+            if (ServerRunning(exeName) || (!wars && ServerRunning("F4MPServer.exe"))) {
+                Say("A " + (wars ? "WARS " : "") + "SERVER IS ALREADY RUNNING ON THIS PC. CLOSE ITS WINDOW AND TRY AGAIN.");
+                return;
+            }
+            int portNo;
+            if (!int.TryParse(port.Box.Text.Trim(), out portNo) || portNo < 1 || portNo > 65535) { Say("TYPE A PORT NUMBER (CAMPAIGN 7779, WARS 7790)."); return; }
+            if (password.Box.Text.Length > 31) { Say("THE PASSWORD CAN BE 31 CHARACTERS AT MOST."); return; }
+            SaveSettings();
+            string exe = StableServerExe(wars);
+            string dir = Path.GetDirectoryName(exe);
+            try {
+                string cfgFile = Path.Combine(dir, "config.json");
+                var json = new JavaScriptSerializer();
+                var cfg = File.Exists(cfgFile) ? json.Deserialize<Dictionary<string, object>>(File.ReadAllText(cfgFile)) : null;
+                if (cfg == null) {
+                    cfg = new Dictionary<string, object>();
+                    cfg["server-name"] = wars ? "FathersFallout Wasteland Wars" : "FathersFallout Server";
+                    cfg["master-server"] = "";
+                    cfg["ip"] = "127.0.0.1";
+                    cfg["run-as-service"] = false;
+                    cfg["player-limit"] = 100;
+                    cfg["tick-rate"] = 60;
+                    cfg["log-location"] = "./logs.log";
+                }
+                cfg["port"] = portNo;
+                cfg["world-owner"] = wars ? "" : owner.Box.Text.Trim();
+                File.WriteAllText(cfgFile, json.Serialize(cfg));
+            } catch (Exception e) {
+                Say("COULDN'T WRITE THE SERVER SETTINGS: " + e.Message.ToUpper());
+                return;
+            }
+            try {
+                // The password goes in the server's environment (not its command line, which other programs can read).
+                var psi = new ProcessStartInfo(exe, "--dedicated") { WorkingDirectory = dir, UseShellExecute = false };
+                psi.EnvironmentVariables["FF_SERVER_PASSWORD"] = password.Box.Text;
+                Process.Start(psi);
+                Say("SERVER RUNNING IN ITS OWN WINDOW - KEEP IT OPEN. TO PLAY HERE TOO: JOIN > BY IP > 127.0.0.1");
+                saveHint.Text = "ALLOW IT IN THE FIREWALL. ONLINE FRIENDS: FORWARD UDP " + portNo + ", SEND THEM MY IP.";
+            } catch (Exception e) {
+                Say("COULDN'T START THE SERVER: " + e.Message.ToUpper());
+            }
+        }
+
         void Play()
         {
+            if (dedicated) { StartDedicated(); return; }
             if (save == null) { Say("PICK A SAVE FIRST (OR MAKE ONE: NEW GAME, LEAVE VAULT 111, SAVE)."); return; }
             bool host = hostOpt.Selected;
             if (!host && viaSteam && !SteamGame()) { Say("THIS COPY OF FALLOUT 4 ISN'T ON STEAM (GOG?): CHOOSE BY IP."); return; }
             if (!host && !viaSteam && ip.Box.Text.Trim() == "") { Say("TYPE THE HOST'S IP ADDRESS."); return; }
             if (password.Box.Text.Length > 31) { Say("THE PASSWORD CAN BE 31 CHARACTERS AT MOST."); return; }
-            var failed = RunChecks().Where(c => !c.Ok && c.Label != "MOD LIST" && c.Label != "FATHERSFALLOUT").ToList();
+            var failed = RunChecks().Where(c => !c.Ok && c.Label != "MOD LIST" && c.Label != "FATHERSFALLOUT" && c.Label != "LOAD SETTINGS").ToList();
             if (failed.Count > 0) {
                 Say("MISSING: " + string.Join(", ", failed.Select(c => c.Label)) + ". USE THE DOWNLOAD LINKS ABOVE.");
                 return;

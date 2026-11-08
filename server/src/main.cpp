@@ -34,6 +34,7 @@ static volatile sig_atomic_t g_running = 1;
 // Wasteland Wars runs its own copy of the server, named FathersFalloutWarsServer.exe, from its own folder (own
 // config.json, port 7790): it never shares a server or a port with the campaign.
 static bool g_wars = false;
+static bool g_dedicated = false;   // --dedicated: runs on its own (launcher: DEDICATED SERVER), hands out the host role
 
 void SignalHandler(int signal) {
     g_running = 0;
@@ -62,6 +63,11 @@ int UMain() {
     GameServer::GetInstance().SetTickRate(Config::getInstance().TickRate);
     GameServer::GetInstance().SetPassword(Config::getInstance().Password);
     GameServer::GetInstance().SetWars(g_wars);
+    GameServer::GetInstance().SetDedicated(g_dedicated, Config::getInstance().WorldOwner);
+    if (g_dedicated)
+        spdlog::info("[Server] DEDICATED: {} - players join by IP on UDP port {}. Keep this window open.",
+            Config::getInstance().WorldOwner.empty() ? "the first player in hosts the shared world"
+                                                     : "'" + Config::getInstance().WorldOwner + "' hosts the shared world (their save carries on)", port);
 
     if (!GameServer::GetInstance().Initialize(port)) {
         spdlog::error("[Server] Failed to initialize server on port {}", port);
@@ -100,6 +106,9 @@ int main(int argc, char** argv) {
                                  "This program comes with ABSOLUTELY NO WARRANTY. \n"
                                  "This is free software, and you are welcome to redistribute it \n"
                                  "under certain conditions; read LICENSE and NOTICE for full details. \n \n");
+
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--dedicated") g_dedicated = true;
 
     // --alife-test <game hours>: runs the Wasteland Wars world that long at full speed, prints what happened, exits.
     for (int i = 1; i + 1 < argc; ++i)

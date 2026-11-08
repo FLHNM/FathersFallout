@@ -20,17 +20,22 @@ namespace F4MP::CrashLog
         std::atomic<bool> g_inside{ false };
         DWORD g_mainThread = 0;
         void* volatile g_lastReported = nullptr;   // where the last exception OnException wrote out happened
-        std::atomic<bool> g_closing{ false };      // the game was seen quitting (Main::quitGame)
+        std::atomic<bool> g_closing{ false };      // the game was seen quitting (Main::quitGame / resetGame)
+        std::atomic<ULONGLONG> g_menuSaveAt{ 0 };  // GetTickCount64 of the last save made with the pause menu open
 
         // Quitting to the desktop faults inside the game's own teardown on many PCs (Fallout4.exe+0x4CB273 on the
         // main thread right after the exit save, or in the CRT exit path): every player's log ended in GAME CRASHED.
         // Main::quitGame is set when the player picks Quit and stays set through the teardown.
+        // Quit to the main menu sets resetGame instead. Seen in testing: a guest picked Quit in the pause menu,
+        // the game saved and faulted 20 ms later in GFx::Value::ObjectRelease (menus being torn down) before
+        // either flag was seen: a fault within 3 s of a save made from the pause menu counts as quitting too.
         bool GameClosing()
         {
             if (g_closing.load()) return true;
+            if (const auto at = g_menuSaveAt.load(); at && GetTickCount64() - at < 3000) return true;
             auto* main = RE::Main::GetSingleton();
             if (!main || IsBadReadPtr(main, sizeof(RE::Main))) return false;
-            return main->quitGame;
+            return main->quitGame || main->resetGame;
         }
 
         // No allocation, no logger locks (the crash may have happened inside either): plain WriteFile.
@@ -191,10 +196,22 @@ namespace F4MP::CrashLog
     void NoteFrame()
     {
         if (g_closing.load()) return;
-        if (auto* main = RE::Main::GetSingleton(); main && main->quitGame) {
+        if (auto* main = RE::Main::GetSingleton(); main && (main->quitGame || main->resetGame)) {
             g_closing = true;
-            REX::INFO("[FathersFallout] game is closing (quit)");
+            REX::INFO("[FathersFallout] game is closing ({})", main->quitGame ? "quit" : "quit to main menu");
         }
+    }
+
+    void NoteSave()
+    {
+        auto* ui = RE::UI::GetSingleton();
+        if (ui && ui->GetMenuOpen("PauseMenu")) g_menuSaveAt = GetTickCount64();
+    }
+
+    void NoteGameLoaded()
+    {
+        g_closing = false;   // back from the main menu into a game: a later fault is a crash again
+        g_menuSaveAt = 0;
     }
 
     void Reassert()

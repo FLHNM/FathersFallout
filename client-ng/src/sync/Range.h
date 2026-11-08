@@ -22,6 +22,9 @@ namespace F4MP::Range
             if (grids < 5) grids = 5;
             REX::INFO("[FathersFallout] uGridsToLoad {} -> sync radius {:.0f} units (~{:.0f} m)", grids,
                 (grids / 2) * kCellSize, (grids / 2) * kCellSize * 0.01428f);
+            // 9 made one host's loads 31-36 s instead of 13-14 s in testing; the launcher offers the fix.
+            if (grids > 5)
+                REX::WARN("[FathersFallout] uGridsToLoad {} is above the game's 5: loading screens take much longer (launcher: LOAD SETTINGS > FIX)", grids);
         }
         return grids;
     }
