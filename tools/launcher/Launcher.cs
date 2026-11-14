@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("FatherLamb")]
 [assembly: AssemblyCopyright("Copyright (C) 2026 FatherLamb")]
 [assembly: AssemblyTrademark("FathersFallout and FatherLamb are names reserved by FatherLamb")]
-[assembly: AssemblyVersion("0.28.0.0")]
-[assembly: AssemblyFileVersion("0.28.0.0")]
+[assembly: AssemblyVersion("0.29.0.0")]
+[assembly: AssemblyFileVersion("0.29.0.0")]
 
 namespace F4MPLauncher
 {
@@ -204,7 +204,7 @@ namespace F4MPLauncher
         }
     }
 
-    class MainForm : Form
+    partial class MainForm : Form
     {
         const int W = 1000, H = 640, LeftW = 340, TitleH = 34;
 
@@ -715,7 +715,11 @@ namespace F4MPLauncher
                 return c;
             };
             bool game = gameDir != "" && File.Exists(Path.Combine(gameDir, "Fallout4.exe"));
-            add("FALLOUT 4", game, game ? GameVersion() : "NOT FOUND - USE [ GAME FOLDER ]", null);
+            // A game that isn't 1.11.240 (old-gen downgrade, Game Pass, a newer patch) makes f4se_loader quit at once:
+            // PLAY flashed a console and nothing started while every check was green (2026-11-13 report).
+            string ver = game ? GameVersion() : "";
+            bool rightVer = game && !ver.Contains("NEEDS");
+            add("FALLOUT 4", rightVer, !game ? "NOT FOUND - USE [ GAME FOLDER ]" : ver, null);
             if (!game) return list;
             bool f4se = File.Exists(Path.Combine(gameDir, "f4se_loader.exe")) && File.Exists(Path.Combine(gameDir, "f4se_1_11_240.dll"));
             add("F4SE", f4se, f4se ? "INSTALLED" : "MISSING - LOADER + DLL GO NEXT TO FALLOUT4.EXE", "https://f4se.silverlock.org/");
@@ -1110,6 +1114,11 @@ namespace F4MPLauncher
             if (!host && !viaSteam && ip.Box.Text.Trim() == "") { Say("TYPE THE HOST'S IP ADDRESS."); return; }
             if (password.Box.Text.Length > 31) { Say("THE PASSWORD CAN BE 31 CHARACTERS AT MOST."); return; }
             var failed = RunChecks().Where(c => !c.Ok && c.Label != "MOD LIST" && c.Label != "FATHERSFALLOUT" && c.Label != "LOAD SETTINGS").ToList();
+            var wrongGame = failed.FirstOrDefault(c => c.Label == "FALLOUT 4" && c.Detail.Contains("NEEDS"));
+            if (wrongGame != null) {
+                Say("FALLOUT 4 IS " + wrongGame.Detail + ": F4SE AND THE MOD ONLY RUN ON 1.11.240 (THE CURRENT STEAM VERSION). A DOWNGRADED OR OLDER GAME WON'T START.");
+                return;
+            }
             if (failed.Count > 0) {
                 Say("MISSING: " + string.Join(", ", failed.Select(c => c.Label)) + ". USE THE DOWNLOAD LINKS ABOVE.");
                 return;
@@ -1144,16 +1153,73 @@ namespace F4MPLauncher
                 Ini.Set(ini, "Launch", "LoadSave", save.Name);
             }
 
+            if (Process.GetProcessesByName("Fallout4").Length > 0) { Say("FALLOUT 4 IS ALREADY RUNNING: CLOSE IT FIRST, THEN PRESS PLAY."); return; }
+            if (SteamGame() && Process.GetProcessesByName("steam").Length == 0) {
+                // The Steam copy restarts itself through Steam (without F4SE) when Steam is closed.
+                try { Process.Start(new ProcessStartInfo("steam://open/main") { UseShellExecute = true }); } catch { }
+                Say("STEAM ISN'T RUNNING. STARTING IT: LOG IN, THEN PRESS PLAY AGAIN.");
+                return;
+            }
             string exe = Ini.Get(settings, "Launcher", "LaunchExe", Path.Combine(gameDir, "f4se_loader.exe"));
             string args = Ini.Get(settings, "Launcher", "LaunchArgs", "");
             try {
                 var psi = new ProcessStartInfo(exe, args) { WorkingDirectory = Path.GetDirectoryName(exe), UseShellExecute = true };
+                DateTime started = DateTime.Now;
                 Process.Start(psi);
+                WatchLaunch(started);
                 if (wars && save.NewWar) Say("STARTING FALLOUT 4... A NEW WAR BEGINS. YOU COULD START ANYWHERE.");
                 else Say("STARTING FALLOUT 4... LOADING " + save.Player.ToUpper() + " AND " + (host ? "HOSTING." : viaSteam ? "JOINING THROUGH STEAM." : "JOINING.") + " GOOD LUCK OUT THERE.");
             } catch (Exception e) {
                 Say("COULDN'T START THE GAME: " + e.Message.ToUpper());
             }
+        }
+    }
+
+    partial class MainForm
+    {
+        // PLAY starts f4se_loader (a console program) that starts Fallout4.exe and quits. If the game never shows up,
+        // say why instead of leaving the player with a flashed console window and nothing else.
+        Timer launchWatch;
+        void WatchLaunch(DateTime started)
+        {
+            if (launchWatch != null) { launchWatch.Stop(); launchWatch.Dispose(); }
+            launchWatch = new Timer { Interval = 1000 };
+            int seconds = 0;
+            launchWatch.Tick += (o, e) => {
+                seconds++;
+                if (Process.GetProcessesByName("Fallout4").Length > 0) { launchWatch.Stop(); return; }
+                if (seconds < 30) return;
+                launchWatch.Stop();
+                Say("FALLOUT 4 DIDN'T START. " + LoaderProblem(started));
+            };
+            launchWatch.Start();
+        }
+
+        // The reason from F4SE's own log (Documents\My Games\Fallout4\F4SE4se_loader.log), when it wrote one.
+        string LoaderProblem(DateTime started)
+        {
+            try {
+                string log = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "My Games", "Fallout4", "F4SE", "f4se_loader.log");
+                if (!File.Exists(log) || File.GetLastWriteTime(log) < started.AddSeconds(-2))
+                    return "F4SE WROTE NO LOG: YOUR ANTIVIRUS MAY HAVE BLOCKED F4SE_LOADER.EXE (ALLOW IT), OR RUN F4SE_LOADER.EXE FROM THE GAME FOLDER ONCE TO SEE ITS MESSAGE.";
+                string[] lines = File.ReadAllLines(log);
+                string text = string.Join(" ", lines).ToLower();
+                if (text.Contains("unsupported") || text.Contains("please update"))
+                    foreach (string l in lines.Reverse())
+                        if (l.ToLower().Contains("unsupported") || l.ToLower().Contains("please update") || l.ToLower().Contains("runtime"))
+                            return "F4SE SAYS: " + l.Trim().ToUpper() + " - THE MOD NEEDS FALLOUT 4 1.11.240 WITH F4SE 0.7.6 OR NEWER.";
+                if (text.Contains("winstore") || text.Contains("microsoft store") || text.Contains("game pass"))
+                    return "THE GAME PASS / MICROSOFT STORE COPY CAN'T RUN F4SE: THE STEAM OR GOG COPY IS NEEDED.";
+                if (text.Contains("couldn't find") || text.Contains("not found") || text.Contains("missing"))
+                    foreach (string l in lines.Reverse())
+                        if (l.ToLower().Contains("couldn't") || l.ToLower().Contains("not found") || l.ToLower().Contains("missing"))
+                            return "F4SE SAYS: " + l.Trim().ToUpper();
+                string last = lines.Where(l => l.Trim() != "").LastOrDefault() ?? "";
+                if (last.Trim() == "launching")
+                    return "F4SE STARTED IT BUT THE GAME CLOSED AT ONCE: CHECK THAT STEAM IS LOGGED IN AND FALLOUT 4 STARTS FROM STEAM, THEN TRY AGAIN.";
+                return "F4SE'S LAST WORDS: " + last.Trim().ToUpper() + " (FULL LOG: DOCUMENTS/MY GAMES/FALLOUT4/F4SE/F4SE_LOADER.LOG)";
+            } catch { return "SEE DOCUMENTS/MY GAMES/FALLOUT4/F4SE/F4SE_LOADER.LOG."; }
         }
     }
 

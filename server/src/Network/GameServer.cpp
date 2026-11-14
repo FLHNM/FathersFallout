@@ -6,6 +6,11 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+
+namespace {
+    constexpr const char* kUnlockedPath = "./wars_unlocked.txt";   // Wars: unlocked doors/containers (Update 29)
+}
 
 namespace {
     constexpr int kHandshakeSeconds = 10;        // a connection must say who it is within this
@@ -92,6 +97,12 @@ bool GameServer::Initialize(uint16_t port) {
         m_teams = std::make_unique<Wars::Teams>();
         m_teams->Load(Wars::kTeamsPath);
         StartALife();
+        if (FILE* f = std::fopen(kUnlockedPath, "r")) {
+            unsigned int r = 0;
+            while (std::fscanf(f, "%X", &r) == 1) m_unlocked.insert(r);
+            std::fclose(f);
+            spdlog::info("[Locks] {} unlocked doors/containers remembered", m_unlocked.size());
+        }
     }
     m_running = true;
 
@@ -396,6 +407,67 @@ void GameServer::RelayCoop(HSteamNetConnection conn, MessageType type, const voi
     const uint32_t sender = it->second.id;
     memcpy(data.data(), &sender, sizeof(sender));
     BroadcastMessage(type, data.data(), size, sender);
+    // Update 29: unlocks are remembered; door questions also get the server's answer from that memory.
+    constexpr uint16_t kLockChanged = 109, kDoorStateReq = 114;
+    if (static_cast<uint16_t>(type) == kLockChanged && size >= 9) {
+        uint32_t ref = 0;
+        memcpy(&ref, data.data() + 4, 4);
+        RememberLock(ref, data[8] != 0);
+    } else if (static_cast<uint16_t>(type) == kDoorStateReq) {
+        AnswerDoorsFromMemory(sender, data.data(), size);
+    }
+}
+
+void GameServer::RememberLock(uint32_t a_ref, bool a_locked) {
+    if (a_ref == 0 || a_ref >= 0xFF000000u) return;   // runtime references differ per game
+    if (!a_locked && m_unlocked.size() >= 50000) return;   // a bad client can't grow it (and the file) for ever
+    const bool changed = a_locked ? m_unlocked.erase(a_ref) > 0 : m_unlocked.insert(a_ref).second;
+    if (!changed) return;
+    spdlog::info("[Locks] {:#x} {} ({} unlocked remembered)", a_ref, a_locked ? "locked again" : "unlocked", m_unlocked.size());
+    if (!m_wars) return;
+    if (FILE* f = std::fopen(kUnlockedPath, "w")) {
+        for (uint32_t r : m_unlocked) std::fprintf(f, "%08X\n", r);
+        std::fclose(f);
+    }
+}
+
+void GameServer::AnswerDoorsFromMemory(uint32_t a_asker, const uint8_t* a_payload, uint32_t a_size) {
+    // CoopDoorStateReqMsg: senderId, count, refs[48]. Reply CoopDoorStateMsg: senderId 0, targetId, count, entries
+    // {ref, open 0 = unknown, locked 1 = no, pad[0] 1 = "loaded there"}.
+    constexpr uint32_t kMax = 48;
+    if (m_unlocked.empty() || a_size < 8) return;
+    uint32_t count = 0;
+    memcpy(&count, a_payload + 4, 4);
+    count = std::min(count, std::min(kMax, (a_size - 8) / 4));
+    std::vector<uint8_t> out(12 + kMax * 8, 0);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t ref = 0;
+        memcpy(&ref, a_payload + 8 + i * 4, 4);
+        if (!m_unlocked.count(ref)) continue;
+        uint8_t* e = out.data() + 12 + n * 8;
+        memcpy(e, &ref, 4);
+        e[4] = 0;   // open: unknown
+        e[5] = 1;   // locked: no
+        e[6] = 1;   // as if loaded there
+        ++n;
+    }
+    if (!n) return;
+    memcpy(out.data() + 4, &a_asker, 4);
+    memcpy(out.data() + 8, &n, 4);
+    constexpr uint16_t kDoorState = 115;
+    // m_clientsMutex is held by RelayCoop: send straight to the connection.
+    for (const auto& [conn, client] : m_clients) {
+        if (client.id != a_asker || !client.isConnected) continue;
+        MessageHeader header;
+        header.type = static_cast<MessageType>(kDoorState);
+        header.size = static_cast<uint32_t>(sizeof(MessageHeader) + out.size());
+        header.timestamp = 0;
+        std::vector<uint8_t> buffer(header.size);
+        memcpy(buffer.data(), &header, sizeof(MessageHeader));
+        memcpy(buffer.data() + sizeof(MessageHeader), out.data(), out.size());
+        m_sockets->SendMessageToConnection(conn, buffer.data(), (uint32_t)buffer.size(), k_nSteamNetworkingSend_Reliable, nullptr);
+    }
 }
 
 void GameServer::HandlePlayerAppearance(HSteamNetConnection conn, const PlayerAppearanceMsg* msg) {

@@ -35,6 +35,11 @@ namespace F4MP::Wars
     bool TakeNewWar();
     void GiveKit();   // a fresh character's kit (new war, after dying)
     uint32_t RandomStart();   // a map marker somewhere quiet: where a new war starts, where you get up without a claim
+    // The bed you last lay down in (Update 29): where you get up after dying. Kept in this save's Wars record.
+    void SetBed(uint32_t a_ref);              // also remembers where it is (a far bed's reference isn't loaded)
+    uint32_t Bed();
+    bool BedPlace(RE::NiPoint3& a_at, uint32_t& a_space);
+    uint32_t NearestStart(const RE::NiPoint3& a_at);   // the start marker closest to a spot (Commonwealth)
     void StartNewWar(std::function<void()> a_ready);
 
     // After a save loaded. False = don't connect (a campaign save in Wars mode, or a Wars save in campaign mode).

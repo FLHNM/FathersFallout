@@ -103,7 +103,12 @@ about a minute.
   enemies and NPCs, deaths, explosions, doors and switches (gates a quest opened for one player
   open for everyone), items you drop for each other, containers (including the ones you build at
   settlements), building / moving / scrapping in workshops, power wires, settlers' jobs, quest progress,
-  time of day and weather.
+  time of day and weather, and unlocked doors and containers (the server remembers them for players who join later).
+- **Down, not dead (Update 29):** while playing together, the hit that would kill you puts you **down**
+  instead. A friend revives you by **crouching beside you for 3 seconds**. A window gives you the choices:
+  **RESPAWN AT HOST** (guests get up next to the host), **LOAD LAST SAVE** (the game's own death) or wait
+  for a friend. If nobody comes in 90 seconds, guests respawn at the host and the host's last save loads.
+  Switch it off in **F1 → Sync** ("Down, not dead").
 - **Voice chat:** hold **N** to talk to the players around you (push to talk). Voices fade with distance
   (silent by about 45 m), come from the side the speaker is on, and only carry where you are (the same
   building, or outdoors together). **F1 → Voice chat:** change the talk key (any key or mouse button),
@@ -118,7 +123,9 @@ A separate game mode: Rust, in Fallout 4's Commonwealth, with no story. It never
 - You start at a random settlement. Read the note and press OK.
 - It's played in the game's **Survival** mode: eat, drink and sleep. **Sleeping in a bed saves your game**, and so does quitting from the menu. There's no fast travel.
 - Press **F1** to start a crew or pick a side. Clear a settlement and hold its workbench for 30 seconds to take it.
-- If you die, your gear stays in a bag where you fell.
+- If you die, your gear stays in a bag where you fell. The HUD tells you how far away it is and in which direction until you empty it. Your crew (or your faction) can revive you first: you're down, not dead, for 60 seconds.
+- You get up at the **last bed you slept in**, even far away.
+- **F1 → Camp → SET UP CAMP HERE** puts down a camp kit where you stand: a sleeping bag (your respawn point), a cooking fire, a weapons workbench and a stash. **MOVE CAMP HERE** / **PACK UP CAMP** take it with you.
 
 ## 6. Something went wrong?
 

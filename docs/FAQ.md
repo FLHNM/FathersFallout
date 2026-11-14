@@ -68,6 +68,13 @@ the same mods, or base game + DLC only. Texture or mesh mods without plugins are
 Bug reports on GitHub are **public**, which is why the launcher cleans the log first. Have a quick
 look at the file before posting if you want to be sure. (A free GitHub account is needed to post.)
 
+## I press PLAY and the game doesn't start
+
+Since Update 29 the launcher tells you why after about 30 seconds, from F4SE's own log: a game version
+other than 1.11.240, an antivirus blocking F4SE, or a Game Pass / Microsoft Store copy (not supported).
+The **FALLOUT 4** line in the system check also turns red when the game version is wrong. Still stuck?
+Press **[ SHARE LOG ]** and [open an issue](https://github.com/FLHNM/FathersFallout/issues/new?template=bug_report.yml).
+
 ## Loading screens take ages
 
 Check the launcher's **LOAD SETTINGS** line (Update 28). If it says the grids are above 5, a tweak

@@ -328,6 +328,13 @@ namespace F4MP::Wars::Teams
         return false;
     }
 
+    void Bridge(const std::string& a_what)
+    {
+        // testing: "side <0-3>" sides with that faction, "solo" plays alone.
+        if (a_what.rfind("side ", 0) == 0) Send(2, static_cast<uint8_t>(std::atoi(a_what.c_str() + 5)));
+        else if (a_what == "solo") Send(1);
+    }
+
     bool Friendly(uint32_t a_player)
     {
         std::lock_guard lock(g_lock);

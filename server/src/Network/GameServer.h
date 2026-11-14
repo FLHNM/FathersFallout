@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <queue>
 #include <mutex>
@@ -412,6 +413,11 @@ private:
     struct RadioTune { uint16_t freq = 0; bool on = true; bool chatter = true; };
     std::unordered_map<uint32_t, RadioTune> m_radioTune;
     std::unordered_map<uint32_t, std::unordered_map<int, uint32_t>> m_campsSent;
+    // Doors and containers a player unlocked (plugin reference FormIDs; Update 29). The server answers door questions
+    // from it, so an unlock reaches players who arrive later or weren't near. Wars keeps it in wars_unlocked.txt.
+    std::unordered_set<uint32_t> m_unlocked;
+    void RememberLock(uint32_t a_ref, bool a_locked);
+    void AnswerDoorsFromMemory(uint32_t a_asker, const uint8_t* a_payload, uint32_t a_size);
 
     std::queue<std::string> m_commands;
     std::mutex m_cmdMutex;

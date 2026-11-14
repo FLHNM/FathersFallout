@@ -37,6 +37,7 @@ namespace F4MP::Coop
         bool combatAnims = true; // show other players' shots, swings, aiming and reloads
         bool building = true;    // settlement building, doors and switches
         bool friendlyFire = false; // campaign: other players' hits hurt me ([Sync] FriendlyFire, off since Update 28). Wars ignores it
+        bool downNotDead = true;  // a killing blow puts you down: friends revive, or respawn at host ([Sync] DownNotDead, Update 29)
         bool realTimeVats = true; // VATS doesn't slow time while playing together, like Fallout 76 ([Sync] RealTimeVATS)
         bool hitTrace = false;   // [Debug] BodyTrace: log every hit by/on a player, dump the appearance we send
     };

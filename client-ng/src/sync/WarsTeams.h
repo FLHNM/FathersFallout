@@ -23,4 +23,5 @@ namespace F4MP::Wars::Teams
     bool TagOf(uint32_t a_player, std::string& a_tag, uint32_t& a_abgr);
     // Their hits on us don't count: same crew, or the same faction.
     bool Friendly(uint32_t a_player);
+    void Bridge(const std::string& a_what);   // testing: side <n> | solo
 }

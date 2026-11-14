@@ -5,6 +5,8 @@
 #include "pch.h"
 #include <functional>
 #include "F4SEMenuFramework.h"
+#include "sync/Downed.h"
+#include "sync/WarsMyCamp.h"
 #include "network/NetworkClient.h"
 #include "network/SteamLink.h"
 #include "sync/WorldPause.h"
@@ -1065,6 +1067,12 @@ namespace F4MP
                         REX::INFO("[FURN] body of player {} ({:#x}): furniture {:#x}, at {:.0f} {:.0f} {:.0f}", pid, fid,
                             furn ? furn->GetFormID() : 0u, a ? a->GetPosition().x : 0.f, a ? a->GetPosition().y : 0.f, a ? a->GetPosition().z : 0.f);
                     }
+                    continue;
+                }
+                // Down, not dead (Update 29): "f4mp:down" [revive|respawn|giveup].
+                if (cmd.rfind("f4mp:down", 0) == 0) {
+                    std::string what = cmd.size() > 10 ? cmd.substr(10) : "";
+                    if (auto* tasks = F4SE::GetTaskInterface()) tasks->AddTask([what]() { Downed::Bridge(what); });
                     continue;
                 }
                 // Wasteland Wars test helpers: "f4mp:wars <what>".
@@ -3031,7 +3039,11 @@ namespace F4MP
         auto host = players.find(Authority::HostId());
         const auto here = pl->GetPosition();
         const auto npcs = net.GetRemoteNpcs();
-        if (host == players.end() || npcs.empty() || host->second.cellId != Authority::LocalSpace()) {
+        // A host in a menu (looting, Pip-Boy) hands its area to us and stops sending it: everything looked missing
+        // from its world and got hidden - the body the host was looting vanished on the guest's screen and came back
+        // when the menu closed (2026-11-13 report). Paused includes Authority's 2 s grace after the menu.
+        if (host == players.end() || npcs.empty() || host->second.cellId != Authority::LocalSpace() ||
+            Authority::IsPaused(Authority::HostId())) {
             s_since = now; s_missing.clear(); return;
         }
         const float hx = host->second.x - here.x, hy = host->second.y - here.y;
@@ -3838,6 +3850,8 @@ namespace F4MP
     {
         auto& net = Network::NetworkClient::GetInstance();
         ImGuiMCP::TextDisabled("FathersFallout by FatherLamb - Copyright (C) 2026 FatherLamb");
+        Downed::RenderMenu();
+        Wars::MyCamp::RenderMenu();
         RenderPlayTogether();
         RenderCharacters();
         if (Wars::Mode()) Wars::Teams::RenderMenu();
@@ -3859,6 +3873,8 @@ namespace F4MP
         ImGuiMCP::Checkbox("Show other players' attacks, aiming and reloads", &cs.combatAnims);
         if (!Wars::Mode())   // Wars: other sides always can, crewmates never
             ImGuiMCP::Checkbox("Friendly fire (other players' shots and swings can hurt me)", &cs.friendlyFire);
+        ImGuiMCP::Checkbox(Wars::Mode() ? "Down, not dead: my crew can revive me" : "Down, not dead: friends can revive me, or I respawn at the host",
+            &cs.downNotDead);
         ImGuiMCP::Checkbox("Real-time VATS (targeting doesn't slow time, so the others aren't left waiting)", &cs.realTimeVats);
         if (Coop::IsLoadOrderMismatch())
             ImGuiMCP::TextColored(ImGuiMCP::ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
@@ -4013,6 +4029,8 @@ namespace F4MP
         F4SEMenuFramework::AddSectionItem("Menu", RenderMenu);
         F4SEMenuFramework::AddHudElement(RenderHud);
         Wars::Teams::Init();   // Wasteland Wars: the choose-your-side window
+        Downed::Install();     // Update 29: the "you're down" window
+        Downed::SetGoToHost([](bool a_quiet) { return GoToHost(a_quiet); });
         REX::INFO("[FathersFallout] menu + HUD registered");
     }
 
@@ -4043,6 +4061,7 @@ namespace F4MP
             g_travelOnJoin = GetPrivateProfileIntA(Wars::ConnectSection(), "TravelOnJoin", 1, ini) != 0;
             // Off by default since Update 28.
             Coop::GetSettings().friendlyFire = GetPrivateProfileIntA("Sync", "FriendlyFire", 0, ini) != 0;
+            Coop::GetSettings().downNotDead = GetPrivateProfileIntA("Sync", "DownNotDead", 1, ini) != 0;
             Coop::GetSettings().realTimeVats = GetPrivateProfileIntA("Sync", "RealTimeVATS", 1, ini) != 0;
         }
         if (!GetPrivateProfileIntA(Wars::ConnectSection(), "AutoConnect", 0, ini)) return;

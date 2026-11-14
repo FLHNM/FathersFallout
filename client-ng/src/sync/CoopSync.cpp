@@ -25,6 +25,8 @@
 #include "sync/Voice.h"
 #include "sync/WorldPause.h"
 #include "sync/Dialogue.h"
+#include "sync/Downed.h"
+#include "sync/WarsMyCamp.h"
 
 #include <algorithm>
 #include <atomic>
@@ -287,8 +289,9 @@ namespace F4MP::Coop
         // flags on inventory stacks are not set for NPC bodies (verified in game: always empty),
         // so we track our own changes instead of reading equip state back.
         std::unordered_map<uint32_t, std::vector<uint32_t>> g_appliedEquip;
-        struct EquipVerify { Clock::time_point at; int round = 0; };
+        struct EquipVerify { Clock::time_point at; int round = 0; bool periodic = false; };
         std::unordered_map<uint32_t, EquipVerify> g_equipVerify;   // body FormID -> check its clothing then
+        std::unordered_map<uint32_t, int> g_periodicFixes;          // body FormID -> fixes found by the 10 s check
 
         void PollLocalEquipment()
         {
@@ -380,6 +383,19 @@ namespace F4MP::Coop
                 // guest took off a jumpsuit and the body had nothing on at all, then only the jumpsuit when it went
                 // back on (players saw that player invisible until a Pip-Boy close rebuilt the body). Checked 1.5 s
                 // after a change: missing clothing is put on again, and a body still wrong after that is rebuilt.
+                // Update 29: also every 10 s without a change - "naked while clothed" kept being reported, e.g. after a
+                // body's 3D was rebuilt by a cell load, where nothing had changed so nothing was checked.
+                {
+                    static std::unordered_map<uint32_t, Clock::time_point> s_periodic;
+                    auto& next = s_periodic[bodyId];
+                    if (Clock::now() >= next) {
+                        next = Clock::now() + std::chrono::seconds(10);
+                        // At most 6 fixes per body from these checks: a game that never reports a body's worn items
+                        // must not have its bodies re-dressed every 10 s.
+                        if (applied != g_appliedEquip.end() && !g_equipVerify.contains(bodyId) && g_periodicFixes[bodyId] < 6)
+                            g_equipVerify[bodyId] = { Clock::now(), 0, true };
+                    }
+                }
                 if (auto v = g_equipVerify.find(bodyId); v != g_equipVerify.end() && Clock::now() >= v->second.at &&
                     applied != g_appliedEquip.end()) {
                     const auto has = CollectEquipped(body);
@@ -393,6 +409,7 @@ namespace F4MP::Coop
                     if (missing.empty()) {
                         g_equipVerify.erase(v);
                     } else if (v->second.round == 0) {
+                        if (v->second.periodic) ++g_periodicFixes[bodyId];
                         for (auto* obj : missing) {
                             if (body->GetInventoryObjectCount(obj) == 0) AddItems(body, obj, 1);
                             RE::BGSObjectInstance inst(obj, nullptr);
@@ -665,6 +682,7 @@ namespace F4MP::Coop
             // Health alone can sit at 0 without the player dying; the real hit would have killed.
             // Wasteland Wars: no game death - the Wars death (loot bag, respawn) takes it from here.
             if (left <= 0.0f && Wars::Live()) return;
+            if (left <= 0.0f && Downed::HoldsDeath()) return;   // campaign: down, not dead (the clamp keeps 1 health)
             if (left <= 0.0f && !pl->IsDead(false)) {
                 // Only a real PvP shot names the other player's body as the killer (an NPC's kill credited to
                 // the friend's body: 's "killed by player 1").
@@ -1601,7 +1619,7 @@ namespace F4MP::Coop
         // ---------- locks (player -> all) ----------
         // A door or container someone picked open stayed locked for the other player (and the replayed
         // door opening did nothing). Locks the player touches are watched for a while; a change goes out.
-        struct LockWatch { bool locked; Clock::time_point until; };
+        struct LockWatch { bool locked; Clock::time_point until; bool scanned = false; };
         std::unordered_map<uint32_t, LockWatch> g_lockWatch;
 
         bool IsLockedNow(RE::TESObjectREFR* ref)
@@ -1613,18 +1631,42 @@ namespace F4MP::Coop
         void WatchLock(RE::TESObjectREFR* ref)
         {
             if (!ref || !ref->GetLock() || !IsSyncableRef(ref->GetFormID())) return;
-            g_lockWatch[ref->GetFormID()] = { IsLockedNow(ref), Clock::now() + std::chrono::minutes(2) };
+            g_lockWatch[ref->GetFormID()] = { IsLockedNow(ref), Clock::now() + std::chrono::minutes(2), false };
         }
 
         void PollLocks()
         {
             const auto now = Clock::now();
+            // Update 29: every lock near us is watched, not only the ones our player activated. A terminal, a key
+            // found later, a quest script or the console unlocked doors that never reached the others (Wars report:
+            // "doors unlocked by one player should be unlocked for all").
+            static Clock::time_point s_scan{};
+            if (now - s_scan > std::chrono::seconds(1)) {
+                s_scan = now;
+                auto* pl = RE::PlayerCharacter::GetSingleton();
+                auto* tes = RE::TES::GetSingleton();
+                if (pl && tes && pl->parentCell)
+                    tes->ForEachReferenceInRange(pl->GetPosition(), 3000.0f, [&](RE::TESObjectREFR* ref) {
+                        if (!ref || !ref->GetLock() || !IsSyncableRef(ref->GetFormID()) || ref->IsDisabled() || !ref->Get3D())
+                            return RE::BSContainer::ForEachResult::kContinue;
+                        auto* base = ref->GetObjectReference();
+                        const auto type = base ? base->GetFormType() : RE::ENUM_FORM_ID::kNONE;
+                        if (type != RE::ENUM_FORM_ID::kDOOR && type != RE::ENUM_FORM_ID::kCONT)
+                            return RE::BSContainer::ForEachResult::kContinue;
+                        auto [w, fresh] = g_lockWatch.try_emplace(ref->GetFormID(), LockWatch{ IsLockedNow(ref), now, true });
+                        w->second.until = (std::max)(w->second.until, now + std::chrono::seconds(30));
+                        return RE::BSContainer::ForEachResult::kContinue;
+                    });
+            }
             for (auto it = g_lockWatch.begin(); it != g_lockWatch.end();) {
                 auto* ref = LookupForm<RE::TESObjectREFR>(it->first);
                 if (!ref || now > it->second.until) { it = g_lockWatch.erase(it); continue; }
                 const bool locked = IsLockedNow(ref);
                 if (locked != it->second.locked) {
                     it->second.locked = locked;
+                    // Found by the area scan (not a lock our player used): only unlocks go out. A quest script or
+                    // a cell reset locking a door in our world mustn't lock the others out (review).
+                    if (locked && it->second.scanned) { ++it; continue; }
                     CoopLockChangedMsg msg{};
                     msg.refFormId = it->first;
                     msg.locked = locked ? 1 : 0;
@@ -2724,6 +2766,15 @@ namespace F4MP::Coop
             case MessageType::CoopLockChanged:
                 if (auto* m = As<CoopLockChangedMsg>(item); m && g_settings.items) OnLockChanged(*m);
                 break;
+            case MessageType::CoopDowned:
+                if (auto* m = As<CoopDownedMsg>(item)) Downed::OnDowned(*m);
+                break;
+            case MessageType::CoopRevive:
+                if (auto* m = As<CoopReviveMsg>(item)) Downed::OnRevive(*m);
+                break;
+            case MessageType::WarsPlayerCamp:
+                if (auto* m = As<WarsPlayerCampMsg>(item)) Wars::MyCamp::OnRemote(*m);
+                break;
             case MessageType::CoopDoorStateReq:
                 if (auto* m = As<CoopDoorStateReqMsg>(item); m && g_settings.building) OnDoorStateReq(*m);
                 break;
@@ -2872,6 +2923,7 @@ namespace F4MP::Coop
         { SlowWatch w("dynamic actors"); DynamicActors::ClientTick(); }
         { SlowWatch w("activity"); Activity::Tick(); }
         { SlowWatch w("dialogue"); Dialogue::Tick(); }
+        Downed::Tick();
 
         const auto now = Clock::now();
         if (g_settings.quests && now - g_lastQuestPoll >= std::chrono::milliseconds(500)) {
@@ -2904,6 +2956,7 @@ namespace F4MP::Coop
 
     void OnGameLoaded()
     {
+        Downed::Reset();   // a down state never carries into another save
         g_loadedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
     }
 
@@ -2936,6 +2989,8 @@ namespace F4MP::Coop
         g_deathReported.clear();
         Explosions::Reset();
         Dialogue::Reset();   // the player's own subtitle settings back
+        Downed::Reset();
+        Wars::MyCamp::Reset();
         g_pendingSnapshot.clear();
         g_questStages.clear();
         g_questBacklog.clear();

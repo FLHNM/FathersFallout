@@ -7,6 +7,8 @@
 #include "sync/Range.h"
 #include "sync/WarsSquads.h"
 #include "sync/WarsDeath.h"
+#include "sync/WarsMyCamp.h"
+#include "sync/WarsTeams.h"
 #include "sync/WarsVoice.h"
 
 #include <Windows.h>
@@ -29,6 +31,9 @@ namespace F4MP::Wars
         bool g_mode = false;                 // set once at plugin load
         bool g_newWar = false;               // [Launch] NewWar=1, taken at the main menu
         std::atomic<bool> g_world{ false };  // the loaded save is a Wars world
+        std::atomic<uint32_t> g_bed{ 0 };    // the bed we last lay down in (respawn point), saved in the Wars record
+        RE::NiPoint3 g_bedAt{};              // ...and where it is: far away its (placed) reference isn't in memory
+        uint32_t g_bedSpace = 0;
         std::atomic<bool> g_tickRunning{ false };
         std::atomic<bool> g_newWarCancelled{ false };   // a save loaded while a new war waited for the mirror
 
@@ -467,23 +472,93 @@ namespace F4MP::Wars
     void OnSave(const F4SE::SerializationInterface* a_intfc)
     {
         if (!g_world) return;   // campaign saves get no Wars record at all
-        if (!a_intfc->OpenRecord(kRecord, 1)) return;
+        // Version 2 (Update 29): the mark, then the respawn bed. The launcher only looks for the mark.
+        if (!a_intfc->OpenRecord(kRecord, 2)) return;
         a_intfc->WriteRecordData(kMark, sizeof(kMark));
-        REX::INFO("[Wars] saved: Wars world mark");
+        const uint32_t bed = g_bed;
+        a_intfc->WriteRecordData(&bed, sizeof(bed));
+        const float bedAt[3] = { g_bedAt.x, g_bedAt.y, g_bedAt.z };
+        a_intfc->WriteRecordData(bedAt, sizeof(bedAt));
+        a_intfc->WriteRecordData(&g_bedSpace, sizeof(g_bedSpace));
+        const auto camp = MyCamp::Save();   // then the portable camp: size + data
+        const uint32_t campSize = static_cast<uint32_t>(camp.size());
+        a_intfc->WriteRecordData(&campSize, sizeof(campSize));
+        if (campSize) a_intfc->WriteRecordData(camp.data(), campSize);
+        REX::INFO("[Wars] saved: Wars world mark, respawn bed {:#x}, camp {}", bed, MyCamp::Deployed() ? "set up" : "none");
     }
 
     void OnLoadRecord(const F4SE::SerializationInterface* a_intfc, uint32_t a_version, uint32_t a_length)
     {
-        if (a_version != 1 || a_length < sizeof(kMark)) return;
+        if ((a_version != 1 && a_version != 2) || a_length < sizeof(kMark)) return;
         char mark[sizeof(kMark)]{};
         if (a_intfc->ReadRecordData(mark, sizeof(mark)) != sizeof(mark)) return;
         g_world = std::memcmp(mark, kMark, sizeof(kMark)) == 0;
-        REX::INFO("[Wars] loaded a {} world", g_world ? "Wasteland Wars" : "(unknown mark)");
+        uint32_t bed = 0;
+        if (a_version >= 2 && a_length >= sizeof(kMark) + sizeof(bed) && a_intfc->ReadRecordData(&bed, sizeof(bed)) == sizeof(bed)) {
+            // A bed from a mod's plugin may sit at another load-order index now: resolve it for this load.
+            if (bed) bed = a_intfc->ResolveFormID(bed).value_or(bed);
+        }
+        g_bed = bed;
+        float bedAt[3]{};
+        uint32_t bedSpace = 0;
+        if (a_version >= 2 && a_intfc->ReadRecordData(bedAt, sizeof(bedAt)) == sizeof(bedAt) &&
+            a_intfc->ReadRecordData(&bedSpace, sizeof(bedSpace)) == sizeof(bedSpace)) {
+            g_bedAt = { bedAt[0], bedAt[1], bedAt[2] };
+            g_bedSpace = bedSpace ? a_intfc->ResolveFormID(bedSpace).value_or(bedSpace) : 0;
+        }
+        uint32_t campSize = 0;
+        if (a_version >= 2 && a_intfc->ReadRecordData(&campSize, sizeof(campSize)) == sizeof(campSize) &&
+            campSize > 0 && campSize < 4096) {
+            std::vector<uint8_t> camp(campSize);
+            if (a_intfc->ReadRecordData(camp.data(), campSize) == campSize)
+                MyCamp::Load(camp.data(), camp.size(), [a_intfc](uint32_t a_id) { return a_intfc->ResolveFormID(a_id).value_or(a_id); });
+        }
+        REX::INFO("[Wars] loaded a {} world (respawn bed {:#x})", g_world ? "Wasteland Wars" : "(unknown mark)", bed);
+    }
+
+    void SetBed(uint32_t a_ref)
+    {
+        g_bed = a_ref;
+        g_bedAt = {};
+        g_bedSpace = 0;
+        auto* f = a_ref ? RE::TESForm::GetFormByID(a_ref) : nullptr;
+        if (auto* r = f ? f->As<RE::TESObjectREFR>() : nullptr) {
+            g_bedAt = r->GetPosition();
+            if (auto* cell = r->GetParentCell())
+                g_bedSpace = cell->IsInterior() ? cell->GetFormID() : (cell->worldSpace ? cell->worldSpace->GetFormID() : 0);
+        }
+    }
+    uint32_t Bed() { return g_bed; }
+    bool BedPlace(RE::NiPoint3& a_at, uint32_t& a_space)
+    {
+        if (!g_bed || !g_bedSpace) return false;
+        a_at = g_bedAt;
+        a_space = g_bedSpace;
+        return true;
+    }
+
+    uint32_t NearestStart(const RE::NiPoint3& a_at)
+    {
+        uint32_t best = 0;
+        float bestD = 1e30f;
+        for (auto& s : kStarts) {
+            auto* f = RE::TESForm::GetFormByID(s.marker);
+            auto* r = f ? f->As<RE::TESObjectREFR>() : nullptr;
+            if (!r) continue;
+            const auto p = r->GetPosition();
+            const float d = (p.x - a_at.x) * (p.x - a_at.x) + (p.y - a_at.y) * (p.y - a_at.y);
+            if (d < bestD) { bestD = d; best = s.marker; }
+        }
+        return best;
     }
 
     void OnRevert()
     {
         g_world = false;
+        g_bed = 0;
+        g_bedAt = {};
+        g_bedSpace = 0;
+        MyCamp::Revert();
         g_survivalUp = false;
         Squads::Reset();
     }
@@ -564,6 +639,37 @@ namespace F4MP::Wars
         } else if (what == "aiprobe") {
             Squads::AiProbe();
 
+        } else if (what.rfind("side", 0) == 0 || what == "solo") {
+            Teams::Bridge(what);
+        } else if (what.rfind("mycamp", 0) == 0) {
+            MyCamp::Bridge(what.size() > 7 ? what.substr(7) : std::string());
+        } else if (what.rfind("campuse", 0) == 0) {
+            // testing (portable camp research): activate the nearest reference of that base, log what it is.
+            const uint32_t base = std::strtoul(what.c_str() + 8, nullptr, 16);
+            auto* pl = RE::PlayerCharacter::GetSingleton();
+            auto* tes = RE::TES::GetSingleton();
+            RE::TESObjectREFR* best = nullptr;
+            float bestDist = 1e9f;
+            if (pl && tes) tes->ForEachReferenceInRange(pl->GetPosition(), 3000.0f, [&](RE::TESObjectREFR* r) {
+                auto* b = r ? r->GetObjectReference() : nullptr;
+                if (b && b->GetFormID() == base) {
+                    const float d = r->GetPosition().GetDistance(pl->GetPosition());
+                    if (d < bestDist) { bestDist = d; best = r; }
+                }
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+            REX::INFO("[Wars] bridge: camp test ref {:#x} of base {:#x} ({:.0f} away)", best ? best->GetFormID() : 0u, base, bestDist);
+            if (best) {
+                char cmd[64];
+                std::snprintf(cmd, sizeof(cmd), "%08X.activate player", best->GetFormID());
+                Console(cmd);
+            }
+        } else if (what.rfind("camp", 0) == 0) {
+            const uint32_t base = std::strtoul(what.c_str() + 5, nullptr, 16);
+            char cmd[64];
+            std::snprintf(cmd, sizeof(cmd), "player.placeatme %08X 1", base);
+            Console(cmd);
+            REX::INFO("[Wars] bridge: camp test placed base {:#x}", base);
         } else if (what == "epc") {
             PapyrusGameControls(true);
         } else if (what == "unlock") {

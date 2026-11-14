@@ -11,8 +11,10 @@
 // fell, and you get up at your crew's captured place (or a starting spot) with a fresh starting kit.
 namespace F4MP::Wars::Death
 {
-    void Install();                            // plugin load, Wars mode only: the player's health stops at 1
+    void Install();                            // plugin load: the player's health stops at 1 (Wars; campaign co-op while down-not-dead is on)
     void Tick();                               // main thread, ~1/s
     bool Pending();                            // a killing blow was stopped: the death runs on the next tick
+    void ClearPending();                       // Downed: revived / handled
+    void DieNow();                             // Downed (Wars): nobody revived us - the Wars death runs now
     void Bridge(const std::string& a_what);    // test: f4mp:wars die
 }

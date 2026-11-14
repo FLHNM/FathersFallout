@@ -18,6 +18,7 @@
 #include "sync/WarsClaims.h"
 #include "sync/WarsTeams.h"
 #include "sync/WarsDeath.h"
+#include "sync/WarsMyCamp.h"
 #include "sync/WarsVoice.h"
 #include "network/NetworkClient.h"
 
@@ -592,6 +593,7 @@ namespace F4MP::Wars::Squads
         Claims::Tick();
         Teams::Tick();
         Death::Tick();
+        MyCamp::Tick();
         if (Outside(pl) && now - g_lastSweep >= std::chrono::seconds(3)) {
             g_lastSweep = now;
             SweepVanillaEnemies(pl);

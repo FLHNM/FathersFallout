@@ -79,6 +79,9 @@ enum class MessageType : uint16_t {
     CoopWorkerAssigned = 118,       // player -> all: a settler given a job (a crop, a guard post, a shop) in workshop mode
     CoopVoice = 119,                // player -> all: push-to-talk voice, played by distance (variable length, unreliable)
     CoopNpcSay = 120,               // owner -> all: an NPC it runs started saying a dialogue line (Update 26)
+    CoopDowned = 121,               // player -> all: I'm down (can be revived) or back up (Update 29, sync/Downed)
+    CoopRevive = 122,               // player -> all: I revived that player (crouched beside them)
+    WarsPlayerCamp = 123,           // Wars, player -> all (relayed like co-op): my camp is set up here / packed up (Update 29)
     WarsPresence = 130,             // Wars, player -> server: where I am (outdoors in the Commonwealth or not)
     WarsSquadOnline = 131,          // Wars, server -> one player: an A-Life squad near you, run it in your game
     WarsSquadReport = 132,          // Wars, player -> server: how that squad is doing (final = handed back)
@@ -517,6 +520,27 @@ struct CoopNpcSayMsg {
     uint32_t infoFormId;     // INFO: the line itself
     uint8_t  hasFragment;    // the line runs a script in the owner's game: not said again elsewhere
     uint8_t  pad[3];
+};
+
+struct CoopDownedMsg {
+    uint32_t senderId;
+    uint8_t  downed;         // 1 = down, waiting for a revive; 0 = up again (revived, respawned, gave up)
+    uint8_t  pad[3];
+    float    secondsLeft;    // until they respawn by themselves
+};
+
+struct CoopReviveMsg {
+    uint32_t senderId;
+    uint32_t targetId;       // the player who was down
+};
+
+struct WarsPlayerCampMsg {
+    uint32_t senderId;
+    uint8_t  deployed;       // 1 = set up at x/y/z facing heading, 0 = packed up
+    uint8_t  pad[3];
+    uint32_t space;          // worldspace (outdoors) or interior cell FormID
+    float    x, y, z;
+    float    heading;        // radians
 };
 
 struct CoopHelloMsg {
